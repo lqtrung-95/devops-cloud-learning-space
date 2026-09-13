@@ -26,3 +26,9 @@ build/
 
 # Kubernetes
 kubeconfig*
+
+# Next.js / tooling
+next-env.d.ts
+*.tsbuildinfo
+coverage/
+.vercel

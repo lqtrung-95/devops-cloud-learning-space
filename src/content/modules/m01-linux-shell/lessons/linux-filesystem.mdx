@@ -1,0 +1,93 @@
+import { FilesystemTreeDiagram } from "../diagrams/filesystem-tree-diagram";
+
+<Eli5 title="Linux giống như một toà chung cư" emoji="🏢">
+  Hãy tưởng tượng máy tính là một **toà chung cư**. **Linux** là ban quản lý toà nhà: lo điện nước, phân phòng, giữ chìa khoá.
+
+  Toà nhà này chỉ có **một cổng chính** tên là `/`. Từ cổng đi vào có các khu: khu căn hộ (`/home`), phòng ban quản lý cất nội quy (`/etc`), phòng bảo vệ ghi sổ nhật ký (`/var/log`), kho đồ nghề chung (`/bin`)...
+
+  Bạn không có chuột để bấm — bạn đi lại bằng cách **nói địa chỉ** cho người dẫn đường (terminal): "đưa tôi tới `/home/trung`".
+</Eli5>
+
+## Vì sao DevOps phải biết Linux?
+
+Hơn 90% server trên cloud chạy Linux. Docker container thực chất là tiến trình Linux. Kubernetes node chạy Linux. Pipeline CI/CD chạy trên runner Linux. Nói cách khác: **Linux là mặt đất mà mọi thứ khác xây lên**.
+
+<FilesystemTreeDiagram />
+
+<Technical>
+
+**Linux** là một _kernel_ (nhân hệ điều hành) — phần mềm nói chuyện trực tiếp với phần cứng. Khi người ta nói "Ubuntu", "Debian", "Amazon Linux", "RHEL", đó là các **distribution (distro)**: kernel Linux + bộ công cụ + trình quản lý gói.
+
+| Distro | Hay gặp ở đâu | Quản lý gói |
+|---|---|---|
+| Ubuntu / Debian | Server phổ biến, Docker image | `apt` |
+| Amazon Linux / RHEL / Rocky | AWS EC2, doanh nghiệp | `dnf` / `yum` |
+| Alpine | Docker image siêu nhỏ | `apk` |
+
+### Filesystem Hierarchy Standard (FHS)
+
+Linux có **một cây thư mục duy nhất** bắt đầu từ `/` (root directory). Ổ đĩa khác không thành `D:` mà được **mount** (gắn) vào một thư mục trong cây, ví dụ `/mnt/data`.
+
+- `/etc` — cấu hình hệ thống (text file, sửa được bằng editor)
+- `/var` — dữ liệu biến đổi: log (`/var/log`), dữ liệu Docker (`/var/lib/docker`)
+- `/home/<user>` — thư mục cá nhân, viết tắt là `~`
+- `/bin`, `/usr/bin` — chương trình (ls, cp, python3…)
+- `/tmp` — file tạm, có thể bị xoá khi reboot
+- `/proc` — thư mục "ảo" do kernel tạo ra, chứa thông tin tiến trình và phần cứng
+
+### Đường dẫn tuyệt đối vs tương đối
+
+- **Tuyệt đối** (absolute): bắt đầu bằng `/`, ví dụ `/var/log/syslog` — đúng ở mọi nơi.
+- **Tương đối** (relative): tính từ thư mục hiện tại. `.` = ở đây, `..` = thư mục cha.
+
+</Technical>
+
+## Thực hành: đi dạo trong toà nhà
+
+<Terminal
+  commands={[
+    { comment: "Tôi đang đứng ở đâu? (print working directory)", command: "pwd", output: "/home/trung" },
+    { comment: "Nhìn quanh: liệt kê file, cả file ẩn, dạng chi tiết", command: "ls -la", output: "drwxr-x--- 5 trung trung 4096 Sep 13 09:00 .\n-rw-r--r-- 1 trung trung  220 Sep 13 09:00 .bashrc\ndrwx------ 2 trung trung 4096 Sep 13 09:00 .ssh" },
+    { comment: "Đi tới khu log", command: "cd /var/log" },
+    { comment: "Quay về nhà mình", command: "cd ~" },
+    { comment: "Tạo thư mục lồng nhau và file rỗng", command: "mkdir -p projects/demo && touch projects/demo/notes.txt" },
+    { comment: "Xem cấu trúc dạng cây (cài: sudo apt install tree)", command: "tree projects", output: "projects\n└── demo\n    └── notes.txt" },
+    { comment: "Xem ổ đĩa còn trống bao nhiêu", command: "df -h /", output: "Filesystem  Size  Used Avail Use% Mounted on\n/dev/sda1    30G  8.2G   22G  28% /" },
+    { comment: "Thư mục nào đang chiếm nhiều chỗ?", command: "sudo du -sh /var/* | sort -h | tail -3" },
+  ]}
+/>
+
+Một vài lệnh đọc file hay dùng:
+
+```bash
+cat /etc/os-release      # in toàn bộ file (file ngắn)
+less /var/log/syslog     # đọc từng trang, gõ q để thoát, /từ-khoá để tìm
+head -n 20 app.log       # 20 dòng đầu
+tail -f app.log          # theo dõi dòng mới được ghi thêm (Ctrl+C để dừng)
+```
+
+<Callout type="mistake">
+  **`rm -rf` không có thùng rác.** Gõ nhầm `rm -rf / home/trung` (thừa dấu cách) có thể xoá cả hệ thống. Luôn kiểm tra kỹ đường dẫn, và dùng `ls` xem trước những gì sắp xoá.
+</Callout>
+
+<Callout type="tip">
+  Nhấn **Tab** để tự hoàn thành tên file/thư mục, **Ctrl+R** để tìm lại lệnh đã gõ. Hai phím này tiết kiệm cho bạn hàng giờ mỗi tuần.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "kernel", meaning: "Lõi hệ điều hành, nói chuyện trực tiếp với CPU, RAM, ổ đĩa." },
+    { term: "distro", meaning: "Bản phân phối: kernel + công cụ đóng gói sẵn (Ubuntu, Alpine…)." },
+    { term: "/ (root directory)", meaning: "Gốc của cây thư mục duy nhất trong Linux." },
+    { term: "mount", meaning: "Gắn một ổ đĩa vào một thư mục trong cây." },
+    { term: "absolute path", meaning: "Đường dẫn đầy đủ bắt đầu bằng /." },
+    { term: "~ (home)", meaning: "Thư mục cá nhân của user hiện tại." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn vừa cài Nginx và muốn sửa cấu hình của nó. Bạn sẽ tìm ở đâu?"
+  options={["/home/nginx", "/etc/nginx", "/var/log/nginx", "/bin/nginx"]}
+  answerIndex={1}
+  explanation="/etc là 'phòng ban quản lý' — nơi cất cấu hình. /var/log/nginx là nơi Nginx ghi log."
+/>

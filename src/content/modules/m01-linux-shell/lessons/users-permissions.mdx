@@ -1,0 +1,89 @@
+import { PermissionBuilderDiagram } from "../diagrams/permission-builder-diagram";
+
+<Eli5 title="Quyền file giống như chìa khoá phòng" emoji="🔑">
+  Trong chung cư, mỗi phòng có **chủ phòng**, **người trong gia đình**, và **khách lạ**.
+
+  Với mỗi nhóm người, chủ phòng quyết định 3 việc: được **nhìn vào** (đọc), được **sắp xếp lại đồ đạc** (sửa), được **bật máy móc trong phòng** (chạy).
+
+  Còn **root** là bác quản lý toà nhà cầm chìa khoá vạn năng — mở được mọi cửa. Vì thế không ai nên đi lại cả ngày với chùm chìa đó trong túi: rơi mất là toang cả toà nhà.
+</Eli5>
+
+<PermissionBuilderDiagram />
+
+<Technical>
+
+### User & group
+
+- Mỗi người/chương trình chạy dưới một **user** có UID riêng. Danh sách nằm trong `/etc/passwd`.
+- **Group** gom nhiều user lại để cấp quyền chung (ví dụ group `docker`, `sudo`, `devops`).
+- **root** (UID 0) bỏ qua mọi kiểm tra quyền.
+
+### Đọc quyền trong `ls -l`
+
+```text
+-rwxr-x---  1  trung  devops  1204  Sep 13 09:00  deploy.sh
+│└┬┘└┬┘└┬┘      │      │
+│ │  │  │       owner  group
+│ │  │  └── others: ---  (không gì)
+│ │  └───── group:  r-x  (đọc, chạy)
+│ └──────── owner:  rwx  (đọc, sửa, chạy)
+└────────── loại: - file, d thư mục, l symlink
+```
+
+Với **thư mục**, ý nghĩa hơi khác: `r` = xem danh sách file bên trong, `w` = tạo/xoá file bên trong, `x` = được "bước vào" (`cd`).
+
+### chmod: hai cách viết
+
+| Kiểu số (octal) | Kiểu chữ (symbolic) | Ý nghĩa |
+|---|---|---|
+| `chmod 644 file` | `chmod u=rw,go=r file` | File thường: chủ sửa, người khác chỉ đọc |
+| `chmod 755 script.sh` | `chmod u=rwx,go=rx script.sh` | Script/thư mục ai cũng chạy được |
+| `chmod 600 id_ed25519` | `chmod u=rw,go= id_ed25519` | File bí mật: chỉ chủ đọc/sửa |
+| — | `chmod +x script.sh` | Thêm quyền chạy cho mọi người |
+
+### sudo & nguyên tắc least privilege
+
+`sudo` = "mượn chìa khoá vạn năng cho **một lệnh này thôi**", và mọi lần mượn đều được ghi log. Đó là lý do ta làm việc bằng user thường + `sudo` khi cần, thay vì đăng nhập thẳng root.
+
+**Least privilege** (quyền tối thiểu): mỗi user, mỗi app chỉ có đúng quyền nó cần. Nguyên tắc này sẽ quay lại ở AWS IAM, Kubernetes RBAC… — học một lần, dùng cả đời.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tôi là ai, thuộc những group nào?", command: "id", output: "uid=1000(trung) gid=1000(trung) groups=1000(trung),27(sudo)" },
+    { comment: "Tạo user cho ứng dụng, không cho đăng nhập", command: "sudo useradd --system --no-create-home --shell /usr/sbin/nologin myapp" },
+    { comment: "Tạo group devops và thêm trung vào (đăng xuất/đăng nhập lại để có hiệu lực)", command: "sudo groupadd devops && sudo usermod -aG devops trung" },
+    { comment: "Đổi chủ sở hữu thư mục ứng dụng", command: "sudo chown -R myapp:devops /opt/myapp" },
+    { comment: "Chủ: toàn quyền, group: đọc+vào, others: không", command: "sudo chmod 750 /opt/myapp" },
+    { command: "ls -ld /opt/myapp", output: "drwxr-x--- 2 myapp devops 4096 Sep 13 10:12 /opt/myapp" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **`chmod 777` để "cho chạy được".** Đây là mở toang cửa cho mọi người sửa file — kể cả kẻ tấn công đã lọt vào qua một app khác. Hãy tìm xem **ai** cần quyền **gì**, rồi cấp đúng chừng đó.
+</Callout>
+
+<Callout type="warning">
+  SSH sẽ **từ chối** dùng private key nếu file có quyền quá rộng. Luôn đặt `chmod 700 ~/.ssh` và `chmod 600 ~/.ssh/id_ed25519`.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "UID / GID", meaning: "Số định danh của user / group." },
+    { term: "owner, group, others", meaning: "Ba nhóm người được cấp quyền riêng cho mỗi file." },
+    { term: "rwx", meaning: "read (4), write (2), execute (1)." },
+    { term: "chmod / chown", meaning: "Đổi quyền / đổi chủ sở hữu file." },
+    { term: "sudo", meaning: "Chạy một lệnh với quyền root, có ghi log." },
+    { term: "least privilege", meaning: "Chỉ cấp đúng quyền cần thiết, không hơn." },
+  ]}
+/>
+
+<QuickCheck
+  question="Private key SSH của bạn nên có quyền nào?"
+  options={["777", "644", "600", "755"]}
+  answerIndex={2}
+  explanation="600 = chỉ chủ file được đọc/sửa. Người khác không được nhìn vào 'chìa khoá riêng' của bạn."
+/>

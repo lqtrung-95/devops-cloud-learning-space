@@ -1,0 +1,102 @@
+import { SshKeyAuthenticationDiagram } from "../diagrams/ssh-key-authentication-diagram";
+
+<Eli5 title="SSH key giống như con dấu riêng & mẫu dấu ở ngân hàng" emoji="🔏">
+  Mật khẩu giống như **câu nói bí mật**: mỗi lần vào cửa bạn phải nói to lên — ai đứng gần nghe được là biết.
+
+  SSH key thì khác. Bạn có **một con dấu riêng** (private key) cất trong túi, và gửi **mẫu dấu** (public key) cho ngân hàng (server).
+
+  Khi bạn tới, ngân hàng đưa một tờ giấy ngẫu nhiên: "đóng dấu vào đây". Họ so với mẫu dấu — khớp thì cho vào. **Con dấu không bao giờ rời khỏi túi bạn**, và tờ giấy mỗi lần một khác nên kẻ gian chụp lại cũng vô ích.
+</Eli5>
+
+<SshKeyAuthenticationDiagram />
+
+<Technical>
+
+**SSH (Secure Shell)** tạo một kết nối được mã hoá tới máy khác (mặc định cổng **22**) để chạy lệnh, copy file, hoặc làm "đường hầm".
+
+### Public-key authentication
+
+1. `ssh-keygen` sinh **cặp khoá bất đối xứng**: private key và public key liên quan toán học với nhau.
+2. Public key được thêm vào `~/.ssh/authorized_keys` của user trên server.
+3. Khi kết nối, server gửi dữ liệu thách thức; client **ký** bằng private key; server **xác minh chữ ký** bằng public key.
+
+Khuyến nghị dùng thuật toán **Ed25519** (khoá ngắn, nhanh, an toàn). Có thể đặt **passphrase** cho private key, và dùng `ssh-agent` để không phải gõ lại liên tục.
+
+### Cấu hình giúp gõ ít hơn
+
+```text title="~/.ssh/config"
+Host lab
+  HostName 203.0.113.10
+  User trung
+  IdentityFile ~/.ssh/id_ed25519
+
+Host web-private
+  HostName 10.0.2.15
+  User ubuntu
+  ProxyJump lab        # đi qua máy "lab" để vào máy trong mạng riêng
+```
+
+Giờ chỉ cần gõ `ssh lab` hoặc `ssh web-private`.
+
+### Làm cứng (hardening) SSH server
+
+Trong `/etc/ssh/sshd_config`:
+
+```text
+PasswordAuthentication no   # chỉ cho đăng nhập bằng key
+PermitRootLogin no          # không cho SSH thẳng vào root
+```
+
+Rồi `sudo sshd -t` (kiểm tra cú pháp) và `sudo systemctl reload ssh`.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Trên LAPTOP: tạo cặp khoá (Enter để dùng đường dẫn mặc định)", command: "ssh-keygen -t ed25519 -C \"trung@laptop\"" },
+    { command: "ls ~/.ssh", output: "id_ed25519  id_ed25519.pub" },
+    { comment: "Copy public key lên server (lần cuối cùng phải gõ mật khẩu)", command: "ssh-copy-id trung@203.0.113.10" },
+    { comment: "Đăng nhập bằng key", command: "ssh trung@203.0.113.10" },
+    { comment: "Chạy một lệnh từ xa rồi về luôn", command: "ssh lab 'df -h / && uptime'" },
+    { comment: "Copy file lên server", command: "scp backup.sh lab:/home/trung/" },
+    { comment: "Đồng bộ cả thư mục (chỉ gửi phần thay đổi)", command: "rsync -avz ./site/ lab:/var/www/site/" },
+    { comment: "Mở cổng 5432 của database trên server về máy mình", command: "ssh -L 5432:localhost:5432 lab" },
+  ]}
+/>
+
+<Callout type="warning" title="Đừng tự khoá mình ở ngoài">
+  Trước khi đặt `PasswordAuthentication no`, hãy **mở một terminal thứ hai** và thử SSH bằng key thành công. Giữ phiên cũ mở cho tới khi chắc chắn — nếu cấu hình sai, bạn vẫn còn đường sửa.
+</Callout>
+
+<Callout type="mistake">
+  Commit private key vào Git, hoặc copy private key lên server "cho tiện". Nếu lỡ lộ: **tạo cặp khoá mới** và xoá public key cũ khỏi mọi `authorized_keys` ngay lập tức.
+</Callout>
+
+<Callout type="info" title="Xem trước tương lai">
+  Trên AWS bạn sẽ học **SSM Session Manager** — vào server mà **không cần mở cổng 22** chút nào. Nhưng SSH vẫn là kỹ năng nền tảng bạn dùng hằng ngày (và cũng là cách Git nói chuyện với GitHub).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "SSH", meaning: "Giao thức điều khiển máy từ xa qua kết nối mã hoá, cổng 22." },
+    { term: "private key", meaning: "Khoá bí mật — không bao giờ rời máy bạn." },
+    { term: "public key", meaning: "Khoá công khai — đặt lên server để xác minh bạn." },
+    { term: "authorized_keys", meaning: "Danh sách public key được phép đăng nhập vào một user." },
+    { term: "ProxyJump", meaning: "Đi qua một máy trung gian (bastion) để tới máy trong mạng riêng." },
+    { term: "port forwarding (-L)", meaning: "Mượn đường hầm SSH để truy cập dịch vụ ở xa như đang ở local." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao đăng nhập bằng SSH key an toàn hơn mật khẩu?"
+  options={[
+    "Vì key dài hơn nên gõ lâu hơn",
+    "Vì private key không bao giờ gửi qua mạng, server chỉ kiểm tra chữ ký",
+    "Vì SSH key không cần mã hoá",
+    "Vì server lưu private key của bạn",
+  ]}
+  answerIndex={1}
+  explanation="Như con dấu không rời túi: laptop chỉ gửi chữ ký cho một thử thách ngẫu nhiên. Kẻ nghe lén không lấy được gì để dùng lại."
+/>

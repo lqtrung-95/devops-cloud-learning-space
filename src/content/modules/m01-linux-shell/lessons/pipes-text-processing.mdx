@@ -1,0 +1,91 @@
+import { ShellPipelineDiagram } from "../diagrams/shell-pipeline-diagram";
+
+<Eli5 title="Pipe giống như dây chuyền trong nhà máy nước ép" emoji="🏭">
+  Mỗi lệnh Linux là **một cỗ máy nhỏ chỉ làm một việc**: máy rửa, máy gọt, máy ép, máy đóng chai.
+
+  Dấu **`|` (pipe)** là **băng chuyền** nối các máy: trái cây ra khỏi máy rửa sẽ tự chạy sang máy gọt, rồi sang máy ép.
+
+  Không cần một cỗ máy khổng lồ làm mọi thứ — chỉ cần xếp đúng thứ tự vài cỗ máy nhỏ là bạn có ngay một nhà máy.
+</Eli5>
+
+<ShellPipelineDiagram />
+
+<Technical>
+
+### stdin, stdout, stderr
+
+Mỗi process có sẵn 3 "đường ống":
+
+| Tên | Số | Mặc định | Dùng để |
+|---|---|---|---|
+| **stdin** | 0 | bàn phím | nhận dữ liệu vào |
+| **stdout** | 1 | màn hình | in kết quả bình thường |
+| **stderr** | 2 | màn hình | in thông báo lỗi |
+
+### Redirection (chuyển hướng)
+
+```bash
+ls > files.txt            # stdout ghi đè vào file
+ls >> files.txt           # stdout ghi nối thêm vào cuối file
+npm test 2> errors.txt    # chỉ stderr vào file
+npm test > all.log 2>&1   # cả stdout lẫn stderr vào cùng file
+cmd | tee out.txt         # vừa hiện lên màn hình vừa ghi file
+```
+
+`cmd1 | cmd2` nối **stdout** của cmd1 vào **stdin** của cmd2. Còn `&&` thì khác hẳn: `cmd1 && cmd2` nghĩa là "chỉ chạy cmd2 nếu cmd1 thành công (exit 0)".
+
+### Bộ đồ nghề xử lý văn bản
+
+| Lệnh | Việc chuyên làm | Ví dụ |
+|---|---|---|
+| `grep` | lọc dòng khớp mẫu | `grep -i error app.log`, `grep -v DEBUG` |
+| `awk` | tách cột, tính toán | `awk '{print $1, $9}'`, `awk -F, '{s+=$3} END {print s}'` |
+| `sed` | tìm & thay thế | `sed 's/http:/https:/g' urls.txt` |
+| `sort` / `uniq` | sắp xếp / gộp trùng | `sort \| uniq -c \| sort -rn` |
+| `cut` | cắt cột theo ký tự phân cách | `cut -d: -f1 /etc/passwd` |
+| `wc` | đếm dòng/từ | `wc -l` |
+| `jq` | xử lý JSON | `jq '.items[].name'` |
+
+</Technical>
+
+## Thực hành: điều tra một sự cố
+
+Giả sử website bị chậm, bạn có file `access.log` của Nginx. Hãy đặt câu hỏi và trả lời bằng pipe:
+
+<Terminal
+  commands={[
+    { comment: "Có bao nhiêu request lỗi 5xx?", command: "awk '$9 ~ /^5/' access.log | wc -l", output: "1342" },
+    { comment: "Top 5 IP gọi nhiều nhất", command: "awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -5", output: "  8821 198.51.100.7\n   912 203.0.113.5\n   455 192.0.2.44" },
+    { comment: "Endpoint nào bị lỗi 500 nhiều nhất?", command: "awk '$9 == 500 {print $7}' access.log | sort | uniq -c | sort -rn | head -3", output: "   1201 /api/checkout\n     98 /api/cart" },
+    { comment: "Theo dõi lỗi mới xuất hiện theo thời gian thực", command: "tail -f access.log | grep --line-buffered ' 500 '" },
+    { comment: "Lấy tên các pod đang lỗi từ JSON", command: "kubectl get pods -o json | jq -r '.items[] | select(.status.phase != \"Running\") | .metadata.name'" },
+  ]}
+/>
+
+Chỉ với 5 lệnh, bạn phát hiện: **một IP đang spam** và **`/api/checkout` đang lỗi** — hai hướng điều tra rõ ràng, không cần công cụ đắt tiền nào.
+
+<Callout type="tip">
+  Xây pipe **từng bước**: chạy lệnh đầu, nhìn output, rồi mới thêm `| lệnh tiếp`. Gặp lệnh khó hiểu? Dán vào [explainshell.com](https://explainshell.com) để xem giải thích từng phần.
+</Callout>
+
+<Callout type="mistake">
+  `cat file | grep x` hoạt động nhưng thừa một process — `grep x file` là đủ. Không sai, nhưng khi review script người ta sẽ nhắc ("useless use of cat").
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "pipe |", meaning: "Nối output của lệnh trước làm input của lệnh sau." },
+    { term: "stdout / stderr", meaning: "Luồng kết quả bình thường / luồng thông báo lỗi." },
+    { term: "> / >>", meaning: "Ghi đè / ghi nối output vào file." },
+    { term: "2>&1", meaning: "Gộp stderr vào cùng chỗ với stdout." },
+    { term: "grep / awk / sed", meaning: "Lọc dòng / xử lý cột / tìm-thay-thế." },
+    { term: "jq", meaning: "Công cụ lọc và trích xuất dữ liệu JSON." },
+  ]}
+/>
+
+<QuickCheck
+  question="Lệnh nào ghi CẢ output bình thường và lỗi của `npm test` vào file test.log?"
+  options={["npm test > test.log", "npm test 2> test.log", "npm test > test.log 2>&1", "npm test | test.log"]}
+  answerIndex={2}
+  explanation="`> test.log` chuyển stdout vào file, `2>&1` bảo stderr đi theo cùng chỗ với stdout. Pipe `|` thì nối sang lệnh khác, không phải file."
+/>

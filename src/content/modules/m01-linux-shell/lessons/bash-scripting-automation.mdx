@@ -1,0 +1,134 @@
+import { BackupScriptFlowDiagram } from "../diagrams/backup-script-flow-diagram";
+
+<Eli5 title="Bash script là tờ công thức nấu ăn cho máy" emoji="📝">
+  Mỗi tối bạn đều gõ lại 10 lệnh để sao lưu dữ liệu? Hãy **viết chúng ra một tờ giấy** theo thứ tự, rồi đưa cho máy: "cứ làm theo tờ này". Tờ giấy đó chính là **bash script**.
+
+  Một công thức tốt còn có **dặn dò khi có sự cố**: "nếu hết trứng thì dừng lại và báo mẹ, đừng cố nướng bánh không có trứng". Script tốt cũng vậy: gặp lỗi là dừng và báo.
+
+  Cuối cùng, bạn **hẹn giờ** (cron / systemd timer) để máy tự nấu mỗi đêm — kể cả khi bạn đang ngủ.
+</Eli5>
+
+<BackupScriptFlowDiagram />
+
+<Technical>
+
+### Bộ khung một script "chuẩn DevOps"
+
+```bash title="backup.sh"
+#!/usr/bin/env bash
+# Nén thư mục nguồn vào thư mục đích, giữ lại N bản gần nhất.
+set -euo pipefail
+
+SRC="${1:?Cách dùng: backup.sh <thư-mục-nguồn> <thư-mục-đích>}"
+DEST="${2:?Thiếu thư mục đích}"
+KEEP="${KEEP:-7}"   # cho phép đổi qua biến môi trường, mặc định 7
+
+log() { echo "[$(date '+%F %T')] $*"; }
+
+if [[ ! -d "$SRC" ]]; then
+  echo "Lỗi: không tìm thấy thư mục $SRC" >&2
+  exit 1
+fi
+
+mkdir -p "$DEST"
+ARCHIVE="$DEST/backup-$(date +%F-%H%M).tar.gz"
+
+log "Đang nén $SRC → $ARCHIVE"
+tar -czf "$ARCHIVE" -C "$(dirname "$SRC")" "$(basename "$SRC")"
+
+# Giữ KEEP bản mới nhất, xoá phần còn lại
+ls -1t "$DEST"/backup-*.tar.gz | tail -n +"$((KEEP + 1))" | xargs -r rm --
+
+log "Hoàn tất. Hiện có $(ls "$DEST"/backup-*.tar.gz | wc -l) bản backup."
+```
+
+Giải thích những dòng quan trọng:
+
+- `#!/usr/bin/env bash` — **shebang**: dặn hệ thống dùng bash để chạy file này.
+- `set -e` dừng khi có lệnh lỗi · `set -u` báo lỗi khi dùng biến chưa đặt · `set -o pipefail` coi cả pipe là lỗi nếu một lệnh bên trong lỗi.
+- `"${1:?thông báo}"` — bắt buộc có tham số, thiếu thì in thông báo và thoát.
+- `"${KEEP:-7}"` — giá trị mặc định.
+- **Luôn đặt biến trong ngoặc kép** `"$SRC"` — tránh lỗi khi đường dẫn có dấu cách.
+- `>&2` in ra stderr; `exit 1` báo thất bại cho ai gọi script.
+
+### Cú pháp cần nhớ
+
+```bash
+# Điều kiện
+if [[ -f "$FILE" ]]; then echo "là file"; elif [[ -d "$FILE" ]]; then echo "là thư mục"; fi
+
+# Vòng lặp
+for host in web1 web2 web3; do
+  ssh "$host" 'uptime'
+done
+
+# Function + trap: dọn dẹp dù script thành công hay lỗi
+cleanup() { rm -rf "$TMP_DIR"; }
+TMP_DIR=$(mktemp -d)
+trap cleanup EXIT
+```
+
+### Hẹn giờ: cron vs systemd timer
+
+| | cron | systemd timer |
+|---|---|---|
+| Cấu hình | 1 dòng trong `crontab -e` | 2 file `.service` + `.timer` |
+| Log | tự lo (redirect ra file) | có sẵn trong `journalctl` |
+| Máy tắt đúng giờ chạy | bỏ lỡ | `Persistent=true` chạy bù |
+| Dùng khi | việc nhỏ, nhanh | server production |
+
+Cú pháp cron: `phút giờ ngày tháng thứ lệnh` — ví dụ `30 2 * * * /opt/backup.sh` = 2:30 sáng mỗi ngày. Dùng [crontab.guru](https://crontab.guru) để kiểm tra.
+
+```ini title="/etc/systemd/system/backup.timer"
+[Unit]
+Description=Chạy backup mỗi đêm
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cho phép chạy script", command: "chmod +x backup.sh" },
+    { comment: "Kiểm tra lỗi phổ biến trước khi chạy (sudo apt install shellcheck)", command: "shellcheck backup.sh" },
+    { comment: "Chạy thử", command: "./backup.sh ~/projects /tmp/backups", output: "[2026-09-13 10:40:01] Đang nén /home/trung/projects → /tmp/backups/backup-2026-09-13-1040.tar.gz\n[2026-09-13 10:40:02] Hoàn tất. Hiện có 1 bản backup." },
+    { comment: "Xem exit code của lệnh vừa chạy", command: "echo $?", output: "0" },
+    { comment: "Thử kịch bản lỗi", command: "./backup.sh /khong/ton/tai /tmp/backups; echo \"exit=$?\"", output: "Lỗi: không tìm thấy thư mục /khong/ton/tai\nexit=1" },
+    { comment: "Chạy script ở chế độ debug: in từng lệnh trước khi chạy", command: "bash -x backup.sh ~/projects /tmp/backups" },
+    { comment: "Bật timer và kiểm tra lần chạy kế tiếp", command: "sudo systemctl enable --now backup.timer && systemctl list-timers backup.timer" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Quên ngoặc kép quanh biến.** Nếu `DIR="my folder"` thì `rm -rf $DIR` sẽ thành `rm -rf my folder` — xoá 2 thứ khác nhau! Luôn viết `"$DIR"`.
+</Callout>
+
+<Callout type="info" title="Khi nào thôi dùng bash?">
+  Script dài quá ~100 dòng, cần xử lý JSON phức tạp, gọi API, hoặc cần test? Chuyển sang Python/Go. Bash tuyệt vời để **dán các lệnh lại với nhau**, không phải để viết phần mềm lớn.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "shebang #!", meaning: "Dòng đầu chỉ định chương trình dùng để chạy script." },
+    { term: "set -euo pipefail", meaning: "Chế độ an toàn: dừng khi lỗi, biến rỗng, pipe lỗi." },
+    { term: "$? ", meaning: "Exit code của lệnh vừa chạy." },
+    { term: "trap", meaning: "Đăng ký hàm chạy khi script thoát/nhận signal (dọn dẹp)." },
+    { term: "cron", meaning: "Bộ hẹn giờ cổ điển: chạy lệnh theo lịch." },
+    { term: "systemd timer", meaning: "Hẹn giờ kiểu systemd, có log và chạy bù." },
+  ]}
+/>
+
+<QuickCheck
+  question="Script có `set -e`. Lệnh `cp config.yml /etc/app/` thất bại vì thiếu quyền. Chuyện gì xảy ra?"
+  options={["Script bỏ qua và chạy tiếp các lệnh sau", "Script dừng ngay với exit code khác 0", "Script tự thử lại bằng sudo", "Script chạy lại từ đầu"]}
+  answerIndex={1}
+  explanation="`set -e` giống lời dặn 'hết trứng thì dừng lại': lệnh nào lỗi là script thoát ngay, tránh làm tiếp trên trạng thái hỏng."
+/>

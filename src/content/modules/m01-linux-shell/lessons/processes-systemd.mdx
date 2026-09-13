@@ -1,0 +1,99 @@
+import { SystemdServiceLifecycleDiagram } from "../diagrams/systemd-service-lifecycle-diagram";
+
+<Eli5 title="Server là một nhà hàng, systemd là quản lý" emoji="🍜">
+  Mỗi chương trình đang chạy là một **món ăn đang được nấu** — gọi là **tiến trình (process)**. Mỗi món có một **số phiếu order** — gọi là **PID**.
+
+  **systemd** là **quản lý nhà hàng**: sáng mở cửa thì bật bếp nào, món nào bị cháy thì cho nấu lại, và ghi hết mọi chuyện vào sổ (**journald**).
+
+  Nếu không có quản lý, món bị cháy lúc 3 giờ sáng sẽ nằm đó tới khi bạn thức dậy — còn khách hàng (người dùng website) thì đã bỏ đi.
+</Eli5>
+
+<SystemdServiceLifecycleDiagram />
+
+<Technical>
+
+### Process
+
+- Mỗi process có **PID**, **PPID** (tiến trình cha), user chạy nó, lượng CPU/RAM đang dùng.
+- Tiến trình đầu tiên khi máy khởi động là **PID 1** — trên hầu hết distro hiện đại đó chính là `systemd`.
+- Process kết thúc với **exit code**: `0` = thành công, khác 0 = có lỗi. Mọi công cụ tự động hoá (systemd, CI/CD, Kubernetes) đều dựa vào con số này.
+
+### Signal — cách "nói chuyện" với process
+
+| Signal | Số | Ý nghĩa ELI5 |
+|---|---|---|
+| `SIGTERM` | 15 | "Làm ơn dọn dẹp rồi nghỉ nhé" — mặc định của `kill` |
+| `SIGKILL` | 9 | "Dừng ngay lập tức!" — không kịp dọn dẹp, chỉ dùng khi bí |
+| `SIGHUP` | 1 | Nhiều daemon hiểu là "đọc lại cấu hình" |
+| `SIGINT` | 2 | Chính là khi bạn nhấn Ctrl+C |
+
+### systemd unit
+
+Mỗi dịch vụ được mô tả bằng một **unit file** — "công thức" cho quản lý:
+
+```ini title="/etc/systemd/system/my-app.service"
+[Unit]
+Description=My demo web app
+After=network-online.target
+
+[Service]
+User=myapp
+WorkingDirectory=/opt/myapp
+ExecStart=/usr/bin/python3 -m http.server 8080
+Restart=on-failure
+RestartSec=3
+Environment=APP_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- `[Service] User=` — không chạy bằng root (nhớ bài trước!)
+- `Restart=on-failure` — tự nấu lại món bị cháy
+- `[Install] WantedBy=multi-user.target` — dùng khi `enable`: bật cùng lúc máy khởi động xong
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem các process, sắp theo CPU (q để thoát)", command: "top" },
+    { comment: "Tìm process theo tên", command: "ps aux | grep nginx" },
+    { comment: "Nạp lại danh sách unit sau khi tạo/sửa file .service", command: "sudo systemctl daemon-reload" },
+    { comment: "Bật ngay + bật cùng máy khởi động", command: "sudo systemctl enable --now my-app" },
+    { comment: "Kiểm tra trạng thái — lệnh debug số 1", command: "systemctl status my-app", output: "● my-app.service - My demo web app\n     Active: active (running) since Sat 2026-09-13 10:30:02; 5s ago\n   Main PID: 1234 (python3)" },
+    { comment: "Xem log của service, theo dõi liên tục", command: "journalctl -u my-app -f" },
+    { comment: "Log từ 1 giờ trước, chỉ mức lỗi", command: "journalctl -u my-app --since '1 hour ago' -p err" },
+    { comment: "Giả lập crash, rồi xem systemd tự bật lại", command: "sudo kill -9 1234 && sleep 4 && systemctl status my-app" },
+  ]}
+/>
+
+<Callout type="tip" title="Quy trình debug 'service không chạy'">
+  1. `systemctl status tên-service` → đọc dòng **Active** và vài dòng log cuối.
+  2. `journalctl -u tên-service -n 50` → xem 50 dòng log gần nhất.
+  3. Thử chạy đúng lệnh trong `ExecStart` bằng tay, dưới đúng `User` đó.
+  4. Sửa xong nhớ `daemon-reload` rồi `restart`.
+</Callout>
+
+<Callout type="mistake">
+  Sửa file `.service` rồi chỉ `restart` mà quên `systemctl daemon-reload` — systemd vẫn dùng "công thức" cũ và bạn không hiểu vì sao thay đổi không có tác dụng.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "process / PID", meaning: "Chương trình đang chạy / số định danh của nó." },
+    { term: "exit code", meaning: "Con số trả về khi kết thúc: 0 là ổn, khác 0 là lỗi." },
+    { term: "signal", meaning: "Thông điệp gửi tới process: TERM, KILL, HUP…" },
+    { term: "systemd", meaning: "PID 1, quản lý khởi động và giám sát các service." },
+    { term: "unit file", meaning: "File mô tả cách systemd chạy một service." },
+    { term: "journald / journalctl", meaning: "Hệ thống ghi log của systemd / lệnh đọc log đó." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn đã `systemctl start my-app` nhưng reboot máy thì app không tự chạy. Thiếu bước nào?"
+  options={["systemctl restart my-app", "systemctl enable my-app", "journalctl -u my-app", "chmod +x my-app"]}
+  answerIndex={1}
+  explanation="start = bật ngay bây giờ; enable = dặn systemd bật mỗi lần khởi động máy. Dùng `enable --now` để làm cả hai."
+/>

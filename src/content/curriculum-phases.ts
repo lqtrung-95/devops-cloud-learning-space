@@ -1,0 +1,52 @@
+import type { PhaseDefinition } from "./content-types";
+
+export const curriculumPhases: PhaseDefinition[] = [
+  {
+    id: "phase-0",
+    order: 0,
+    title: "Nền tảng",
+    weeks: "Tuần 1–4",
+    emoji: "🧱",
+    description: "Làm quen với server Linux, mạng máy tính và cách làm việc kiểu DevOps.",
+  },
+  {
+    id: "phase-1",
+    order: 1,
+    title: "Containers & CI/CD",
+    weeks: "Tuần 5–9",
+    emoji: "📦",
+    description: "Đóng gói ứng dụng vào container và để máy tự động test, build, deploy.",
+  },
+  {
+    id: "phase-2",
+    order: 2,
+    title: "AWS Cloud",
+    weeks: "Tuần 10–15",
+    emoji: "☁️",
+    description: "Thuê hạ tầng trên AWS: mạng, máy chủ, database, serverless — an toàn và tiết kiệm.",
+  },
+  {
+    id: "phase-3",
+    order: 3,
+    title: "Infrastructure as Code",
+    weeks: "Tuần 16–18",
+    emoji: "📜",
+    description: "Viết hạ tầng thành code để tạo/xoá/tái tạo chỉ bằng một lệnh.",
+  },
+  {
+    id: "phase-4",
+    order: 4,
+    title: "Kubernetes & GitOps",
+    weeks: "Tuần 19–23",
+    emoji: "☸️",
+    description: "Điều phối hàng trăm container tự động và deploy bằng Git.",
+  },
+  {
+    id: "phase-5",
+    order: 5,
+    title: "Observability, SRE & DevSecOps",
+    weeks: "Tuần 24–26",
+    emoji: "🔭",
+    description: "Theo dõi hệ thống, giữ nó ổn định và bảo mật từ code tới production.",
+  },
+];
