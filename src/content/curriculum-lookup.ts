@@ -36,13 +36,17 @@ export function getLessonContext(moduleSlug: string, lessonSlug: string) {
   };
 }
 
-/** Every progress key that exists in the curriculum — used to reject forged keys. */
-export function getAllProgressItemKeys(): Set<string> {
+let allProgressItemKeys: Set<string> | undefined;
+
+/** Every progress key that exists in the curriculum — used to reject forged keys. Built once. */
+export function getAllProgressItemKeys(): ReadonlySet<string> {
+  if (allProgressItemKeys) return allProgressItemKeys;
   const keys = new Set<string>();
   for (const learningModule of curriculumModules) {
     learningModule.lessons.forEach((lesson) => keys.add(lessonItemKey(learningModule.id, lesson.slug)));
     learningModule.labs.forEach((lab) => keys.add(labItemKey(learningModule.id, lab.id)));
   }
+  allProgressItemKeys = keys;
   return keys;
 }
 
