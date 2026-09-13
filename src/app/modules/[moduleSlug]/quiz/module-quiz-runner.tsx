@@ -43,12 +43,14 @@ export function ModuleQuizRunner({ moduleSlug, questions, passPercent }: ModuleQ
   const retry = () => {
     setAnswers(questions.map(() => -1));
     setGrade(null);
+    setError(null);
   };
 
   return (
     <div className="mt-8 space-y-6">
       {grade && (
         <div
+          role="status"
           className={clsx(
             "rounded-2xl p-6 text-center",
             grade.passed ? "bg-emerald-50 dark:bg-emerald-950/40" : "bg-amber-50 dark:bg-amber-950/40",
@@ -78,12 +80,11 @@ export function ModuleQuizRunner({ moduleSlug, questions, passPercent }: ModuleQ
         const result = grade?.results[questionIndex];
         return (
           <fieldset key={question.id} className="rounded-2xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
-            <legend className="sr-only">Câu {questionIndex + 1}</legend>
-            <p className="font-semibold">
+            <legend className="font-semibold">
               <span className="mr-2 text-indigo-600 dark:text-indigo-400">Câu {questionIndex + 1}.</span>
               <InlineCodeText text={question.question} />
-            </p>
-            <div className="mt-3 grid gap-2">
+            </legend>
+            <div role="radiogroup" className="mt-3 grid gap-2">
               {question.options.map((option, optionIndex) => {
                 const isSelected = answers[questionIndex] === optionIndex;
                 const isCorrectOption = result?.correctIndex === optionIndex;
@@ -93,7 +94,8 @@ export function ModuleQuizRunner({ moduleSlug, questions, passPercent }: ModuleQ
                     type="button"
                     disabled={Boolean(grade)}
                     onClick={() => selectAnswer(questionIndex, optionIndex)}
-                    aria-pressed={isSelected}
+                    role="radio"
+                    aria-checked={isSelected}
                     className={clsx(
                       "rounded-xl border px-3 py-2.5 text-left text-sm transition-colors",
                       !result && isSelected && "border-indigo-500 bg-indigo-50 dark:bg-indigo-950",

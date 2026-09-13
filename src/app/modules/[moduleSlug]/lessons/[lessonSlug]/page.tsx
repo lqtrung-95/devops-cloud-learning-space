@@ -22,9 +22,10 @@ export default async function LessonPage({ params }: LessonPageProps) {
   const { learningModule, lesson, index, previousLesson, nextLesson } = context;
 
   // Slugs are validated against the registry above, so this import only resolves known lesson files.
-  const { default: LessonContent } = await import(`@/content/modules/${learningModule.slug}/lessons/${lesson.slug}.mdx`);
-
-  const session = await getCurrentSession();
+  const [{ default: LessonContent }, session] = await Promise.all([
+    import(`@/content/modules/${learningModule.slug}/lessons/${lesson.slug}.mdx`),
+    getCurrentSession(),
+  ]);
   const completedKeys = session ? await getCompletedItemKeys(session.user.id) : new Set<string>();
   const isSignedIn = Boolean(session);
   const currentItemKey = lessonItemKey(learningModule.id, lesson.slug);

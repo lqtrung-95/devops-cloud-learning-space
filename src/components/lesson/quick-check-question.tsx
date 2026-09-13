@@ -47,7 +47,7 @@ export function QuickCheckQuestion({ question, options, answerIndex, explanation
         })}
       </div>
       {answered && (
-        <div className="mt-3 flex items-start justify-between gap-3">
+        <div aria-live="polite" className="mt-3 flex items-start justify-between gap-3">
           <p className="text-sm leading-relaxed text-stone-700 dark:text-stone-300">
             <strong>{selected === answerIndex ? "Chính xác! " : "Chưa đúng. "}</strong>
             <InlineCodeText text={explanation} />

@@ -37,7 +37,7 @@ export async function getBestQuizPercentByModule(userId: string): Promise<Map<st
 
 export async function getRecentQuizAttempts(userId: string, limit = 5) {
   return db
-    .select({ moduleId: quizAttempt.moduleId, score: quizAttempt.score, total: quizAttempt.total, createdAt: quizAttempt.createdAt })
+    .select({ id: quizAttempt.id, moduleId: quizAttempt.moduleId, score: quizAttempt.score, total: quizAttempt.total, createdAt: quizAttempt.createdAt })
     .from(quizAttempt)
     .where(eq(quizAttempt.userId, userId))
     .orderBy(desc(quizAttempt.createdAt))

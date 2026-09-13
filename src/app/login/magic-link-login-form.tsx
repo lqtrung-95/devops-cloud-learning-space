@@ -18,12 +18,12 @@ export function MagicLinkLoginForm({ isGithubEnabled, showLocalMailHint }: Magic
   const sendMagicLink = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setStatus({ kind: "sending" });
-    const { error } = await authClient.signIn.magicLink({ email, callbackURL: "/dashboard" });
+    const { error } = await authClient.signIn.magicLink({ email, callbackURL: "/dashboard", errorCallbackURL: "/login" });
     setStatus(error ? { kind: "error", message: error.message ?? "Không gửi được email, thử lại sau." } : { kind: "sent", email });
   };
 
   const signInWithGithub = async () => {
-    const { error } = await authClient.signIn.social({ provider: "github", callbackURL: "/dashboard" });
+    const { error } = await authClient.signIn.social({ provider: "github", callbackURL: "/dashboard", errorCallbackURL: "/login" });
     if (error) setStatus({ kind: "error", message: error.message ?? "Đăng nhập GitHub thất bại." });
   };
 

@@ -11,9 +11,9 @@ function intensityClass(count: number): string {
 }
 
 /** GitHub-style activity grid: columns are weeks, rows are weekdays (Monday first). */
-export function ActivityHeatmapGrid({ weeks }: { weeks: HeatmapDay[][] }) {
+export function ActivityHeatmapGrid({ weeks, summary }: { weeks: HeatmapDay[][]; summary: string }) {
   return (
-    <div className="flex gap-1 overflow-x-auto pb-1">
+    <div role="img" aria-label={summary} className="flex gap-1 overflow-x-auto pb-1">
       <div className="mr-1 grid grid-rows-7 gap-1 text-[10px] leading-3 text-stone-500">
         {dayLabels.map((label, index) => (
           <span key={index} className="h-3">

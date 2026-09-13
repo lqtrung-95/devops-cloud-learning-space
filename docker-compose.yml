@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: devops
       POSTGRES_DB: devops_learning
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432" # localhost only
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -18,11 +18,12 @@ services:
       retries: 10
 
   mailpit:
-    image: axllent/mailpit:latest
+    image: axllent/mailpit:v1.31.1
     restart: unless-stopped
     ports:
-      - "1025:1025" # SMTP
-      - "8025:8025" # Web UI to read emails
+      # Bound to localhost: anyone who can open Mailpit can read magic links.
+      - "127.0.0.1:1025:1025" # SMTP
+      - "127.0.0.1:8025:8025" # Web UI to read emails
 
 volumes:
   postgres-data:

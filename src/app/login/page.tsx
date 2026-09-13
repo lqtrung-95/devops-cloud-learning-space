@@ -6,9 +6,10 @@ import { MagicLinkLoginForm } from "./magic-link-login-form";
 
 export const metadata: Metadata = { title: "Đăng nhập" };
 
-export default async function LoginPage() {
+export default async function LoginPage({ searchParams }: PageProps<"/login">) {
   const session = await getCurrentSession();
   if (session) redirect("/dashboard");
+  const { error } = await searchParams;
 
   return (
     <div className="mx-auto flex max-w-md flex-col px-4 py-16">
@@ -20,6 +21,11 @@ export default async function LoginPage() {
         <p className="mt-2 text-sm text-stone-600 dark:text-stone-400">
           Đăng nhập để lưu tiến độ học, làm quiz và theo dõi chuỗi ngày học của bạn.
         </p>
+        {error && (
+          <p role="alert" className="mt-4 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950/40 dark:text-rose-300">
+            Link đăng nhập không hợp lệ hoặc đã hết hạn. Hãy gửi lại link mới.
+          </p>
+        )}
         <MagicLinkLoginForm isGithubEnabled={isGithubAuthEnabled} showLocalMailHint={process.env.NODE_ENV !== "production"} />
       </div>
     </div>

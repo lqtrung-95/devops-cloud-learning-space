@@ -9,7 +9,7 @@ import { getCurrentSession } from "@/lib/auth/auth-server";
 import { buildActivityHeatmap } from "@/lib/progress/activity-heatmap-builder";
 import { getActivityDates, getRecentQuizAttempts } from "@/lib/progress/learning-progress-repository";
 import { lessonItemKey } from "@/lib/progress/progress-item-keys";
-import { toPercent } from "@/lib/progress/quiz-grader";
+import { QUIZ_PASS_PERCENT, toPercent } from "@/lib/progress/quiz-grader";
 import { getUserProgressSnapshot } from "@/lib/progress/user-progress-snapshot";
 
 export const metadata: Metadata = { title: "Tiến độ của tôi" };
@@ -116,7 +116,7 @@ export default async function DashboardPage() {
           <section className="rounded-2xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
             <h2 className="text-lg font-bold">🔥 Hoạt động</h2>
             <div className="mt-4">
-              <ActivityHeatmapGrid weeks={heatmap} />
+              <ActivityHeatmapGrid weeks={heatmap} summary={`${activeDays} ngày có hoạt động học trong ${HEATMAP_WEEKS} tuần qua`} />
             </div>
           </section>
           <section className="rounded-2xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
@@ -129,9 +129,9 @@ export default async function DashboardPage() {
                   const learningModule = getModuleById(attempt.moduleId);
                   const percent = toPercent(attempt.score, attempt.total);
                   return (
-                    <li key={attempt.createdAt.toISOString()} className="flex items-center justify-between text-sm">
+                    <li key={attempt.id} className="flex items-center justify-between text-sm">
                       <span className="truncate">{learningModule?.title ?? attempt.moduleId}</span>
-                      <span className={percent >= 80 ? "font-semibold text-emerald-600" : "font-semibold text-amber-600"}>{percent}%</span>
+                      <span className={percent >= QUIZ_PASS_PERCENT ? "font-semibold text-emerald-600" : "font-semibold text-amber-600"}>{percent}%</span>
                     </li>
                   );
                 })}

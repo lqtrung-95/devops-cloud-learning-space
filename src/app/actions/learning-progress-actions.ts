@@ -32,7 +32,7 @@ export async function toggleProgressItemAction(input: { itemKey: string; complet
   return { ok: true, data: undefined };
 }
 
-const quizSchema = z.object({ moduleSlug: z.string().max(80), answers: z.array(z.number().int().min(-1).max(20)).max(50) });
+const quizSchema = z.object({ moduleSlug: z.string().max(80), answers: z.array(z.number().int().min(0).max(20)).max(50) });
 
 /** Grades a quiz on the server (answer key never leaves the server) and stores the attempt. */
 export async function submitQuizAction(input: { moduleSlug: string; answers: number[] }): Promise<ActionResult<QuizGradeResult>> {

@@ -29,6 +29,7 @@ export function LessonCompletionFooter({ itemKey, initiallyCompleted, isSignedIn
   const nextHref = nextLesson ? `/modules/${moduleSlug}/lessons/${nextLesson.slug}` : `/modules/${moduleSlug}/quiz`;
 
   const completeAndContinue = () => {
+    setError(null);
     startTransition(async () => {
       if (!completed) {
         setCompleted(true);
