@@ -30,6 +30,10 @@ pnpm dev                             # http://localhost:3000
 
 **GitHub OAuth (tuỳ chọn):** tạo OAuth App tại https://github.com/settings/developers với callback `http://localhost:3000/api/auth/callback/github`, điền `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` vào `.env`. Nút GitHub chỉ hiện khi đã cấu hình.
 
+## Deploy lên Vercel
+
+Xem hướng dẫn từng bước tại [docs/deployment-guide.md](docs/deployment-guide.md) — dùng Vercel Postgres (Neon) cho database và Resend cho email magic-link.
+
 ## Scripts
 
 | Lệnh | Việc |
@@ -64,3 +68,4 @@ docs/                          # curriculum, authoring guide, architecture
 - [Chương trình học](docs/curriculum.md)
 - [Hướng dẫn viết nội dung module](docs/content-authoring-guide.md)
 - [Kiến trúc hệ thống](docs/system-architecture.md)
+- [Hướng dẫn deploy lên Vercel](docs/deployment-guide.md)
