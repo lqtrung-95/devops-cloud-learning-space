@@ -1,0 +1,103 @@
+import { ErrorBudgetBurndownDiagram } from "../diagrams/error-budget-burndown-diagram";
+
+<Eli5 title="Error budget giống như hạn mức trễ giao hàng trong tháng" emoji="💰">
+
+Quán pizza hứa 99.5% đơn tới trong 30 phút. Vậy 0,5% còn lại là **"hạn mức được phép trễ"** trong tháng — như một cái ví nhỏ đựng "vé trễ giờ". Mỗi đơn trễ tiêu một ít tiền trong ví.
+
+Tháng này quán gặp một vụ tắc đường lớn, tiêu hết veat 80% ví ngay tuần đầu. Quản lý (error budget policy đã thống nhất từ trước) nói: *"Từ giờ tới cuối tháng, ngừng nhận đơn giao xa để không trễ thêm, tập trung giao đúng giờ."* Không ai cãi nhau vì luật đã có sẵn trước khi sự cố xảy ra.
+
+Nếu cả tháng không tắc đường, ví vẫn còn dư → quán được thử nghiệm menu mới, mở thêm khu vực giao hàng — tương đương đội dev được release tính năng mới thoải mái.
+
+</Eli5>
+
+Error budget là cầu nối biến SLO khô khan thành **quyết định hằng ngày**: hôm nay có nên deploy không, có nên tắt canary sớm không, có nên ưu tiên fix bug thay vì làm feature không. Không có error budget, mọi cuộc tranh luận "tốc độ vs ổn định" đều dựa trên cảm tính.
+
+<ErrorBudgetBurndownDiagram />
+
+<Technical>
+
+### Công thức
+
+```text
+Error budget = (1 − SLO) × tổng số sự kiện hợp lệ trong cửa sổ
+```
+
+Với SLO availability 99.5% trong 30 ngày:
+
+```text
+Error budget (phút) = 30 × 24 × 60 × (1 − 0.995) ≈ 216 phút
+Error budget (request) = tổng request × (1 − 0.995)
+```
+
+**Đã tiêu bao nhiêu?** = số request lỗi thực tế trong cửa sổ. **Còn lại (%)** = `1 − (đã tiêu / tổng budget)`.
+
+```text title="PromQL — % error budget còn lại (30 ngày)"
+1 - (
+  (sum(increase(http_requests_total{service="checkout",code=~"5.."}[30d])))
+  /
+  (sum(increase(http_requests_total{service="checkout"}[30d])) * (1 - 0.995))
+)
+```
+
+### Error budget policy — luật chơi thống nhất trước
+
+Một policy điển hình, viết ra và đồng ý **trước khi** có sự cố:
+
+| Budget còn lại | Hành động |
+|---|---|
+| > 50% | Release bình thường, kể cả thử nghiệm rủi ro |
+| 20–50% | Review kỹ hơn trước khi release; ưu tiên canary/feature flag |
+| < 20% | **Feature freeze**: chỉ merge fix liên quan tới độ tin cậy, hoãn feature mới |
+| Budget âm (đã vi phạm SLO) | Dừng mọi release không khẩn cấp; postmortem bắt buộc; kế hoạch khắc phục có deadline |
+
+Freeze **không phải hình phạt** — nó bảo vệ chính đội dev khỏi việc chồng thêm rủi ro lên một hệ thống đang không ổn định.
+
+### Vì sao không nhắm SLO 100%?
+
+Chi phí tăng phi tuyến theo mỗi số 9 thêm vào (multi-AZ → multi-region → active-active), trong khi lợi ích với người dùng giảm dần. Error budget hợp thức hoá việc **chấp nhận rủi ro có tính toán** — đúng tinh thần gốc của SRE: độ tin cậy là một tính năng có chi phí, không phải mặc định miễn phí.
+
+### Ai sở hữu policy?
+
+Policy nên được **product/eng lead ký duyệt trước**, không phải on-call tự quyết giữa đêm. Khi budget cạn, người phá vỡ "luật im lặng phát triển tính năng" là management, không phải kỹ sư đang trực.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tổng request và request lỗi trong 30 ngày qua", command: "promtool query instant http://localhost:9090 'sum(increase(http_requests_total{service=\"checkout\"}[30d]))'", output: "{} => 8942210 @[1757844302.1]" },
+    { command: "promtool query instant http://localhost:9090 'sum(increase(http_requests_total{service=\"checkout\",code=~\"5..\"}[30d]))'", output: "{} => 31740 @[1757844302.1]" },
+    { comment: "Tỉ lệ error budget còn lại", command: "echo '1 - (31740 / (8942210 * (1-0.995)))' | bc -l", output: "0.29082..." },
+    { comment: "Tạo recording rule budget còn lại để hiển thị trên dashboard", command: "kubectl apply -f prometheusrule-error-budget.yaml", output: "prometheusrule.monitoring.coreos.com/checkout-error-budget created" },
+  ]}
+/>
+
+<Callout type="tip" title="Gắn budget vào quy trình release">
+
+Tự động chặn merge/deploy khi CI thấy budget dưới ngưỡng (gọi API Prometheus trong pipeline) biến policy từ "lời hứa trên giấy" thành rào chắn thật.
+
+</Callout>
+
+<Callout type="mistake" title="Coi mọi phút downtime như nhau">
+
+2 phút lỗi rải đều lúc 3 giờ sáng khác hẳn 2 phút sập hoàn toàn giờ cao điểm bán hàng — dù cùng tiêu một lượng budget theo công thức. Policy nên tính thêm mức độ nghiêm trọng, không chỉ số phút.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "error budget", meaning: "Lượng 'được phép không đạt SLO' trong một cửa sổ thời gian: (1−SLO) × tổng sự kiện." },
+    { term: "error budget policy", meaning: "Luật hành động theo mức budget còn lại, thống nhất trước khi có sự cố." },
+    { term: "feature freeze", meaning: "Tạm dừng release tính năng mới khi budget cạn, chỉ merge fix độ tin cậy." },
+    { term: "burn-down", meaning: "Biểu đồ budget giảm dần theo thời gian trong cửa sổ." },
+    { term: "canary release", meaning: "Triển khai dần cho một phần nhỏ traffic để giới hạn thiệt hại nếu lỗi." },
+  ]}
+/>
+
+<QuickCheck
+  question="Error budget 30 ngày còn 15%. Theo policy đã thống nhất, việc nào NÊN làm?"
+  options={["Vẫn release feature lớn theo đúng roadmap đã hứa với khách", "Hoãn feature không khẩn cấp, ưu tiên fix nguyên nhân gây lỗi gần đây, dùng canary cho mọi thay đổi", "Hạ ngay SLO xuống 99% để coi như chưa cạn budget", "Tắt hết alert cho tới khi budget hồi phục"]}
+  answerIndex={1}
+  explanation="Ví tiền gần cạn thì tạm ngừng chi tiêu rủi ro, không phải vẽ lại ví cho to hơn (hạ SLO tuỳ tiện) hay bịt mắt không nhìn ví (tắt alert)."
+/>

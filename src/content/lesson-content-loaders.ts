@@ -23,4 +23,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "m11-ansible-packer": (lessonSlug) => import(`./modules/m11-ansible-packer/lessons/${lessonSlug}.mdx`),
   "m13-kubernetes-production-eks": (lessonSlug) => import(`./modules/m13-kubernetes-production-eks/lessons/${lessonSlug}.mdx`),
   "m14-gitops-argocd": (lessonSlug) => import(`./modules/m14-gitops-argocd/lessons/${lessonSlug}.mdx`),
+  "m16-sre-practices": (lessonSlug) => import(`./modules/m16-sre-practices/lessons/${lessonSlug}.mdx`),
 };

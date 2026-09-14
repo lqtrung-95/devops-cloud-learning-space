@@ -1,0 +1,145 @@
+import { IncidentTimelineDiagram } from "../diagrams/incident-timeline-diagram";
+
+<Eli5 title="Xử lý sự cố giống như đội cứu hoả chữa cháy" emoji="🚒">
+
+Khi cháy nhà, **người chỉ huy đội cứu hoả** không tự cầm vòi nước xịt — anh ta đứng ngoài, nhìn toàn cảnh, phân việc: "anh A phá cửa, anh B cứu người, anh C giữ liên lạc với người nhà nạn nhân". Đó là **Incident Commander (IC)**.
+
+Chữa cháy xong, đội **không họp để tìm ai làm cháy nhà rồi phạt** — họ hỏi: *"Vì sao lửa lan nhanh thế? Bình cứu hoả có hoạt động không? Lối thoát hiểm có bị chặn không?"* rồi **sửa cả toà nhà** để lần sau cháy nhỏ hơn hoặc không cháy nữa. Đó là tinh thần **blameless postmortem**.
+
+</Eli5>
+
+Hệ thống production sẽ có sự cố — không phải "nếu" mà là "khi nào". Điều phân biệt đội SRE giỏi không phải là "không bao giờ sập" mà là: **phát hiện nhanh, xử lý có tổ chức, và mỗi sự cố làm hệ thống mạnh hơn** thay vì lặp lại chính lỗi cũ.
+
+<IncidentTimelineDiagram />
+
+<Technical>
+
+### Mức độ nghiêm trọng (severity)
+
+| Mức | Ví dụ | Phản ứng |
+|---|---|---|
+| **SEV1** | Toàn bộ hệ thống sập, mất doanh thu trực tiếp | Page ngay, IC bắt buộc, thông báo status page |
+| **SEV2** | Một tính năng chính lỗi, ảnh hưởng nhiều khách | Page trong giờ hành động, có thể không cần IC riêng |
+| **SEV3** | Ảnh hưởng nhỏ, có workaround | Ticket, xử lý giờ hành chính |
+
+Định nghĩa severity **trước khi có sự cố**, không tranh cãi lúc đang cháy.
+
+### Vai trò trong incident response
+
+| Vai trò | Trách nhiệm |
+|---|---|
+| **Incident Commander (IC)** | Điều phối tổng thể, ra quyết định, KHÔNG tự debug |
+| **Operations lead / tech lead** | Trực tiếp chẩn đoán và sửa |
+| **Communications lead** | Cập nhật status page, thông báo nội bộ/khách hàng |
+| **Scribe** | Ghi timeline theo thời gian thực (mốc giờ, hành động, kết quả) |
+
+Sự cố nhỏ có thể một người kiêm nhiều vai; SEV1 nên tách rõ để tránh một người vừa sửa lỗi vừa phải trả lời Slack.
+
+### Runbook — biến kiến thức ngầm thành tài liệu
+
+```markdown title="runbook-checkout-high-error-rate.md"
+## Alert: CheckoutErrorBudgetBurnFast
+
+**Ý nghĩa:** Tỉ lệ lỗi checkout đang đốt error budget nhanh gấp ≥14.4 lần bình thường.
+
+**Tác động người dùng:** Khách không thanh toán được, mất đơn hàng trực tiếp.
+
+**Chẩn đoán:**
+1. Mở dashboard: `https://grafana.example.com/d/checkout-red`
+2. Có deploy nào trong 30 phút qua? `kubectl -n shop rollout history deploy/checkout`
+3. Lỗi tập trung ở downstream nào? Xem trace trong Tempo, lọc `status=error`.
+
+**Giảm thiểu:**
+- Nếu liên quan tới deploy gần nhất: `kubectl -n shop rollout undo deploy/checkout`
+- Nếu downstream (bank-gateway) lỗi: bật circuit breaker / chuyển sang provider dự phòng.
+
+**Escalate:** Nếu chưa cải thiện sau 15 phút, gọi thêm tech lead team payments qua PagerDuty.
+```
+
+Runbook tốt: **copy-paste được**, không giả định người đọc đã biết hệ thống, và được **thử nghiệm bởi người chưa quen** (game day ở bài sau).
+
+### Blameless postmortem — cấu trúc chuẩn
+
+```markdown title="postmortem-2026-09-14-checkout-outage.md"
+# Postmortem: Checkout error rate tăng đột biến
+
+**Mức độ:** SEV1 · **Thời gian:** 09:41–10:12 (31 phút) · **Tác động:** ~8.400 request lỗi, ước tính mất X đơn hàng
+
+## Tóm tắt
+Bản deploy v42 thay đổi timeout kết nối tới bank-gateway từ 5s xuống 1s, gây timeout hàng loạt dưới tải cao.
+
+## Timeline (giờ UTC+7)
+- 09:41 Alert CheckoutErrorBudgetBurnFast firing
+- 09:43 On-call xác nhận, gán SEV1, chỉ định IC
+- 09:52 Xác định deploy v42 là nghi phạm
+- 09:55 Rollback về v41
+- 10:05 Error rate về bình thường
+- 10:12 Alert resolved, tuyên bố kết thúc khẩn cấp
+
+## Nguyên nhân gốc (5 Whys)
+1. Sao lỗi? → Request tới bank-gateway timeout.
+2. Sao timeout? → Timeout config giảm còn 1s.
+3. Sao giảm? → PR thay đổi giá trị mặc định, không có test cho trường hợp p99 cao.
+4. Sao không phát hiện ở staging? → Staging không có traffic đủ lớn để p99 vượt 1s.
+5. Sao review không bắt được? → Không có checklist cho thay đổi timeout/circuit breaker.
+
+## Điều làm tốt
+- Alert burn-rate phát hiện trong 2 phút.
+- Runbook có sẵn giúp rollback trong 12 phút.
+
+## Điều chưa tốt
+- Không có canary cho thay đổi cấu hình timeout.
+- Load test staging chưa mô phỏng đúng traffic thật.
+
+## Action items
+| Việc | Owner | Hạn |
+|---|---|---|
+| Thêm canary bắt buộc cho mọi thay đổi timeout/circuit breaker | @tech-lead-payments | 2026-09-21 |
+| Load test staging dùng traffic replay từ production | @sre-team | 2026-09-28 |
+```
+
+**Blameless** không phải "không ai chịu trách nhiệm" — mà là hỏi *"vì sao hệ thống/quy trình cho phép lỗi này xảy ra"* thay vì *"ai đã làm sai"*. Người viết sai config không phải mục tiêu sửa — checklist và canary mới là.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem lịch sử rollout để tìm deploy nghi phạm", command: "kubectl -n shop rollout history deploy/checkout", output: "REVISION  CHANGE-CAUSE\n41        image=checkout:v41\n42        image=checkout:v42 (timeout 5s->1s)" },
+    { comment: "Rollback về bản trước", command: "kubectl -n shop rollout undo deploy/checkout", output: "deployment.apps/checkout rolled back" },
+    { comment: "Xác nhận rollout đã hoàn tất", command: "kubectl -n shop rollout status deploy/checkout", output: "deployment \"checkout\" successfully rolled out" },
+    { comment: "Tạo incident channel tự động (ví dụ tích hợp Slack)", command: "pd incident create --title 'Checkout error rate spike' --severity sev1 --service checkout" },
+    { comment: "Xuất timeline alert để đưa vào postmortem", command: "amtool alert query alertname=CheckoutErrorBudgetBurnFast --alertmanager.url=http://localhost:9093" },
+  ]}
+/>
+
+<Callout type="mistake" title="Postmortem nêu tên để đổ lỗi">
+
+"Do bạn A quên test" khiến lần sau người khác **giấu lỗi** thay vì báo cáo sớm. Viết lại thành "quy trình review chưa yêu cầu test cho thay đổi timeout" — sửa được hệ thống, không chỉ một người.
+
+</Callout>
+
+<Callout type="tip" title="Action items phải có owner và hạn">
+
+Postmortem không có action items cụ thể là "than thở có tổ chức". Mỗi action cần một người chịu trách nhiệm theo dõi và một ngày cụ thể, review lại trong sprint tiếp theo.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "severity (SEV1/2/3)", meaning: "Mức độ nghiêm trọng của sự cố, định nghĩa trước để quyết định tốc độ phản ứng." },
+    { term: "Incident Commander (IC)", meaning: "Người điều phối tổng thể sự cố, không tự debug." },
+    { term: "runbook", meaning: "Tài liệu từng bước để chẩn đoán và giảm thiểu một alert cụ thể." },
+    { term: "blameless postmortem", meaning: "Phân tích sự cố tập trung vào hệ thống/quy trình, không đổ lỗi cá nhân." },
+    { term: "5 Whys", meaning: "Kỹ thuật hỏi 'vì sao' liên tiếp để tìm nguyên nhân gốc thay vì triệu chứng." },
+    { term: "action item", meaning: "Việc cụ thể sau postmortem, có owner và hạn, để tránh lặp lại sự cố." },
+  ]}
+/>
+
+<QuickCheck
+  question="Trong lúc SEV1 đang xử lý, IC nên làm gì khi CTO nhắn tin hỏi tiến độ mỗi 5 phút?"
+  options={["Tự trả lời chi tiết kỹ thuật ngay để CTO yên tâm, tạm dừng điều phối", "Giao communications lead cập nhật định kỳ cho stakeholder để IC tập trung điều phối xử lý", "Bảo mọi người ngừng debug để họp báo cáo CTO", "Phớt lờ CTO cho tới khi xong"]}
+  answerIndex={1}
+  explanation="IC như chỉ huy cứu hoả: không rời vị trí chỉ huy để đích thân báo cáo từng phút. Phân vai communications lead giữ đúng luồng thông tin mà không làm gián đoạn xử lý."
+/>

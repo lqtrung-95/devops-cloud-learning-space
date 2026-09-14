@@ -1,0 +1,126 @@
+import { ToilAutomationSorterDiagram } from "../diagrams/toil-automation-sorter-diagram";
+
+<Eli5 title="Toil giống như rửa bát bằng tay mỗi ngày cho một quán ngày càng đông" emoji="🍽️">
+
+Quán ăn có hai loại việc: **nghĩ thực đơn mới, trang trí quán** (sáng tạo, mỗi lần khác nhau, tạo giá trị lâu dài) và **rửa bát sau mỗi lượt khách** (lặp đi lặp lại, không cần suy nghĩ, khách càng đông càng phải rửa nhiều).
+
+Nếu chủ quán chỉ có 2 tiếng mỗi ngày mà 1,5 tiếng dành để rửa bát bằng tay, quán **không bao giờ có thời gian nghĩ thực đơn mới** — quán sẽ dậm chân tại chỗ trong khi đối thủ mua máy rửa bát và bứt lên.
+
+**Toil** chính là "rửa bát bằng tay": việc thủ công, lặp lại, không cần tư duy, và **càng nhiều khách (traffic/server) thì càng nhiều việc** — không giảm theo thời gian nếu không ai sửa tận gốc.
+
+</Eli5>
+
+Google SRE đặt mục tiêu: **toil dưới 50% thời gian** của mỗi kỹ sư SRE. Vượt ngưỡng đó, đội không còn thời gian làm việc có đòn bẩy dài hạn (tự động hoá, cải thiện kiến trúc) — và toil sẽ chỉ tăng thêm theo quy mô hệ thống.
+
+<ToilAutomationSorterDiagram />
+
+<Technical>
+
+### Định nghĩa toil (theo SRE Book)
+
+Một việc là toil khi có **đủ các đặc điểm**:
+
+| Đặc điểm | Giải thích |
+|---|---|
+| Thủ công (manual) | Người phải trực tiếp làm |
+| Lặp lại (repetitive) | Làm lại y hệt nhiều lần |
+| Tự động hoá được (automatable) | Máy làm được nếu có công cụ |
+| Không tạo giá trị lâu dài (no enduring value) | Xong là hết, không để lại cải tiến |
+| Tăng theo quy mô (scales linearly) | Nhiều server/traffic hơn → nhiều việc hơn |
+
+**Không phải mọi việc nhàm chán đều là toil.** Viết postmortem lặp lại về mặt quy trình nhưng mỗi lần nội dung khác, tạo giá trị học hỏi — không tính là toil.
+
+### Đo toil
+
+Cách đơn giản: mỗi tuần, mọi thành viên ghi nhãn ticket/thời gian là `toil` hoặc `engineering`. Sau vài tuần, tính:
+
+```text
+% toil = tổng giờ toil / tổng giờ làm việc
+```
+
+Nếu > 50%, ưu tiên **1 sprint dành riêng cho tự động hoá** trước khi nhận thêm việc mới.
+
+### Từ toil tới tự động hoá — ví dụ thực tế
+
+| Toil | Tự động hoá thay thế |
+|---|---|
+| Restart pod bằng tay khi OOM | Đặt đúng `resources.limits`, bật HPA, hoặc dùng VPA |
+| Gia hạn chứng chỉ TLS thủ công | `cert-manager` với `ClusterIssuer` Let's Encrypt |
+| Tạo user/quyền IAM bằng tay | Terraform module + PR review, không click Console |
+| Trả lời "service down chưa" lặp lại | Runbook tự động (bài sau) hoặc self-service dashboard |
+| Xoá log cũ khi disk đầy | Log rotation + retention (M01/M15), alert saturation sớm |
+
+### Capacity planning cơ bản
+
+Capacity planning là toil-phòng-ngừa: dự đoán trước khi hết tài nguyên thay vì phản ứng lúc cháy nhà.
+
+1. **Đo baseline**: request/giây, CPU, memory hiện tại theo giờ cao điểm (từ dashboard USE ở M15).
+2. **Dự phóng tăng trưởng**: dựa trên xu hướng traffic 3–6 tháng qua, hoặc kế hoạch kinh doanh (đợt sale lớn).
+3. **Tính buffer**: giữ headroom (thường 20–40%) cho traffic bất thường và cho thời gian mua thêm/scale thêm.
+4. **Autoscaling làm phần việc lặp lại**: HPA theo CPU/custom metric, Karpenter thêm node — nhưng vẫn cần capacity planning cho **giới hạn cứng** (service quota AWS, vCPU quota vùng, kích cỡ RDS).
+5. **Load test trước sự kiện lớn** bằng `k6`/`hey` để xác nhận hệ thống chịu được tải dự phóng.
+
+```yaml title="hpa-checkout.yaml — autoscaling giảm toil 'thêm pod bằng tay'"
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkout
+  namespace: shop
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem xu hướng CPU 30 ngày qua để ước lượng tăng trưởng", command: "promtool query range http://localhost:9090 'sum(rate(container_cpu_usage_seconds_total{namespace=\"shop\"}[5m]))' --start=$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ) --end=$(date -u +%Y-%m-%dT%H:%M:%SZ) --step=1d" },
+    { comment: "Áp dụng HPA để bớt việc scale tay", command: "kubectl apply -f hpa-checkout.yaml", output: "horizontalpodautoscaler.autoscaling/checkout created" },
+    { comment: "Kiểm tra HPA đang hoạt động", command: "kubectl -n shop get hpa checkout", output: "NAME       REFERENCE             TARGETS   MINPODS   MAXPODS   REPLICAS\ncheckout   Deployment/checkout   58%/65%   3         20        4" },
+    { comment: "Load test trước một sự kiện lớn", command: "k6 run --vus 200 --duration 5m checkout-load-test.js", output: "checks.........................: 99.82% ✓ 59892 ✗ 108\nhttp_req_duration..............: p(95)=284ms" },
+    { comment: "Kiểm tra service quota trước khi scale mạnh (AWS)", command: "aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A", output: "Value: 256.0 (Running On-Demand Standard vCPUs)" },
+  ]}
+/>
+
+<Callout type="mistake" title="Tự động hoá thứ chưa hiểu rõ">
+
+Viết script tự động "restart mọi pod lỗi" mà chưa biết nguyên nhân gốc dễ **che giấu vấn đề thật** thay vì giải quyết. Trước khi tự động hoá, hiểu tại sao toil đó tồn tại.
+
+</Callout>
+
+<Callout type="tip" title="Ưu tiên tự động hoá theo tần suất × thời gian">
+
+Việc mất 5 phút nhưng làm 50 lần/tuần đáng tự động hoá hơn việc mất 2 giờ nhưng chỉ làm 1 lần/quý. Tính `tần suất × thời gian mỗi lần` để xếp hạng.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "toil", meaning: "Việc thủ công, lặp lại, tự động hoá được, không tạo giá trị lâu dài, tăng theo quy mô." },
+    { term: "engineering (đối lập toil)", meaning: "Công việc có tư duy, tạo cải tiến bền vững cho hệ thống." },
+    { term: "capacity planning", meaning: "Dự phóng nhu cầu tài nguyên tương lai và chuẩn bị trước khi thiếu." },
+    { term: "HPA (Horizontal Pod Autoscaler)", meaning: "Tự động tăng/giảm số pod theo metric, giảm toil scale thủ công." },
+    { term: "headroom / buffer", meaning: "Dung lượng dự phòng giữ lại cho traffic bất thường." },
+  ]}
+/>
+
+<QuickCheck
+  question="Đội SRE dành 65% thời gian mỗi tuần restart service bị leak memory bằng tay. Hành động đúng theo tinh thần SRE?"
+  options={["Chấp nhận vì hệ thống vẫn chạy được", "Thuê thêm người để restart nhanh hơn", "Ưu tiên một sprint sửa gốc rễ (fix leak hoặc đặt limit + liveness probe tự restart), vì toil đã vượt ngưỡng 50% khuyến nghị", "Viết thêm dashboard để xem restart đẹp hơn"]}
+  answerIndex={2}
+  explanation="65% thời gian rửa bát bằng tay nghĩa là quán không còn giờ nghĩ thực đơn mới. Ngưỡng toil 50% là tín hiệu dừng lại, đầu tư sửa tận gốc trước khi nhận thêm việc."
+/>

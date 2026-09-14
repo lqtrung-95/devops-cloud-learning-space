@@ -1,0 +1,144 @@
+import { ChaosExperimentInjectorDiagram } from "../diagrams/chaos-experiment-injector-diagram";
+
+<Eli5 title="Chaos engineering giống như diễn tập phòng cháy chữa cháy" emoji="🧯">
+
+Toà chung cư không chờ **cháy thật** để biết vòi cứu hoả có nước hay không. Mỗi quý, ban quản lý tổ chức **diễn tập có kiểm soát**: giả lập báo cháy, xem cư dân thoát hiểm đúng lối không, bình cứu hoả có hoạt động không — trong khung giờ đã báo trước, có đội an toàn đứng sẵn để dừng ngay nếu có gì bất ổn thật.
+
+**Chaos engineering** là diễn tập đó cho hệ thống: chủ động **kill một pod**, **làm chậm mạng**, xem hệ thống có tự hồi phục như bạn nghĩ không — thay vì đợi 3 giờ sáng một ngày thứ Bảy để phát hiện PodDisruptionBudget chưa được cấu hình.
+
+**Game day** là buổi diễn tập lớn hơn: cả đội cùng tham gia, một người đóng vai "kẻ gây rối" (thả chaos), người khác đóng vai on-call chỉ được dùng runbook để xử lý — giống một buổi diễn tập cứu hoả có giám sát viên.
+
+</Eli5>
+
+Học Kubernetes, Prometheus, SLO mà chưa từng **chủ động phá vỡ hệ thống của chính mình** thì bạn chỉ đang tin vào giả định. Chaos engineering biến giả định ("chắc HPA sẽ scale kịp") thành sự thật đã kiểm chứng.
+
+<ChaosExperimentInjectorDiagram />
+
+<Technical>
+
+### Nguyên tắc chaos engineering (Principles of Chaos)
+
+1. **Định nghĩa steady state đo được**: một chỉ số (SLI availability, latency) mô tả "hệ thống đang khoẻ".
+2. **Giả thuyết**: "Nếu kill 1 pod checkout, steady state vẫn giữ nguyên nhờ 3 replica + PDB."
+3. **Giới hạn blast radius**: chạy trên staging trước, hoặc một phần nhỏ traffic production, không phải toàn bộ ngay từ đầu.
+4. **Chạy thí nghiệm và so sánh** với baseline.
+5. **Luôn có nút dừng khẩn cấp** — nếu vượt ngoài dự kiến, dừng ngay và khôi phục.
+
+Đây là phương pháp khoa học áp dụng cho độ tin cậy — **khác hoàn toàn** với việc phá hệ thống ngẫu nhiên không kế hoạch.
+
+### Chaos Mesh trên Kubernetes
+
+Chaos Mesh dùng CRD để mô tả thí nghiệm, dễ review qua Git giống mọi manifest khác:
+
+```yaml title="podchaos-kill-checkout.yaml"
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: kill-one-checkout-pod
+  namespace: shop
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces: ["shop"]
+    labelSelectors:
+      app: checkout
+  duration: "30s"
+```
+
+```yaml title="networkchaos-payments-delay.yaml"
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: payments-latency
+  namespace: shop
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: ["shop"]
+    labelSelectors:
+      app: payments
+  delay:
+    latency: "500ms"
+    jitter: "50ms"
+  duration: "10m"
+```
+
+Dừng thí nghiệm bất cứ lúc nào: `kubectl delete networkchaos payments-latency -n shop`.
+
+### AWS Fault Injection Service (FIS) — cho hạ tầng AWS thật
+
+Khi thí nghiệm cần chạm tới tầng AWS (AZ failure, EC2 stop, RDS failover) thay vì chỉ tầng Kubernetes:
+
+```json title="fis-experiment-template.json (rút gọn)"
+{
+  "description": "Stop 50% checkout instances in one AZ",
+  "targets": {
+    "checkoutInstances": {
+      "resourceType": "aws:ec2:instance",
+      "selectionMode": "PERCENT(50)",
+      "filters": [{ "path": "Placement.AvailabilityZone", "values": ["ap-southeast-1a"] }]
+    }
+  },
+  "actions": {
+    "stopInstances": { "actionId": "aws:ec2:stop-instances", "targets": { "Instances": "checkoutInstances" } }
+  },
+  "stopConditions": [{ "source": "aws:cloudwatch:alarm", "value": "arn:aws:cloudwatch:...:alarm:checkout-error-budget-critical" }]
+}
+```
+
+`stopConditions` là **nút dừng tự động**: nếu alarm nghiêm trọng firing giữa thí nghiệm, FIS tự huỷ thí nghiệm.
+
+### Tổ chức một game day
+
+1. **Lên kế hoạch trước 1 tuần**: phạm vi, giả thuyết, thời gian, người tham gia, kênh liên lạc.
+2. **Vai trò**: người thả chaos (không tiết lộ chi tiết cho on-call), on-call thật (chỉ dùng dashboard + runbook), người quan sát ghi chú.
+3. **Chạy trong giờ hành chính**, có người biết cách dừng ngay lập tức.
+4. **Debrief ngay sau đó**: runbook có thiếu bước nào? Alert có bắn đúng lúc không? Ai bị bối rối ở đâu?
+5. **Viết postmortem** dù không phải sự cố thật — game day là cách rẻ nhất để tìm lỗ hổng trước khi khách hàng tìm ra.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài Chaos Mesh", command: "helm repo add chaos-mesh https://charts.chaos-mesh.org && helm install chaos-mesh chaos-mesh/chaos-mesh -n chaos-mesh --create-namespace" },
+    { comment: "Áp dụng thí nghiệm kill pod", command: "kubectl apply -f podchaos-kill-checkout.yaml", output: "podchaos.chaos-mesh.org/kill-one-checkout-pod created" },
+    { comment: "Quan sát pod mới lên thay thế", command: "kubectl -n shop get pods -l app=checkout -w", output: "checkout-7c9d8f6b5-x2k4q   0/1   Terminating\ncheckout-7c9d8f6b5-p8n3r   1/1   Running   0   4s" },
+    { comment: "Áp dụng network delay cho payments", command: "kubectl apply -f networkchaos-payments-delay.yaml", output: "networkchaos.chaos-mesh.org/payments-latency created" },
+    { comment: "Theo dõi dashboard trong lúc thí nghiệm", command: "watch -n 5 \"promtool query instant http://localhost:9090 'histogram_quantile(0.95, sum by (le)(rate(http_request_duration_seconds_bucket{service=\\\"checkout\\\"}[5m])))'\"" },
+    { comment: "Dừng khẩn cấp mọi thí nghiệm đang chạy", command: "kubectl delete podchaos,networkchaos,stresschaos -n shop --all", output: "podchaos.chaos-mesh.org \"kill-one-checkout-pod\" deleted\nnetworkchaos.chaos-mesh.org \"payments-latency\" deleted" },
+  ]}
+/>
+
+<Callout type="mistake" title="Chạy chaos trên production mà không báo ai">
+
+Chaos engineering không phải để gây bất ngờ. Luôn có **thông báo trước** trong team (dù có thể giấu chi tiết với người đóng vai on-call để test phản ứng thật), và có người sẵn sàng bấm nút dừng.
+
+</Callout>
+
+<Callout type="warning" title="Blast radius quá lớn ngay lần đầu">
+
+Lần đầu thử nghiệm nên giới hạn ở staging hoặc 1 pod/1% traffic. Kill toàn bộ replica hoặc cả AZ ngay từ đầu biến "thí nghiệm học hỏi" thành "sự cố thật ngoài kế hoạch".
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "steady state", meaning: "Trạng thái 'bình thường' đo được của hệ thống, dùng làm baseline so sánh." },
+    { term: "blast radius", meaning: "Phạm vi bị ảnh hưởng bởi một thí nghiệm chaos." },
+    { term: "Chaos Mesh", meaning: "Công cụ chaos engineering CNCF cho Kubernetes, dùng CRD." },
+    { term: "AWS FIS", meaning: "Fault Injection Service — chaos engineering ở tầng hạ tầng AWS." },
+    { term: "game day", meaning: "Buổi diễn tập chaos có tổ chức với vai trò rõ ràng và debrief sau đó." },
+    { term: "stop condition", meaning: "Điều kiện tự động huỷ thí nghiệm khi vượt ngưỡng an toàn." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn muốn kiểm tra hệ thống chịu được mất một Availability Zone hay không. Công cụ nào phù hợp nhất và nên chạy ở đâu trước?"
+  options={["Chaos Mesh PodChaos trực tiếp trên production", "AWS FIS với target là EC2/RDS trong một AZ cụ thể, thử trên staging trước khi làm ở production với stop condition", "Chỉ đọc tài liệu kiến trúc, không cần thí nghiệm thật", "Tắt cả cluster để kiểm tra"]}
+  answerIndex={1}
+  explanation="Mất cả AZ là sự kiện tầng hạ tầng AWS, không chỉ tầng pod — cần FIS nhắm vào EC2/RDS theo AZ. Luôn thử phạm vi nhỏ/staging trước và có stop condition tự động."
+/>

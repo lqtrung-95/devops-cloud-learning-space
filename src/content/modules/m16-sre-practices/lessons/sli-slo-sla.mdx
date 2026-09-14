@@ -1,0 +1,128 @@
+import { SliSloSlaTargetPickerDiagram } from "../diagrams/sli-slo-sla-target-picker-diagram";
+
+<Eli5 title="SLI, SLO, SLA giống như lời hứa của quán pizza" emoji="🍕">
+
+Quán pizza quảng cáo: **"Giao trong 30 phút, trễ thì miễn phí"**.
+
+- **SLI** (chỉ số) là thứ quán **đo thật**: mỗi đơn mất bao nhiêu phút từ lúc đặt tới lúc tới cửa. Từ đó tính "bao nhiêu % đơn tới trong 30 phút".
+- **SLO** (mục tiêu) là điều quản lý **tự đặt ra trong nội bộ**: "99% đơn phải tới trong 30 phút mỗi tháng". Chặt hơn quảng cáo một chút để còn vùng đệm.
+- **SLA** (cam kết) là **lời hứa có đền bù** với khách: trễ thì miễn phí pizza. Vi phạm SLA là mất tiền thật.
+
+Chú ý: quán **không hứa 100%** — trời mưa, kẹt xe là chuyện có thật. Hứa 100% thì phải thuê shipper đứng sẵn ở mọi ngõ, giá pizza sẽ đắt gấp mười. Phần trăm "được phép trễ" chính là **error budget** ở bài sau.
+
+</Eli5>
+
+"Hệ thống phải luôn chạy" không phải là mục tiêu — nó là ước mơ. SLO biến độ tin cậy thành **con số thống nhất giữa dev, ops và business**, để trả lời những câu hỏi khó: có nên release thứ Sáu không? Có đáng bỏ tiền chạy multi-region không? Alert nào đáng đánh thức người lúc 3 giờ sáng?
+
+<SliSloSlaTargetPickerDiagram />
+
+<Technical>
+
+### Định nghĩa
+
+| | SLI | SLO | SLA |
+|---|---|---|---|
+| Là gì | Số đo chất lượng dịch vụ | Mục tiêu cho SLI trong một cửa sổ thời gian | Hợp đồng với khách, có hậu quả |
+| Ví dụ | % request HTTP không trả 5xx | 99.5% trong 30 ngày cuốn chiếu | 99.0%/tháng, vi phạm hoàn 10% phí |
+| Ai quan tâm | Kỹ sư | Kỹ sư + product | Sales, legal, khách hàng |
+
+Không phải dịch vụ nào cũng có SLA, nhưng dịch vụ nào có người dùng cũng nên có SLO.
+
+### SLI tốt: tỉ lệ sự kiện tốt / tổng sự kiện
+
+Google SRE Workbook khuyến nghị viết mọi SLI dưới dạng **good events / valid events** — kết quả luôn từ 0 đến 100%.
+
+| Loại SLI | Good event | Đo ở đâu |
+|---|---|---|
+| Availability | Request không trả 5xx | Load balancer / ingress / service mesh |
+| Latency | Request nhanh hơn 300ms | Histogram `le="0.3"` |
+| Freshness | Dữ liệu cập nhật trong 10 phút | Batch pipeline |
+| Correctness | Kết quả đúng | Probe kiểm tra nội dung |
+
+Đo **càng gần người dùng càng tốt**: số liệu ở ALB phản ánh cả lỗi mà app không biết (pod chết, timeout ở LB); synthetic probe từ bên ngoài bắt được lỗi DNS/CDN.
+
+```text title="PromQL — SLI trên cửa sổ 30 ngày"
+# Availability: request không 5xx / tổng
+sum(rate(http_requests_total{service="checkout",code!~"5.."}[30d]))
+/
+sum(rate(http_requests_total{service="checkout"}[30d]))
+
+# Latency SLI: tỉ lệ request nhanh hơn 300ms
+sum(rate(http_request_duration_seconds_bucket{service="checkout",le="0.3"}[30d]))
+/
+sum(rate(http_request_duration_seconds_count{service="checkout"}[30d]))
+```
+
+Truy vấn `[30d]` trực tiếp rất nặng — thực tế dùng recording rule cửa sổ ngắn rồi tổng hợp, hoặc công cụ như **Sloth**, **Pyrra** sinh rule tự động.
+
+### Viết tài liệu SLO
+
+```yaml title="slo-checkout.yaml (định dạng tuỳ team, tham khảo OpenSLO)"
+service: checkout
+owner: team-payments
+slos:
+  - name: availability
+    sli: "request không trả 5xx / tổng request tại ingress"
+    objective: 99.5
+    window: 30d rolling
+  - name: latency
+    sli: "tỉ lệ request /checkout nhanh hơn 300ms"
+    objective: 95
+    window: 30d rolling
+rationale: >
+  Người dùng thử lại được khi lỗi; dữ liệu 3 tháng qua đạt 99.7%.
+  99.9% đòi hỏi multi-region, chưa đáng chi phí ở giai đoạn này.
+```
+
+Lưu ý latency SLO "p95 dưới 300ms" viết lại được thành "95% request nhanh hơn 300ms" — dạng tỉ lệ này dễ tính error budget hơn.
+
+### Chọn con số thế nào?
+
+1. **Nhìn dữ liệu quá khứ** — đừng đặt SLO mà hôm nay đã không đạt.
+2. **Hỏi người dùng/product** — mức nào khách bắt đầu than phiền?
+3. **Phụ thuộc giới hạn trên**: service của bạn khó tin cậy hơn các dependency mà nó bắt buộc gọi đồng bộ.
+4. **Bắt đầu lỏng, siết dần.** Hạ SLO sau khi đã hứa khó hơn nhiều.
+5. Xem lại SLO mỗi quý.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tỉ lệ availability 1 giờ gần nhất của checkout", command: "promtool query instant http://localhost:9090 'sum(rate(http_requests_total{service=\"checkout\",code!~\"5..\"}[1h])) / sum(rate(http_requests_total{service=\"checkout\"}[1h]))'", output: "{} => 0.99712 @[1757844302.1]" },
+    { comment: "Latency SLI: bucket 0.3s có tồn tại không?", command: "curl -s localhost:8080/metrics | grep 'http_request_duration_seconds_bucket' | grep -o 'le=\"[0-9.+Inf]*\"' | sort -u", output: "le=\"+Inf\"\nle=\"0.1\"\nle=\"0.3\"\nle=\"0.5\"\nle=\"1\"" },
+    { comment: "Tính nhanh error budget phút cho 99.5% / 30 ngày", command: "echo '30*24*60*(1-0.995)' | bc -l", output: "216.00000000000000000000" },
+    { comment: "Sinh rule SLO bằng Sloth từ file spec", command: "sloth generate -i slo-checkout-sloth.yaml -o slo-checkout-rules.yaml", output: "INF SLO alert rules generated ... slos=2" },
+  ]}
+/>
+
+<Callout type="mistake" title="SLO 100% hoặc toàn số 9">
+
+100% nghĩa là không bao giờ được deploy, không được thử nghiệm, không được bảo trì. Người dùng cũng không phân biệt được 99.99% với 100% — mạng di động của họ còn kém tin cậy hơn thế.
+
+</Callout>
+
+<Callout type="warning" title="SLA chặt hơn SLO">
+
+Nếu sales ký SLA 99.95% trong khi SLO nội bộ chỉ 99.5%, bạn sẽ vi phạm hợp đồng trước khi kịp nhận ra. SLO phải **chặt hơn** SLA — DevOps nên tham gia trước khi hợp đồng được ký.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "SLI", meaning: "Service Level Indicator — số đo chất lượng, thường là good events / valid events." },
+    { term: "SLO", meaning: "Service Level Objective — mục tiêu cho SLI trong một cửa sổ thời gian." },
+    { term: "SLA", meaning: "Service Level Agreement — cam kết hợp đồng có bồi thường khi vi phạm." },
+    { term: "rolling window", meaning: "Cửa sổ trượt, vd 30 ngày gần nhất, thay vì tháng dương lịch." },
+    { term: "synthetic probe", meaning: "Request giả lập gửi định kỳ từ bên ngoài để đo trải nghiệm." },
+    { term: "Sloth / Pyrra", meaning: "Công cụ sinh recording rule và alert SLO cho Prometheus." },
+  ]}
+/>
+
+<QuickCheck
+  question="API của bạn gọi đồng bộ một payment provider có SLA 99.9%. Product muốn SLO availability của API là 99.99%. Phản hồi hợp lý?"
+  options={["Đồng ý, chỉ cần thêm replica", "Chỉ đo lỗi của riêng code mình để đạt 99.99%", "Bỏ SLO vì phụ thuộc bên ngoài", "Khó khả thi vì dependency đồng bộ chỉ 99.9%; cần fallback/queue hoặc đặt SLO thấp hơn"]}
+  answerIndex={3}
+  explanation="Pizza không thể tới đúng giờ hơn độ đúng giờ của cầu đường bắt buộc phải đi qua. Muốn vượt giới hạn đó phải đổi kiến trúc: xử lý bất đồng bộ, retry, nhà cung cấp dự phòng."
+/>

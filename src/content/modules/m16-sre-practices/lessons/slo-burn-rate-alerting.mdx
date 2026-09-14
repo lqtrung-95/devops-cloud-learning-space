@@ -1,0 +1,139 @@
+import { BurnRateAlertWindowDiagram } from "../diagrams/burn-rate-alert-window-diagram";
+
+<Eli5 title="Burn rate giống như đồng hồ đo tốc độ tiêu xăng" emoji="⛽">
+
+Bình xăng (error budget) đủ chạy 30 ngày nếu bạn đi đúng tốc độ trung bình. Nhưng nếu bạn đột nhiên **đạp ga gấp 14 lần bình thường**, kim đồng hồ báo: *"đi kiểu này thì hết xăng sau 2 ngày, không phải 30 ngày!"* — đó là **burn rate 14.4**.
+
+Đồng hồ tốc độ tiêu xăng còn thông minh hơn đồng hồ km/h thường: nó nhìn **cả quãng đường xa (1 giờ)** để chắc chắn bạn thật sự đang đạp ga mạnh chứ không phải một cú giật ga qua ổ gà, **và cả khoảnh khắc gần nhất (5 phút)** để biết bạn *vẫn đang* đạp ga chứ không phải đã buông chân ga rồi.
+
+</Eli5>
+
+Alert theo ngưỡng cố định (`error_rate > 5%`) là nguyên nhân hàng đầu của alert fatigue: quá nhạy lúc traffic thấp, quá chậm lúc traffic cao. **Burn-rate alerting** — chuẩn được Google SRE Workbook khuyến nghị — alert theo **tốc độ tiêu error budget**, tự động thích ứng với traffic và mức độ nghiêm trọng.
+
+<BurnRateAlertWindowDiagram />
+
+<Technical>
+
+### Công thức burn rate
+
+```text
+burn_rate = (tỉ lệ lỗi thực tế trong cửa sổ) / (1 − SLO)
+```
+
+Với SLO 99.5% (`1 − SLO = 0.005`): nếu tỉ lệ lỗi thực tế trong 1 giờ là 7.2%, burn rate = `0.072 / 0.005 = 14.4`.
+
+**Burn rate 14.4** nghĩa là: giữ nguyên tốc độ này, budget cả cửa sổ 30 ngày sẽ cạn trong `30 / 14.4 ≈ 2.08 ngày`.
+
+### Bảng ngưỡng chuẩn (Google SRE Workbook, SLO 30 ngày)
+
+| Mức độ | Burn rate | Cửa sổ dài | Cửa sổ ngắn | % budget tiêu trong cửa sổ dài |
+|---|---|---|---|---|
+| Page ngay | 14.4 | 1h | 5m | 2% |
+| Page ngay (chậm hơn) | 6 | 6h | 30m | 5% |
+| Ticket (không cần đánh thức) | 1 | 3 ngày | 6h | 10% |
+
+Hai cửa sổ luôn cùng tỉ lệ **12:1** (1h:5m, 6h:30m) để cửa sổ ngắn phản ứng nhanh và hết ồn ngay khi sự cố qua đi.
+
+### PromQL cho alert đa cửa sổ
+
+```yaml title="prometheusrule-slo-burn-rate.yaml"
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: checkout-slo-burn-rate
+  namespace: shop
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: checkout.slo
+      rules:
+        - alert: CheckoutErrorBudgetBurnFast
+          expr: |
+            (
+              sum(rate(http_requests_total{service="checkout",code=~"5.."}[1h]))
+              /
+              sum(rate(http_requests_total{service="checkout"}[1h]))
+            ) > (14.4 * 0.005)
+            and
+            (
+              sum(rate(http_requests_total{service="checkout",code=~"5.."}[5m]))
+              /
+              sum(rate(http_requests_total{service="checkout"}[5m]))
+            ) > (14.4 * 0.005)
+          labels:
+            severity: page
+          annotations:
+            summary: "Checkout đang đốt error budget rất nhanh (burn rate ≥ 14.4)"
+            runbook_url: "https://wiki.example.com/runbooks/checkout-error-budget-burn-fast"
+        - alert: CheckoutErrorBudgetBurnSlow
+          expr: |
+            (
+              sum(rate(http_requests_total{service="checkout",code=~"5.."}[6h]))
+              /
+              sum(rate(http_requests_total{service="checkout"}[6h]))
+            ) > (6 * 0.005)
+            and
+            (
+              sum(rate(http_requests_total{service="checkout",code=~"5.."}[30m]))
+              /
+              sum(rate(http_requests_total{service="checkout"}[30m]))
+            ) > (6 * 0.005)
+          labels:
+            severity: page
+          annotations:
+            summary: "Checkout đang đốt error budget nhanh (burn rate ≥ 6)"
+```
+
+Vì `0.005 = 1 − 0.995` cố định, `14.4 * 0.005 = 0.072` — có thể viết thẳng số đã tính hoặc dùng biến template nếu team dùng Sloth/Pyrra để sinh rule tự động (khuyến nghị khi có nhiều service, tránh chép tay sai số).
+
+### So với ngưỡng cố định
+
+| | Ngưỡng cố định | Multi-window burn-rate |
+|---|---|---|
+| Traffic thấp ban đêm | Dễ false positive vì mẫu nhỏ | Tự thích ứng vì so với budget, không so với số tuyệt đối |
+| Sự cố ngắn nhưng nặng | Có thể bị `for` che mất | Cửa sổ ngắn bắt được ngay |
+| Hết sự cố | Alert resolved chậm (chờ hết `for`) | Cửa sổ ngắn tụt nhanh, resolved sớm |
+| Mức độ nghiêm trọng | Một ngưỡng, một mức phản ứng | Nhiều cặp cửa sổ, nhiều mức phản ứng |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra cú pháp rule trước khi apply", command: "promtool check rules prometheusrule-slo-burn-rate.yaml", output: "Checking prometheusrule-slo-burn-rate.yaml\n  SUCCESS: 2 rules found" },
+    { command: "kubectl apply -f prometheusrule-slo-burn-rate.yaml", output: "prometheusrule.monitoring.coreos.com/checkout-slo-burn-rate created" },
+    { comment: "Đốt error budget có chủ đích để test alert", command: "hey -z 5m -c 20 http://localhost:8080/fail", output: "Summary:\n  Total: 300.12 secs\n  Requests/sec: 66.4\n  Status code distribution:\n    [500] 19872 responses" },
+    { comment: "Theo dõi alert chuyển Pending → Firing", command: "watch -n 5 \"amtool alert query --alertmanager.url=http://localhost:9093\"" },
+    { comment: "Sinh rule tự động từ spec Sloth (tránh chép tay sai số)", command: "sloth generate -i checkout-slo.yaml -o checkout-slo-rules.yaml", output: "INF SLO alert rules generated ... rules=6" },
+  ]}
+/>
+
+<Callout type="mistake" title="Chỉ dùng một cửa sổ">
+
+Chỉ cửa sổ dài (1h) mà không có cửa sổ ngắn: alert vẫn firing hàng giờ sau khi sự cố đã hết vì trung bình 1h vẫn cao. Chỉ cửa sổ ngắn (5m) mà không có cửa sổ dài: một cú giật traffic vài giây cũng page. Cần cả hai cùng đúng.
+
+</Callout>
+
+<Callout type="tip" title="Dùng công cụ sinh rule">
+
+Tự tay nhân `14.4 * 0.005` cho từng service, từng SLO rất dễ sai. **Sloth** hoặc **Pyrra** nhận input là SLO spec, tự sinh đủ recording rule và alert rule theo bảng chuẩn.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "burn rate", meaning: "Tốc độ tiêu error budget so với tốc độ 'vừa đủ hết cuối cửa sổ'." },
+    { term: "multi-window", meaning: "Kết hợp cửa sổ dài (xác nhận mức độ) và cửa sổ ngắn (xác nhận vẫn đang xảy ra)." },
+    { term: "multi-burn-rate", meaning: "Nhiều cặp ngưỡng burn rate cho các mức phản ứng khác nhau (page ngay vs ticket)." },
+    { term: "Sloth / Pyrra", meaning: "Công cụ sinh Prometheus rule chuẩn từ SLO spec, tránh chép tay sai số." },
+  ]}
+/>
+
+<QuickCheck
+  question="Alert `CheckoutErrorBudgetBurnFast` (1h & 5m, ngưỡng 14.4) đã firing 20 phút rồi tự resolved dù cửa sổ 1h vẫn còn cao. Vì sao hợp lý?"
+  options={["Đây là bug của Alertmanager", "Điều kiện AND cần cả hai cửa sổ cùng đúng; cửa sổ 5 phút đã tụt xuống dưới ngưỡng nghĩa là sự cố hiện tại đã chấm dứt dù dư âm còn trong trung bình 1h", "Prometheus tự động tắt alert sau 20 phút", "SLO đã bị đổi"]}
+  answerIndex={1}
+  explanation="Kim đồng hồ tốc độ tiêu xăng tức thời (5 phút) đã về bình thường — dù quãng đường 1 giờ gần đây vẫn ghi nhận việc đạp ga trước đó. Đó chính là lý do cần cửa sổ ngắn: phản ánh đúng 'ngay bây giờ'."
+/>
