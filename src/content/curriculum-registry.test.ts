@@ -13,6 +13,11 @@ describe("curriculum registry", () => {
     expect(new Set(orders).size).toBe(orders.length);
   });
 
+  it("has a lesson content loader for every registered module", async () => {
+    const source = await import("node:fs").then((fs) => fs.readFileSync("src/content/lesson-content-loaders.ts", "utf8"));
+    for (const learningModule of curriculumModules) expect(source).toContain(`"${learningModule.slug}": (lessonSlug) => import(\`./modules/${learningModule.slug}/lessons/`);
+  });
+
   it("assigns every module to an existing phase", () => {
     const phaseIds = new Set(curriculumPhases.map((phase) => phase.id));
     for (const learningModule of curriculumModules) expect(phaseIds.has(learningModule.phaseId)).toBe(true);

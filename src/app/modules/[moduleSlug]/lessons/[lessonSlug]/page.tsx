@@ -3,6 +3,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ProgressItemCheckbox } from "@/components/progress/progress-item-checkbox";
 import { getLessonContext } from "@/content/curriculum-lookup";
+import { lessonContentLoaders } from "@/content/lesson-content-loaders";
 import { getCurrentSession } from "@/lib/auth/auth-server";
 import { getCompletedItemKeys } from "@/lib/progress/learning-progress-repository";
 import { lessonItemKey } from "@/lib/progress/progress-item-keys";
@@ -21,11 +22,10 @@ export default async function LessonPage({ params }: LessonPageProps) {
   if (!context) notFound();
   const { learningModule, lesson, index, previousLesson, nextLesson } = context;
 
-  // Slugs are validated against the registry above, so this import only resolves known lesson files.
-  const [{ default: LessonContent }, session] = await Promise.all([
-    import(`@/content/modules/${learningModule.slug}/lessons/${lesson.slug}.mdx`),
-    getCurrentSession(),
-  ]);
+  const loadLesson = lessonContentLoaders[learningModule.slug];
+  if (!loadLesson) notFound();
+  // Slugs are validated against the registry above, so the loader only resolves known lesson files.
+  const [{ default: LessonContent }, session] = await Promise.all([loadLesson(lesson.slug), getCurrentSession()]);
   const completedKeys = session ? await getCompletedItemKeys(session.user.id) : new Set<string>();
   const isSignedIn = Boolean(session);
   const currentItemKey = lessonItemKey(learningModule.id, lesson.slug);
