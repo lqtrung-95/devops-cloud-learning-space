@@ -18,4 +18,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "m08-aws-storage-database-serverless": (lessonSlug) => import(`./modules/m08-aws-storage-database-serverless/lessons/${lessonSlug}.mdx`),
   "m10-terraform": (lessonSlug) => import(`./modules/m10-terraform/lessons/${lessonSlug}.mdx`),
   "m12-kubernetes-core": (lessonSlug) => import(`./modules/m12-kubernetes-core/lessons/${lessonSlug}.mdx`),
+  "m15-observability": (lessonSlug) => import(`./modules/m15-observability/lessons/${lessonSlug}.mdx`),
 };

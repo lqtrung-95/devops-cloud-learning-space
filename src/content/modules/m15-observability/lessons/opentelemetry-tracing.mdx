@@ -1,0 +1,149 @@
+import { TraceSpanWaterfallDiagram } from "../diagrams/trace-span-waterfall-diagram";
+
+<Eli5 title="Distributed tracing giống như mã vận đơn của một kiện hàng" emoji="📦">
+
+Bạn đặt hàng online. Kiện hàng đi qua **kho Hà Nội → xe tải → bưu cục Đà Nẵng → shipper**. Mỗi nơi quét **mã vận đơn** và ghi "nhận lúc 8:00, giao đi lúc 9:30". Khi hàng tới trễ, bạn tra mã vận đơn là thấy ngay **nó nằm lì ở bưu cục nào**.
+
+Trong hệ thống: request là kiện hàng, **trace ID** là mã vận đơn, mỗi lần "quét" ở một service là một **span** (bắt đầu lúc nào, kéo dài bao lâu). Ghép các span lại thành **waterfall** — biểu đồ hành trình.
+
+Mấu chốt: mã vận đơn phải **dán lên kiện hàng và đi theo nó**. Nếu một bưu cục bóc nhãn cũ và dán nhãn mới, hành trình bị đứt đôi — trong tracing gọi là **mất context propagation**.
+
+</Eli5>
+
+Metrics nói "checkout chậm", logs nói "payments timeout", nhưng chỉ trace trả lời được: **request cụ thể này** chậm ở bước nào, trong chuỗi 8 service. **OpenTelemetry** (OTel, dự án CNCF) là chuẩn mở chung cho cả traces, metrics và logs — instrument một lần, gửi tới Tempo, Jaeger, X-Ray, Datadog tuỳ ý.
+
+<TraceSpanWaterfallDiagram />
+
+<Technical>
+
+### Khái niệm cốt lõi
+
+| Thuật ngữ | Ý nghĩa |
+|---|---|
+| **Trace** | Toàn bộ hành trình một request; định danh bằng trace ID 16 byte (32 ký tự hex) |
+| **Span** | Một đơn vị công việc: tên, start/end, parent span ID, attributes, events, status |
+| **Context propagation** | Truyền trace ID + span ID qua ranh giới service (HTTP header, message metadata) |
+| **Resource** | Thông tin về nguồn phát: `service.name`, `k8s.pod.name`, `deployment.environment` |
+| **Sampling** | Chọn giữ lại bao nhiêu trace để kiểm soát chi phí |
+
+Header chuẩn **W3C Trace Context**:
+
+```text title="traceparent: version-traceid-parentid-flags"
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+```
+
+`01` ở cuối = sampled. Service nhận header này sẽ tạo span con cùng trace ID.
+
+### Kiến trúc OpenTelemetry
+
+1. **SDK / auto-instrumentation** trong app: tạo span cho HTTP server/client, DB driver, gRPC… gần như không sửa code.
+2. **OTLP**: giao thức gửi telemetry (gRPC port `4317`, HTTP port `4318`).
+3. **Collector**: nhận → xử lý (batch, lọc, sampling, thêm attribute) → export tới backend.
+4. **Backend**: Grafana Tempo, Jaeger, AWS X-Ray, SaaS.
+
+```yaml title="otel-collector-config.yaml"
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch:
+    timeout: 5s
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo.observability.svc.cluster.local:4317
+    tls:
+      insecure: true   # chỉ dùng trong lab, production hãy bật TLS
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]
+```
+
+### Instrument không sửa code
+
+```yaml title="deployment env (Node.js)"
+env:
+  - name: NODE_OPTIONS
+    value: "--require @opentelemetry/auto-instrumentations-node/register"
+  - name: OTEL_SERVICE_NAME
+    value: payments
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_TRACES_SAMPLER
+    value: parentbased_traceidratio
+  - name: OTEL_TRACES_SAMPLER_ARG
+    value: "0.1"   # giữ 10% trace gốc
+```
+
+Python dùng `opentelemetry-instrument python app.py`; Java dùng `-javaagent:opentelemetry-javaagent.jar`. Trên Kubernetes, **OpenTelemetry Operator** có thể tự inject qua annotation.
+
+### Sampling
+
+- **Head sampling** (`traceidratio`): quyết định lúc bắt đầu — rẻ, nhưng có thể bỏ sót trace lỗi hiếm.
+- **Tail sampling** (processor `tail_sampling` trong Collector contrib): chờ trace xong mới quyết — giữ 100% trace lỗi hoặc chậm, chỉ giữ 5% trace bình thường. Tốn RAM Collector hơn.
+- `parentbased_*` đảm bảo service con tôn trọng quyết định của service cha, tránh trace bị thiếu mảnh.
+
+### Nối ba trụ cột
+
+- **Trace → log**: logger in `trace_id`/`span_id` (SDK OTel cho nhiều ngôn ngữ tự thêm vào log context); Grafana derived field nhảy từ log sang Tempo.
+- **Metric → trace**: **exemplars** gắn trace ID mẫu vào điểm histogram; bấm vào điểm p99 trên Grafana mở đúng trace chậm.
+- **TraceQL** (Tempo) tìm trace theo điều kiện, ví dụ: `{ resource.service.name = "payments" && duration > 500ms && status = error }`.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài Tempo (single binary cho lab)", command: "helm install tempo grafana/tempo -n observability" },
+    { comment: "Cài OpenTelemetry Collector với config ở trên", command: "helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts && helm install otel-collector open-telemetry/opentelemetry-collector -n observability --set mode=deployment --set image.repository=otel/opentelemetry-collector-contrib -f otel-values.yaml" },
+    { comment: "Gửi request có sẵn traceparent để tự đặt trace ID", command: "curl -s -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' http://localhost:8080/checkout -d '{\"sku\":\"A1\"}'", output: "{\"orderId\":\"A91\",\"status\":\"paid\"}" },
+    { comment: "Kiểm tra log có cùng trace_id", command: "kubectl -n shop logs deploy/payments --since=2m | grep 4bf92f3577b34da6a3ce929d0e0e4736", output: "{\"level\":\"warn\",\"msg\":\"bank gateway slow\",\"duration_ms\":730,\"trace_id\":\"4bf92f3577b34da6a3ce929d0e0e4736\"}" },
+    { comment: "Lấy trace từ Tempo HTTP API", command: "kubectl -n observability port-forward svc/tempo 3200 & curl -s localhost:3200/api/traces/4bf92f3577b34da6a3ce929d0e0e4736 | jq '[.batches[].scopeSpans[].spans[]] | length'", output: "5" },
+    { comment: "Xem Collector có nhận/gửi span không (metrics nội bộ)", command: "kubectl -n observability logs deploy/otel-collector | grep -i -E 'error|dropped' | tail -3" },
+  ]}
+/>
+
+<Callout type="mistake" title="Trace đứt đôi ở message queue">
+
+HTTP client đã instrument tự thêm `traceparent`, nhưng khi gửi qua SQS/Kafka bạn phải **inject context vào message attributes** và **extract** ở consumer. Quên bước này, waterfall dừng ở producer và consumer mở trace mới.
+
+</Callout>
+
+<Callout type="cost" title="Lưu 100% trace ở traffic lớn">
+
+Mỗi request có thể sinh hàng chục span. Ở vài nghìn request/giây, lưu tất cả rất tốn storage (hoặc phí SaaS). Bắt đầu với head sampling 5–10% và tail sampling giữ trace lỗi/chậm.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "trace ID", meaning: "Mã định danh chung cho mọi span thuộc cùng một request." },
+    { term: "span", meaning: "Một bước công việc có thời gian bắt đầu/kết thúc và parent." },
+    { term: "context propagation", meaning: "Truyền trace context qua header/message giữa các service." },
+    { term: "OTLP", meaning: "Giao thức chuẩn của OpenTelemetry để gửi traces, metrics, logs." },
+    { term: "OTel Collector", meaning: "Trạm trung chuyển nhận, xử lý và export telemetry tới backend." },
+    { term: "head / tail sampling", meaning: "Quyết định giữ trace lúc bắt đầu / sau khi trace hoàn tất." },
+    { term: "exemplar", meaning: "Trace ID mẫu gắn vào điểm metric để nhảy từ biểu đồ sang trace." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn bật head sampling 1%. Một lỗi thanh toán chỉ xảy ra với 0,1% request và team không bao giờ tìm thấy trace của nó. Giải pháp hợp lý nhất?"
+  options={["Tắt tracing, chỉ dùng log", "Tail sampling trong Collector: giữ mọi trace có status error, lấy mẫu phần còn lại", "Tăng scrape interval của Prometheus", "Đổi trace ID sang 64 ký tự"]}
+  answerIndex={1}
+  explanation="Head sampling quyết định trước khi biết kiện hàng có bị thất lạc không. Tail sampling chờ tới cuối hành trình rồi giữ lại những kiện có vấn đề."
+/>

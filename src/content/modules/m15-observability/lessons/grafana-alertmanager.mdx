@@ -1,0 +1,154 @@
+import { AlertmanagerRoutingSimulatorDiagram } from "../diagrams/alertmanager-routing-simulator-diagram";
+
+<Eli5 title="Alerting giống như tổng đài báo cháy của một khu chung cư" emoji="🚒">
+
+**Grafana** là **màn hình camera ở phòng bảo vệ**: nhìn tổng quan cả khu, nhưng không ai ngồi nhìn 24/7.
+
+**Alert rule** là **cảm biến khói** ở từng tầng. Cảm biến không kêu ngay khi có một làn khói thuốc lá — nó chờ khói dày **liên tục vài phút** (đó là `for: 5m`, trạng thái Pending) rồi mới báo (Firing).
+
+**Alertmanager** là **tổng đài viên**: 40 cảm biến cùng tầng 7 kêu thì chỉ gọi **một** cuộc ("tầng 7 có cháy" — grouping); cháy thật thì gọi **đội cứu hoả** (PagerDuty), còn bóng đèn hành lang hỏng thì **nhắn tin cho ban quản lý** (Slack); đang diễn tập PCCC thì **tạm tắt chuông** (silence); mất điện cả toà thì đừng báo từng thang máy dừng (inhibition).
+
+</Eli5>
+
+Alert tồi là nguyên nhân số một khiến kỹ sư on-call kiệt sức: báo quá nhiều, báo thứ không cần hành động, báo lúc 3 giờ sáng cho việc chờ được tới sáng. Kỹ năng thiết kế alert và cấu hình routing là thứ phân biệt người "cài được Prometheus" với người vận hành production thật.
+
+<AlertmanagerRoutingSimulatorDiagram />
+
+<Technical>
+
+### Grafana dashboard tốt
+
+- **Một dashboard cho một câu hỏi**: "checkout có khoẻ không?" — hàng trên là RED, hàng dưới là saturation và dependency.
+- Dùng **variables** (`$namespace`, `$service`) để một dashboard dùng cho nhiều service.
+- Lưu dashboard dưới dạng JSON trong Git (provisioning, hoặc ConfigMap có label `grafana_dashboard: "1"` với sidecar của kube-prometheus-stack) — đừng chỉ bấm tay trên UI.
+- Đặt đơn vị (seconds, percent), ngưỡng màu khớp với ngưỡng alert.
+
+### Vòng đời một alert
+
+| Trạng thái | Nghĩa |
+|---|---|
+| **Inactive** | Điều kiện `expr` đang sai |
+| **Pending** | `expr` đúng nhưng chưa đủ thời gian `for` |
+| **Firing** | Đúng liên tục ≥ `for` → gửi sang Alertmanager |
+| **Resolved** | Hết đúng → Alertmanager gửi "resolved" nếu `send_resolved: true` |
+
+```yaml title="prometheusrule-checkout-alerts.yaml"
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: checkout-alerts
+  namespace: shop
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: checkout.alerts
+      rules:
+        - alert: HighErrorRate
+          expr: |
+            sum by (service) (rate(http_requests_total{service="checkout",code=~"5.."}[5m]))
+            /
+            sum by (service) (rate(http_requests_total{service="checkout"}[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: page
+          annotations:
+            summary: "Checkout error rate trên 5%"
+            runbook_url: "https://wiki.example.com/runbooks/checkout-high-error-rate"
+        - alert: HighLatencyP95
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le, service) (rate(http_request_duration_seconds_bucket{service="checkout"}[5m]))
+            ) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+```
+
+### Cấu hình Alertmanager
+
+```yaml title="alertmanager.yaml"
+route:
+  receiver: slack-default          # nhận mọi thứ không khớp route con
+  group_by: ["alertname", "service"]
+  group_wait: 30s                  # chờ gom alert đầu tiên của nhóm
+  group_interval: 5m               # gửi cập nhật khi nhóm có alert mới
+  repeat_interval: 4h              # nhắc lại nếu vẫn firing
+  routes:
+    - matchers:
+        - severity="page"
+      receiver: pagerduty-oncall
+
+inhibit_rules:
+  - source_matchers:
+      - alertname="NodeDown"
+    target_matchers:
+      - severity="warning"
+    equal: ["node"]                # chỉ che alert trên cùng node
+
+receivers:
+  - name: slack-default
+    slack_configs:
+      - api_url_file: /etc/alertmanager/secrets/slack-webhook/url
+        channel: "#alerts"
+        send_resolved: true
+  - name: pagerduty-oncall
+    pagerduty_configs:
+      - routing_key_file: /etc/alertmanager/secrets/pagerduty/key
+```
+
+Luồng thực tế: **route** (chọn receiver) → **group** → **inhibit** → **silence** → gửi thông báo. `routing_key_file` và `api_url_file` giúp webhook nằm trong Kubernetes Secret thay vì plain text; tuỳ phiên bản Alertmanager, một số trường `*_file` mới có — kiểm tra tài liệu phiên bản bạn dùng.
+
+### Thiết kế alert đáng tin
+
+1. **Alert theo triệu chứng người dùng** (error rate, latency) → page. Alert theo nguyên nhân (CPU 90%) → thường chỉ là ticket/dashboard.
+2. Mỗi alert page phải **cần hành động ngay** và có `runbook_url`.
+3. Có `for` hợp lý để tránh flapping.
+4. Alert "watchdog" luôn firing để phát hiện chính Alertmanager chết (kube-prometheus-stack có sẵn `Watchdog`).
+5. Bài M16 sẽ nâng cấp lên **alert theo SLO burn rate** — ít ồn hơn ngưỡng cố định.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Mở Grafana (user admin; mật khẩu nằm trong Secret)", command: "kubectl -n monitoring get secret monitoring-grafana -o jsonpath='{.data.admin-password}' | base64 -d; kubectl -n monitoring port-forward svc/monitoring-grafana 3000:80" },
+    { comment: "Lưu Slack webhook vào Secret, không commit vào Git", command: "kubectl -n monitoring create secret generic slack-webhook --from-literal=url='https://hooks.slack.com/services/XXX/YYY/ZZZ'" },
+    { comment: "Kiểm tra cú pháp cấu hình trước khi áp dụng", command: "amtool check-config alertmanager.yaml", output: "Checking 'alertmanager.yaml'  SUCCESS\nFound:\n - global config\n - route\n - 1 inhibit rules\n - 2 receivers\n - 0 templates" },
+    { comment: "Xem alert đang firing", command: "kubectl -n monitoring port-forward svc/monitoring-kube-prometheus-alertmanager 9093 & amtool alert query --alertmanager.url=http://localhost:9093", output: "Alertname       Starts At                Summary\nWatchdog        2026-09-14 08:00:12 UTC  An alert that should always be firing\nHighErrorRate   2026-09-14 09:41:30 UTC  Checkout error rate trên 5%" },
+    { comment: "Tạo silence 1 giờ cho đợt bảo trì", command: "amtool silence add service=checkout --duration=1h --comment='DB migration' --alertmanager.url=http://localhost:9093", output: "7d2c1a9e-3b4f-4c1e-9f0a-5e6b7c8d9e0f" },
+    { comment: "Liệt kê silence đang hiệu lực", command: "amtool silence query --alertmanager.url=http://localhost:9093" },
+  ]}
+/>
+
+<Callout type="mistake" title="Alert fatigue">
+
+Mỗi alert page không cần hành động dạy on-call **phớt lờ** alert. Sau 2 tuần, người ta tắt thông báo — và bỏ lỡ sự cố thật. Mỗi tuần, xem lại các alert đã firing: xoá, hạ xuống ticket, hoặc sửa ngưỡng.
+
+</Callout>
+
+<Callout type="warning" title="Silence không hết hạn">
+
+Silence tạo "tạm thời" rồi quên sẽ che sự cố thật nhiều ngày sau. Luôn đặt `--duration` ngắn và ghi `--comment` có tên người tạo.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "alerting rule", meaning: "Biểu thức PromQL + `for` + labels; đúng đủ lâu thì Firing." },
+    { term: "Pending / Firing", meaning: "Đang chờ đủ thời gian `for` / đã xác nhận và gửi đi." },
+    { term: "route / receiver", meaning: "Cây quy tắc chọn nơi nhận / đích gửi (Slack, PagerDuty, email)." },
+    { term: "grouping", meaning: "Gom nhiều alert có label giống nhau thành một thông báo." },
+    { term: "silence", meaning: "Tắt thông báo tạm thời cho alert khớp matcher, có thời hạn." },
+    { term: "inhibition", meaning: "Alert nguồn đang firing thì ẩn các alert đích liên quan." },
+    { term: "alert fatigue", meaning: "Quá nhiều alert vô ích khiến người trực bỏ qua cả alert quan trọng." },
+  ]}
+/>
+
+<QuickCheck
+  question="Cả zone AZ-a mất mạng, bạn nhận 1 alert `ZoneUnreachable` và 60 alert `PodNotReady` severity warning. Cấu hình nào giúp on-call chỉ thấy alert nguyên nhân?"
+  options={["Tăng `repeat_interval` lên 24h", "Thêm silence cho `PodNotReady` vĩnh viễn", "Giảm `group_wait` xuống 0s", "`inhibit_rules` với source `ZoneUnreachable`, target `severity=\"warning\"`, `equal: [\"zone\"]`"]}
+  answerIndex={3}
+  explanation="Như mất điện cả toà thì không cần báo từng thang máy dừng. Inhibition chỉ che khi alert nguồn đang firing; silence vĩnh viễn sẽ che cả những lần PodNotReady thật."
+/>

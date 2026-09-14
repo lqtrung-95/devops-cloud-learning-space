@@ -1,0 +1,142 @@
+import { LogShippingPipelineDiagram } from "../diagrams/log-shipping-pipeline-diagram";
+
+<Eli5 title="Log tập trung giống như bưu điện gom thư của cả thành phố" emoji="📮">
+
+Hồi M01 bạn đọc log bằng cách **tới tận nhà** (SSH vào server) và mở sổ ra xem (`tail -f`). Với Kubernetes, bạn có 300 pod, pod sinh ra rồi biến mất sau mỗi lần deploy — như một thành phố mà nhà cửa **tự dời đi mỗi ngày**. Tới tận nơi là bất khả thi.
+
+Giải pháp: mỗi nhà chỉ việc **bỏ thư vào hộp thư ở tầng** (in log ra stdout). Một **bưu tá** ở mỗi khu phố (agent DaemonSet như Grafana Alloy, Fluent Bit) đi gom, **dán mã bưu chính** (label: namespace, app, pod) rồi chở về **bưu điện trung tâm** (Loki hoặc CloudWatch Logs). Muốn tìm thư, bạn tra theo mã bưu chính trước, rồi mới lục nội dung.
+
+Chỗ ví von hụt: thư thật mất thì thôi, còn log bị mất khi agent quá tải là chuyện có thật — cần theo dõi cả "bưu tá".
+
+</Eli5>
+
+Log là trụ cột **đắt nhất** và cũng dễ làm sai nhất: quá ít thì không debug được, quá nhiều thì hoá đơn CloudWatch tăng vọt. DevOps cần thiết kế đường ống log sao cho app không phải biết log đi đâu, và đội dev tìm được đúng dòng log trong vài giây.
+
+<LogShippingPipelineDiagram />
+
+<Technical>
+
+### Nguyên tắc 12-factor: log là stream
+
+App **chỉ in ra stdout/stderr**, không tự xoay vòng file, không tự gửi lên server log. Việc thu gom là của nền tảng. Nhờ vậy cùng một image chạy được với Loki, CloudWatch hay Datadog.
+
+### Các lựa chọn agent
+
+| Agent | Ghi chú |
+|---|---|
+| **Grafana Alloy** | Bản phân phối OpenTelemetry Collector của Grafana, thay thế Grafana Agent và **Promtail** (Promtail đã bị deprecate — kiểm tra tài liệu mới nhất) |
+| **Fluent Bit** | Nhẹ, viết bằng C, CNCF; AWS dùng trong Container Insights |
+| **OpenTelemetry Collector** | Receiver `filelog`; hợp khi muốn gom cả metrics/traces về một agent |
+| Fluentd | Nhiều plugin nhưng nặng hơn; đang dần nhường chỗ cho Fluent Bit |
+
+### Loki: đánh index label, không index nội dung
+
+Loki lưu log thành **stream** = một bộ label duy nhất. Chỉ label được index; nội dung nén thành chunk trên object storage (S3). Vì vậy:
+
+- Label nên **ít giá trị**: `cluster`, `namespace`, `app`, `level`. **Không** dùng `user_id`, `trace_id`, `request_id` làm label.
+- Mọi truy vấn LogQL bắt đầu bằng stream selector trong ngoặc nhọn.
+
+```text title="LogQL"
+# Chọn stream, lọc chuỗi, parse JSON, lọc theo field
+{namespace="shop", app="payments"} |= "timeout" | json | level="error"
+
+# Tìm theo trace_id — lọc nội dung, KHÔNG phải label
+{namespace="shop"} |= "4bf92f3577b34da6a3ce929d0e0e4736"
+
+# Metric từ log: số dòng lỗi mỗi giây theo app
+sum by (app) (rate({namespace="shop"} | json | level="error" [5m]))
+```
+
+### Fluent Bit → CloudWatch Logs
+
+```ini title="fluent-bit.conf (rút gọn)"
+[INPUT]
+    Name              tail
+    Path              /var/log/containers/*.log
+    multiline.parser  docker, cri
+    Tag               kube.*
+
+[FILTER]
+    Name              kubernetes
+    Match             kube.*
+    Merge_Log         On
+
+[OUTPUT]
+    Name              cloudwatch_logs
+    Match             kube.*
+    region            ap-southeast-1
+    log_group_name    /eks/shop/application
+    log_stream_prefix pod-
+    auto_create_group On
+```
+
+Trên EKS, cách ít công nhất là bật add-on **Amazon CloudWatch Observability** (Container Insights + Fluent Bit). Quyền ghi log cấp qua **EKS Pod Identity** hoặc IRSA — không gắn access key vào pod.
+
+### Structured log & liên kết trace
+
+```json title="một dòng log tốt"
+{"ts":"2026-09-14T09:41:31Z","level":"error","service":"payments","msg":"bank gateway timeout","duration_ms":3002,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7"}
+```
+
+Trong Grafana, cấu hình **derived field** cho data source Loki (regex `"trace_id":"(\w+)"`) để biến `trace_id` thành link mở thẳng trace trong Tempo.
+
+### Loki hay CloudWatch?
+
+| | Loki tự host | CloudWatch Logs |
+|---|---|---|
+| Vận hành | Tự lo scale, S3, compaction | AWS lo |
+| Chi phí | Chủ yếu S3 + compute | Theo GB ingest + lưu + GB quét khi query |
+| Truy vấn | LogQL, chung Grafana với metrics/traces | Logs Insights, tích hợp AWS |
+
+Giá thay đổi theo region và thời điểm — kiểm tra trang giá mới nhất trước khi quyết định.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài Loki chế độ single binary cho lab", command: "helm repo add grafana https://grafana.github.io/helm-charts && helm install loki grafana/loki -n observability --create-namespace -f loki-single-binary-values.yaml" },
+    { comment: "Cài Grafana Alloy dạng DaemonSet", command: "helm install alloy grafana/alloy -n observability -f alloy-values.yaml" },
+    { comment: "Kiểm tra mỗi node có một agent", command: "kubectl -n observability get ds alloy", output: "NAME    DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE\nalloy   3         3         3       3            3" },
+    { comment: "Truy vấn Loki từ CLI", command: "logcli query '{namespace=\"shop\", app=\"payments\"} |= \"timeout\"' --since=1h --limit=3", output: "2026-09-14T09:41:31Z {app=\"payments\"} {\"level\":\"error\",\"msg\":\"bank gateway timeout\",\"trace_id\":\"4bf92f35...\"}" },
+    { comment: "CloudWatch: theo dõi log group theo thời gian thực", command: "aws logs tail /eks/shop/application --follow --since 10m --filter-pattern timeout" },
+    { comment: "CloudWatch: đặt retention 14 ngày để khỏi trả tiền lưu mãi mãi", command: "aws logs put-retention-policy --log-group-name /eks/shop/application --retention-in-days 14" },
+  ]}
+/>
+
+<Callout type="cost" title="Log group mặc định lưu vĩnh viễn">
+
+Log group CloudWatch mới tạo có retention **Never expire**. Hai năm sau bạn trả tiền lưu hàng TB log debug không ai đọc. Đặt retention ngay khi tạo (Terraform: `retention_in_days`) và hạ log level production xuống `info`.
+
+</Callout>
+
+<Callout type="mistake" title="Dùng trace_id / user_id làm label Loki">
+
+Mỗi giá trị label mới tạo một stream mới → hàng triệu stream nhỏ, Loki chậm và có thể từ chối ghi. Giữ những field đó trong nội dung JSON và lọc bằng `|=` hoặc `| json`.
+
+</Callout>
+
+<Callout type="warning" title="Đừng log dữ liệu nhạy cảm">
+
+Mật khẩu, token, số thẻ, toàn bộ request body không được vào log — log thường được nhiều người đọc hơn database. Che (redact) ở app hoặc bằng processor của agent.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "log shipping agent", meaning: "Chương trình chạy trên node đọc file log và gửi về hệ thống trung tâm (Alloy, Fluent Bit)." },
+    { term: "DaemonSet", meaning: "Workload Kubernetes đảm bảo mỗi node chạy đúng một pod — hợp cho agent." },
+    { term: "Loki stream", meaning: "Tập log có cùng bộ label; đơn vị được index trong Loki." },
+    { term: "LogQL", meaning: "Ngôn ngữ truy vấn log của Loki, cú pháp giống PromQL." },
+    { term: "log group / retention", meaning: "Nhóm log trong CloudWatch / thời gian giữ trước khi tự xoá." },
+    { term: "derived field", meaning: "Cấu hình Grafana biến một phần log (trace_id) thành link sang trace." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team muốn tìm mọi log của đơn hàng `A91` trong Loki. Cách nào vừa đúng vừa không làm hại Loki?"
+  options={["`{namespace=\"shop\", app=\"orders\"} | json | order_id=\"A91\"`", "Thêm `order_id` làm label cho mọi stream", "Tắt index label để Loki index toàn văn", "SSH vào từng node và grep file log"]}
+  answerIndex={0}
+  explanation="Tra mã bưu chính (label namespace, app) trước, rồi mới lục nội dung thư (parse JSON, lọc order_id). Biến order_id thành label sẽ làm bùng nổ số stream."
+/>

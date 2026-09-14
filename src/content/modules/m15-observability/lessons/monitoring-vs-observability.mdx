@@ -1,0 +1,99 @@
+import { ThreePillarsExplorerDiagram } from "../diagrams/three-pillars-explorer-diagram";
+
+<Eli5 title="Observability giống như lái xe đường dài có táp-lô, sổ nhật ký và GPS" emoji="🚗">
+  **Monitoring** là cái đèn đỏ trên táp-lô: bạn đã biết trước "nhiệt độ máy quá cao" là chuyện xấu, nên gắn sẵn đèn báo. Đèn sáng → dừng xe.
+
+  Nhưng một hôm xe **kêu lạch cạch lạ** mà không đèn nào sáng. Lúc này bạn cần **observability**: đủ dữ liệu để tự đặt câu hỏi mới — "tiếng kêu có từ lúc lên dốc không? Sau khi đổ xăng ở trạm nào?" — mà không phải tháo máy ra lắp thêm cảm biến.
+
+  Ba nguồn dữ liệu giúp bạn làm điều đó: **đồng hồ táp-lô** (metrics), **sổ nhật ký chuyến đi** (logs) và **bản đồ GPS lộ trình** (traces).
+</Eli5>
+
+Trong thế giới microservices trên Kubernetes, một request đi qua 5–10 service, pod sinh ra rồi biến mất mỗi lần deploy. SSH vào từng máy để `tail` log (như ở M01) không còn khả thi. Người phỏng vấn DevOps/SRE gần như luôn hỏi: *"Production chậm, bạn điều tra thế nào?"* — câu trả lời tốt luôn bắt đầu bằng observability.
+
+<ThreePillarsExplorerDiagram />
+
+<Technical>
+
+### Monitoring vs observability
+
+| | Monitoring | Observability |
+|---|---|---|
+| Câu hỏi | "Những gì ta **đã biết** có thể hỏng — có đang hỏng không?" | "Chuyện gì đang xảy ra, kể cả thứ ta **chưa từng nghĩ tới**?" |
+| Dạng | Dashboard + alert định sẵn | Dữ liệu giàu ngữ cảnh, truy vấn tuỳ ý |
+| Ví dụ | CPU > 90% → alert | Vì sao chỉ khách ở Đà Nẵng dùng iOS bị lỗi thanh toán? |
+
+Observability **không thay thế** monitoring — nó là thuộc tính của hệ thống: "nhìn từ output bên ngoài, suy ra được trạng thái bên trong". Monitoring là một cách dùng dữ liệu đó.
+
+### Ba trụ cột (three pillars)
+
+| Trụ cột | Dạng dữ liệu | Chi phí lưu trữ | Mạnh nhất khi |
+|---|---|---|---|
+| **Metrics** | Chuỗi số theo thời gian + label | Thấp | Alert, xu hướng, dashboard |
+| **Logs** | Sự kiện văn bản/JSON có timestamp | Trung bình–cao | Xem chi tiết lỗi cụ thể |
+| **Traces** | Cây các span của một request | Cao (thường sampling) | Tìm nút thắt giữa nhiều service |
+
+Ngoài ra còn **profiles** (continuous profiling — hàm nào ăn CPU) đang được xem là "trụ cột thứ tư"; OpenTelemetry đã có đặc tả cho profiles nhưng mức độ ổn định còn thay đổi, hãy kiểm tra tài liệu mới nhất.
+
+### Luồng điều tra điển hình
+
+1. **Alert** từ metrics: error rate checkout 7%.
+2. Mở **dashboard** → lỗi tăng từ 14:05, chỉ ở endpoint `/pay`.
+3. Lọc **trace** lỗi của `/pay` → span `payments → bank-gateway` timeout.
+4. Bấm sang **log** cùng `trace_id` → `"connection pool exhausted"`.
+
+Ba trụ cột phải **nối được với nhau** qua label chung (`service`, `namespace`) và `trace_id`. Đó là lý do cả module này xoay quanh stack thống nhất: Prometheus/Grafana + Loki + Tempo + OpenTelemetry.
+
+### Structured logging — nền móng rẻ nhất
+
+```json title="log JSON tốt"
+{"ts":"2026-09-13T14:05:02Z","level":"error","service":"payments","msg":"bank timeout","order_id":"A91","duration_ms":3001,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}
+```
+
+Log dạng JSON với field cố định dễ lọc hơn rất nhiều so với `"Error!!! something failed"`.
+
+### Tự host hay SaaS?
+
+| Lựa chọn | Ưu | Nhược |
+|---|---|---|
+| Prometheus + Grafana + Loki + Tempo | Mã nguồn mở, không phí license | Tự vận hành, tự scale storage |
+| CloudWatch (Container Insights, X-Ray) | Tích hợp sẵn AWS | Truy vấn kém linh hoạt, phí theo GB log/metric |
+| Datadog, New Relic, Grafana Cloud | Dùng ngay, UX tốt | Chi phí tăng nhanh theo host/GB/custom metric |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Metrics: một app instrument sẵn trả về dạng text của Prometheus", command: "curl -s localhost:8080/metrics | grep http_requests_total", output: "# TYPE http_requests_total counter\nhttp_requests_total{method=\"GET\",route=\"/pay\",code=\"200\"} 1532\nhttp_requests_total{method=\"GET\",route=\"/pay\",code=\"500\"} 41" },
+    { comment: "Logs: lọc log JSON mức error của pod bằng jq", command: "kubectl logs deploy/payments --since=10m | jq -c 'select(.level==\"error\") | {msg, trace_id}'", output: "{\"msg\":\"bank timeout\",\"trace_id\":\"4bf92f3577b34da6a3ce929d0e0e4736\"}" },
+    { comment: "Traces: header W3C mà service truyền cho nhau", command: "curl -sv localhost:8080/pay 2>&1 | grep -i traceparent", output: "< traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" },
+  ]}
+/>
+
+<Callout type="mistake" title="Chỉ có dashboard CPU/RAM là 'đã có monitoring'">
+  CPU 30% không có nghĩa là khách hàng hài lòng. Hãy bắt đầu từ góc nhìn người dùng (tỉ lệ lỗi, độ trễ), rồi mới xuống tài nguyên. Bài tiếp theo — Golden Signals — nói kỹ điều này.
+</Callout>
+
+<Callout type="cost" title="Log là khoản phí âm thầm lớn nhất">
+  CloudWatch Logs và các SaaS tính phí theo GB ingest. Một service log ở mức `debug` trên production có thể đốt vài trăm USD/tháng. Đặt log level `info`, đặt retention (vd 14–30 ngày) và đừng log cả body request.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "monitoring", meaning: "Theo dõi các chỉ số và lỗi đã biết trước bằng dashboard/alert." },
+    { term: "observability", meaning: "Khả năng hiểu trạng thái bên trong hệ thống chỉ từ dữ liệu nó phát ra." },
+    { term: "metrics", meaning: "Số đo theo thời gian có label, rẻ, dùng cho alert và xu hướng." },
+    { term: "logs", meaning: "Bản ghi sự kiện có timestamp, chi tiết từng chuyện đã xảy ra." },
+    { term: "traces / span", meaning: "Hành trình của một request qua nhiều service / một bước trong hành trình đó." },
+    { term: "structured logging", meaning: "Ghi log dạng JSON có field cố định để máy lọc được." },
+    { term: "telemetry", meaning: "Tên gọi chung cho metrics, logs, traces mà hệ thống phát ra." },
+  ]}
+/>
+
+<QuickCheck
+  question="Alert báo error rate tăng. Bạn đã biết endpoint nào lỗi nhưng chưa biết lỗi nằm ở service nào trong chuỗi 5 service. Nên xem gì tiếp theo?"
+  options={["Metrics CPU của từng node", "Trace của các request lỗi", "Lịch sử commit Git", "Tăng số replica rồi chờ"]}
+  answerIndex={1}
+  explanation="Trace là GPS lộ trình: nó cho thấy request lỗi đã dừng ở span/service nào. Sau đó mới dùng log cùng trace_id để đọc chi tiết lỗi."
+/>

@@ -1,0 +1,157 @@
+import { PrometheusScrapePullModelDiagram } from "../diagrams/prometheus-scrape-pull-model-diagram";
+
+<Eli5 title="Prometheus giống như nhân viên điện lực đi ghi số công-tơ" emoji="⚡">
+
+Mỗi nhà (mỗi pod) có một **công-tơ điện** (endpoint `/metrics`) tự đếm số điện đã dùng. Chủ nhà không phải gọi điện báo số — **nhân viên điện lực (Prometheus) tự đi từng nhà** cứ 30 giây một lần, ghi lại con số vào sổ (TSDB). Đó là **pull model**.
+
+Nhà nào khoá cửa không cho ghi số? Nhân viên ghi ngay "nhà này không liên lạc được" — chính là metric `up == 0`.
+
+Số trên công-tơ **chỉ tăng**. Muốn biết nhà đó "đang dùng điện mạnh cỡ nào lúc này", bạn phải lấy hai lần ghi trừ nhau rồi chia cho thời gian — việc mà hàm `rate()` trong PromQL làm giúp bạn.
+
+</Eli5>
+
+Prometheus là chuẩn de facto cho metrics trên Kubernetes (dự án CNCF graduated). Amazon Managed Service for Prometheus, Grafana Cloud hay VictoriaMetrics đều nói PromQL. Học PromQL một lần là dùng được ở mọi nơi.
+
+<PrometheusScrapePullModelDiagram />
+
+<Technical>
+
+### Bốn loại metric
+
+| Loại | Hành vi | Ví dụ | Dùng với |
+|---|---|---|---|
+| **Counter** | Chỉ tăng, reset về 0 khi restart | `http_requests_total` | `rate()`, `increase()` |
+| **Gauge** | Lên xuống tự do | `node_memory_MemAvailable_bytes` | dùng trực tiếp, `avg_over_time()` |
+| **Histogram** | Đếm vào các bucket `le` + `_sum` + `_count` | `http_request_duration_seconds_bucket` | `histogram_quantile()` |
+| **Summary** | Tính quantile phía client | `go_gc_duration_seconds` | không gộp được giữa các pod |
+
+Prometheus 3.x còn có **native histograms** (bucket động, ít series hơn); tính năng này đang được ổn định dần — kiểm tra tài liệu phiên bản bạn dùng.
+
+### PromQL căn bản
+
+```text title="PromQL"
+# Selector + label matcher (=, !=, =~ regex, !~)
+http_requests_total{namespace="shop", code=~"5.."}
+
+# rate: tốc độ tăng mỗi giây trung bình trong cửa sổ 5 phút
+rate(http_requests_total[5m])
+
+# Gộp theo label (bỏ các label khác)
+sum by (service) (rate(http_requests_total[5m]))
+
+# Tổng số request trong 1 giờ qua
+increase(http_requests_total[1h])
+
+# p95 latency — BẮT BUỘC giữ label le khi sum
+histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[5m])))
+
+# Target nào đang chết?
+up == 0
+```
+
+Quy tắc vàng: **`rate()` trước, `sum()` sau**. Viết `rate(sum(...))` sẽ sai khi một pod restart vì sum che mất lần reset counter.
+
+Cửa sổ `[5m]` nên ≥ 4 lần scrape interval (30s → tối thiểu `[2m]`), nếu không rate có thể trống.
+
+### kube-prometheus-stack
+
+Helm chart gom sẵn: Prometheus Operator, Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics và bộ dashboard/alert mặc định.
+
+Operator dùng CRD thay cho file `prometheus.yml`:
+
+```yaml title="servicemonitor-checkout.yaml"
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: checkout
+  namespace: shop
+  labels:
+    release: monitoring   # khớp tên Helm release để Prometheus nhận
+spec:
+  selector:
+    matchLabels:
+      app: checkout
+  endpoints:
+    - port: http          # tên port trong Service, không phải số
+      path: /metrics
+      interval: 30s
+```
+
+### Recording rules
+
+Truy vấn nặng mà dashboard gọi liên tục → tính sẵn thành series mới:
+
+```yaml title="prometheusrule-recording.yaml"
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: checkout-recording
+  namespace: shop
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: checkout.rules
+      interval: 30s
+      rules:
+        - record: job:http_requests:rate5m
+          expr: sum by (job) (rate(http_requests_total[5m]))
+        - record: job:http_request_errors:ratio_rate5m
+          expr: |
+            sum by (job) (rate(http_requests_total{code=~"5.."}[5m]))
+            /
+            sum by (job) (rate(http_requests_total[5m]))
+```
+
+Quy ước tên `level:metric:operations` giúp nhìn tên là biết series được gộp thế nào.
+
+### Pull vs push
+
+- Pull: Prometheus biết target chết (`up`), dễ debug (tự `curl /metrics`), app không cần biết địa chỉ Prometheus.
+- Job chạy ngắn (batch, CronJob) có thể kết thúc trước lần scrape → dùng **Pushgateway** (chỉ cho batch job) hoặc gửi OTLP qua OpenTelemetry Collector.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài kube-prometheus-stack", command: "helm repo add prometheus-community https://prometheus-community.github.io/helm-charts && helm repo update" },
+    { command: "helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring --create-namespace", output: "NAME: monitoring\nSTATUS: deployed\nNOTES:\nkube-prometheus-stack has been installed." },
+    { comment: "Xem các CRD mà Operator mang tới", command: "kubectl get crd | grep monitoring.coreos.com", output: "alertmanagers.monitoring.coreos.com\npodmonitors.monitoring.coreos.com\nprometheuses.monitoring.coreos.com\nprometheusrules.monitoring.coreos.com\nservicemonitors.monitoring.coreos.com" },
+    { comment: "Tự làm 'nhân viên điện lực': đọc công-tơ của app", command: "kubectl -n shop port-forward svc/checkout 8080:http & curl -s localhost:8080/metrics | grep -E '^http_request_duration_seconds_bucket' | head -3", output: "http_request_duration_seconds_bucket{le=\"0.1\",route=\"/pay\"} 1402\nhttp_request_duration_seconds_bucket{le=\"0.3\",route=\"/pay\"} 1488\nhttp_request_duration_seconds_bucket{le=\"0.5\",route=\"/pay\"} 1519" },
+    { comment: "Kiểm tra cú pháp rule trước khi apply", command: "promtool check rules checkout-rules.yml", output: "Checking checkout-rules.yml\n  SUCCESS: 2 rules found" },
+    { comment: "Chạy thử một truy vấn từ CLI", command: "promtool query instant http://localhost:9090 'up{namespace=\"shop\"}'", output: "up{instance=\"10.244.1.7:8080\", job=\"checkout\", namespace=\"shop\"} => 1 @[1757844302.1]" },
+  ]}
+/>
+
+<Callout type="mistake" title="ServiceMonitor tạo rồi mà target không hiện">
+
+Ba nguyên nhân phổ biến: (1) thiếu label `release: monitoring`, (2) `port:` ghi số thay vì **tên** port của Service, (3) `selector.matchLabels` không khớp label của **Service** (không phải của Pod). Xem ở Prometheus UI → Status → Targets và Service Discovery.
+
+</Callout>
+
+<Callout type="warning" title="Cardinality">
+
+Mỗi tổ hợp label là một time series. Label `user_id`, `order_id` hay URL đầy đủ `/orders/123` có thể tạo hàng triệu series và làm Prometheus hết RAM. Dùng route template `/orders/:id`.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "pull model / scrape", meaning: "Prometheus chủ động gọi HTTP tới /metrics của target theo chu kỳ." },
+    { term: "exporter", meaning: "Chương trình dịch số liệu của hệ thống khác sang định dạng Prometheus (node-exporter, mysqld-exporter)." },
+    { term: "time series", meaning: "Chuỗi sample của một tên metric + một bộ label cụ thể." },
+    { term: "rate()", meaning: "Tốc độ tăng mỗi giây của counter trong một cửa sổ thời gian, tự xử lý reset." },
+    { term: "ServiceMonitor", meaning: "CRD của Prometheus Operator mô tả Service nào cần scrape." },
+    { term: "recording rule", meaning: "Truy vấn được tính sẵn định kỳ và lưu thành series mới." },
+    { term: "cardinality", meaning: "Số lượng time series; label có quá nhiều giá trị làm nó bùng nổ." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn viết `sum(http_requests_total)` lên dashboard và thấy đường thẳng đi lên, thỉnh thoảng tụt về gần 0 khi deploy. Cách sửa đúng?"
+  options={["Dùng `avg(http_requests_total)`", "Tăng scrape interval lên 5 phút", "Dùng `sum(rate(http_requests_total[5m]))`", "Đổi metric sang gauge"]}
+  answerIndex={2}
+  explanation="Counter như số công-tơ: chỉ tăng và về 0 khi pod restart. rate() tính tốc độ và bù lần reset; sau đó mới sum để gộp các pod."
+/>

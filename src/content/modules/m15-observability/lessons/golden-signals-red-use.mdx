@@ -1,0 +1,116 @@
+import { SymptomToSignalPickerDiagram } from "../diagrams/symptom-to-signal-picker-diagram";
+
+<Eli5 title="Golden Signals giống như quản lý một quán phở đông khách" emoji="🍜">
+
+Bạn là chủ quán phở. Không cần đếm từng cọng hành, bạn chỉ cần để ý **bốn thứ**: khách **chờ món bao lâu** (latency), **bao nhiêu khách** đang vào (traffic), **bao nhiêu bát bị trả lại** (errors) và **bếp đã kín chỗ tới đâu** (saturation — 6 bếp lửa thì đang đỏ lửa cả 6, nồi nước dùng sắp cạn).
+
+Khi đứng ở **cửa quán nhìn khách** (khách chờ bao lâu, bao nhiêu người, bao nhiêu bát bị trả), bạn đang dùng **RED**. Khi xuống **bếp nhìn máy móc** (bếp lửa dùng bao nhiêu %, bao nhiêu nồi đang xếp hàng chờ, bếp nào bị hỏng), bạn đang dùng **USE**.
+
+Chỗ ví von bị hụt: quán phở thấy khách bằng mắt, còn hệ thống thì bạn phải **chủ động đo** — nếu app không phát ra số liệu, bạn "mù" hoàn toàn.
+
+</Eli5>
+
+Người mới hay mắc bệnh "đo mọi thứ": 400 panel Grafana, nhìn mãi không biết cái nào quan trọng. Golden Signals, RED và USE là **danh sách tối thiểu** giúp bạn bắt đầu đúng chỗ — và cũng là cách trả lời gọn gàng khi phỏng vấn hỏi "bạn sẽ monitor service này thế nào?".
+
+<SymptomToSignalPickerDiagram />
+
+<Technical>
+
+### Four Golden Signals (Google SRE Book)
+
+| Signal | Câu hỏi | Ví dụ đo |
+|---|---|---|
+| **Latency** | Phục vụ một request mất bao lâu? | p50/p95/p99 của `http_request_duration_seconds` |
+| **Traffic** | Nhu cầu lớn cỡ nào? | request/giây, message/giây, phiên đăng nhập |
+| **Errors** | Bao nhiêu request thất bại? | tỉ lệ 5xx, timeout, 200 nhưng trả nội dung sai |
+| **Saturation** | Hệ thống "đầy" tới đâu? | CPU throttling, độ dài hàng đợi, connection pool |
+
+Hai lưu ý hay bị hỏi:
+
+- **Tách latency của request lỗi và request thành công.** Một lỗi 500 trả về trong 2ms sẽ kéo latency trung bình *xuống*, làm dashboard trông "đẹp" giả tạo.
+- **Saturation là tín hiệu báo trước.** Khi hàng đợi dài ra, latency và errors sẽ tăng sau đó vài phút.
+
+### RED — cho service (request-driven)
+
+Do Tom Wilkie đề xuất, dành cho mọi thứ nhận request: API, gRPC service, queue consumer.
+
+- **R**ate — số request/giây
+- **E**rrors — số (hoặc tỉ lệ) request lỗi
+- **D**uration — phân phối thời gian xử lý (dùng histogram, không dùng trung bình)
+
+```text title="PromQL cho dashboard RED"
+# Rate: request/giây theo service
+sum by (service) (rate(http_requests_total[5m]))
+
+# Errors: tỉ lệ 5xx
+sum by (service) (rate(http_requests_total{code=~"5.."}[5m]))
+  / sum by (service) (rate(http_requests_total[5m]))
+
+# Duration: p95
+histogram_quantile(0.95, sum by (service, le) (rate(http_request_duration_seconds_bucket[5m])))
+```
+
+### USE — cho tài nguyên
+
+Do Brendan Gregg đề xuất, áp dụng cho từng tài nguyên vật lý/ảo: CPU, memory, disk, network, connection pool.
+
+| Tài nguyên | Utilization | Saturation | Errors |
+|---|---|---|---|
+| CPU | `node_cpu_seconds_total` (phần không idle) | load average > số core; CFS throttling | hiếm, lỗi phần cứng |
+| Memory | `node_memory_MemAvailable_bytes` | swap, OOMKilled | OOM events |
+| Disk | `node_filesystem_avail_bytes` | I/O wait, queue | lỗi đọc/ghi |
+| Network | băng thông | packet drop, retransmit | `node_network_receive_errs_total` |
+
+### Vì sao không dùng trung bình?
+
+Giả sử 100 request: 95 cái mất 50ms, 5 cái mất 8s. Trung bình ≈ 450ms — con số không mô tả **ai cả**. p95 ≈ 50ms còn p99 = 8s mới lộ ra nhóm khách đang khổ. Đó là lý do latency luôn đo bằng **histogram** rồi tính percentile.
+
+### Chọn gì cho hệ thống của bạn?
+
+- API/web service → **RED** (thêm saturation của connection pool/queue).
+- Node EC2, database host, disk → **USE**.
+- Dashboard cho quản lý/on-call → **4 Golden Signals** của luồng người dùng quan trọng nhất (checkout, login).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Mở Prometheus UI của kube-prometheus-stack", command: "kubectl -n monitoring port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090" },
+    { comment: "Traffic: request/giây của toàn bộ API (qua HTTP API của Prometheus)", command: "curl -s 'localhost:9090/api/v1/query' --data-urlencode 'query=sum(rate(http_requests_total[5m]))' | jq '.data.result[0].value'", output: "[\n  1757844302.12,\n  \"42.7\"\n]" },
+    { comment: "Errors: tỉ lệ 5xx", command: "curl -s 'localhost:9090/api/v1/query' --data-urlencode 'query=sum(rate(http_requests_total{code=~\"5..\"}[5m])) / sum(rate(http_requests_total[5m]))' | jq -r '.data.result[0].value[1]'", output: "0.0213" },
+    { comment: "USE cho node: % CPU đang dùng (không idle)", command: "curl -s 'localhost:9090/api/v1/query' --data-urlencode 'query=1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))' | jq -r '.data.result[] | \"\\(.metric.instance) \\(.value[1])\"'", output: "10.0.1.23:9100 0.64\n10.0.2.51:9100 0.31" },
+    { comment: "Saturation: pod nào bị OOMKilled gần đây", command: "kubectl get pods -A -o json | jq -r '.items[] | select(.status.containerStatuses[]?.lastState.terminated.reason==\"OOMKilled\") | .metadata.name'", output: "payments-7c9d8f6b5-x2k4q" },
+  ]}
+/>
+
+<Callout type="mistake" title="Chỉ đo 'service có sống không'">
+
+Health check `/healthz` trả 200 không có nghĩa là khách dùng được. Service có thể "sống" nhưng trả lỗi 30% request, hoặc chậm 10 giây. Luôn đo **Errors** và **Duration** từ phía request thật.
+
+</Callout>
+
+<Callout type="tip" title="Bắt đầu nhỏ">
+
+Với mỗi service mới, tạo đúng **3 panel RED + 1 panel saturation**. Chỉ thêm panel khi một sự cố thực tế cho thấy bạn thiếu thông tin.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Four Golden Signals", meaning: "Latency, Traffic, Errors, Saturation — bốn tín hiệu tối thiểu cho hệ thống hướng người dùng." },
+    { term: "RED", meaning: "Rate, Errors, Duration — góc nhìn khách hàng của một service." },
+    { term: "USE", meaning: "Utilization, Saturation, Errors — góc nhìn của từng tài nguyên." },
+    { term: "saturation", meaning: "Mức 'đầy' của tài nguyên: hàng đợi, throttling, pool cạn." },
+    { term: "percentile (p95, p99)", meaning: "95%/99% request nhanh hơn giá trị này — lộ ra nhóm khách bị chậm." },
+    { term: "histogram", meaning: "Metric chia giá trị vào các bucket để tính percentile phía server." },
+  ]}
+/>
+
+<QuickCheck
+  question="Latency trung bình của API giảm từ 200ms xuống 40ms ngay sau khi deploy bản mới. Đồng nghiệp mừng rỡ. Bạn nên kiểm tra gì trước?"
+  options={["CPU của node có giảm không", "Tỉ lệ lỗi — có thể nhiều request đang fail rất nhanh", "Số pod đang chạy", "Dung lượng disk còn trống"]}
+  answerIndex={1}
+  explanation="Lỗi trả về tức thì kéo latency trung bình xuống. Như quán phở 'phục vụ nhanh' vì từ chối khách ngay ở cửa. Luôn xem Errors cạnh Duration."
+/>
