@@ -1,6 +1,6 @@
 # Deploy lên Vercel
 
-Hướng dẫn deploy app này lên Vercel với **Vercel Postgres (Neon)** cho database và **Resend** cho email magic-link. Làm tuần tự từ trên xuống, khoảng 10–15 phút.
+Hướng dẫn deploy app này lên Vercel với **Neon** (Postgres, cài qua Vercel Marketplace) cho database và **Resend** cho email magic-link. Làm tuần tự từ trên xuống, khoảng 10–15 phút.
 
 ## 0. Trước khi bắt đầu
 
@@ -14,12 +14,17 @@ Hướng dẫn deploy app này lên Vercel với **Vercel Postgres (Neon)** cho 
 2. Chọn repo `devops-cloud-learning-space`. Vercel tự nhận diện đây là app Next.js — không cần chỉnh Build Command / Output Directory.
 3. **Chưa bấm Deploy vội** — mở rộng phần **Environment Variables** hoặc để mặc định rồi làm tiếp bước 2–4, quay lại thêm biến môi trường trước khi deploy thật (Vercel cho sửa env vars bất cứ lúc nào và deploy lại).
 
-## 2. Tạo database (Vercel Postgres / Neon)
+## 2. Tạo database (Neon, qua Vercel Marketplace)
 
-1. Trong project vừa tạo, vào tab **Storage** → **Create Database** → chọn **Postgres** (chạy trên nền Neon).
-2. Đặt tên (vd `devops-learning-db`), chọn region gần bạn, bấm **Create**.
-3. Vercel tự nối database này với project và tự thêm sẵn vài biến môi trường (tên có thể là `POSTGRES_URL`, `DATABASE_URL`, hoặc có tiền tố tên database tuỳ giao diện hiện tại — mở tab **.env.local** của database để xem chính xác).
-4. Vào **Settings → Environment Variables** của project: nếu chưa có biến tên đúng là `DATABASE_URL`, tạo thêm một biến `DATABASE_URL` và dán giá trị của biến **pooled connection string** (thường có chữ `-pooler` trong hostname, hoặc là biến `POSTGRES_URL` mà Vercel đã tạo). Dùng bản **pooled** vì app chạy trên serverless functions — nhiều lượt gọi hàm cùng lúc sẽ tự dùng chung pool phía Neon thay vì mở quá nhiều kết nối trực tiếp.
+Vercel không tự lưu Postgres nữa — mọi database giờ chạy qua **Marketplace**, và nhà cung cấp mặc định để làm việc này là **Neon**. Làm đúng theo thứ tự sau, không cần đổi tên gì cả:
+
+1. Trong project vừa tạo, vào tab **Storage**.
+2. Bấm **Create Database** (hoặc **Connect Database**, tuỳ bản UI bạn đang thấy) → chọn **Neon** trong danh sách.
+3. Nếu được hỏi tài khoản Neon: chọn **Create New Neon Account** → **Continue**.
+4. Chọn region gần bạn (vd Singapore), đặt tên database (vd `devops-learning-db`) → bấm tạo.
+5. **Quan trọng — bỏ qua phần "Advanced Options" / đừng tick "Add prefix"**: nếu để mặc định (không thêm tiền tố), Neon sẽ tự thêm thẳng vào project của bạn một biến tên đúng là **`DATABASE_URL`** — đây chính là bản **pooled connection string** (đã tối ưu cho serverless), dùng được ngay, không cần copy-paste gì thêm.
+
+Vậy là xong bước này — bỏ qua bước 4 cũ (tạo biến DATABASE_URL thủ công), vì Neon đã tự tạo sẵn rồi. Bạn có thể xác nhận lại bằng cách vào **Settings → Environment Variables** của project và tìm thấy `DATABASE_URL` đã có giá trị (bắt đầu bằng `postgres://...`).
 
 ## 3. Tạo API key Resend
 
@@ -32,7 +37,7 @@ Vào **Settings → Environment Variables**, thêm các biến sau (scope **Prod
 
 | Biến | Giá trị |
 |---|---|
-| `DATABASE_URL` | Connection string Neon từ bước 2 (bản pooled, đã có sẵn `?sslmode=require`) |
+| `DATABASE_URL` | Đã có sẵn từ bước 2 (Neon tự tạo) — không cần làm gì thêm |
 | `BETTER_AUTH_SECRET` | Chạy `openssl rand -base64 32` ở máy bạn, dán kết quả vào |
 | `BETTER_AUTH_URL` | `https://<tên-project>.vercel.app` — Vercel cho bạn biết domain mặc định này ngay khi tạo project (Settings → Domains); nếu dùng custom domain, điền domain đó |
 | `SMTP_HOST` | `smtp.resend.com` |
@@ -49,12 +54,12 @@ Thêm `GITHUB_CLIENT_ID` và `GITHUB_CLIENT_SECRET` vào Environment Variables. 
 
 ## 5. Tạo bảng trong database production
 
-Trước khi deploy, tạo schema trên database Neon vừa nối:
+Trước khi deploy, tạo schema trên database Neon vừa nối. Lấy connection string: vào **Settings → Environment Variables** của project trên Vercel, tìm dòng `DATABASE_URL`, bấm vào ô giá trị (icon con mắt 👁 hoặc bấm để lộ) rồi copy.
 
 ```bash
 # Từ máy bạn, trong thư mục devops-cloud-learning-space
-# Tạm thời trỏ DATABASE_URL sang production để đẩy schema — KHÔNG commit file này
-DATABASE_URL="<connection-string-neon-từ-bước-2>" pnpm db:push
+# Tạm thời trỏ DATABASE_URL sang production để đẩy schema — KHÔNG commit dòng này vào .env
+DATABASE_URL="<giá-trị-vừa-copy>" pnpm db:push
 ```
 
 Xác nhận thấy dòng `[✓] Changes applied`. Việc này chỉ cần làm **một lần** (và mỗi khi sau này bạn đổi schema trong `src/db/`).
