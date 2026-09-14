@@ -1,0 +1,131 @@
+import { TerraformPlanApplyWorkflowDiagram } from "../diagrams/terraform-plan-apply-workflow-diagram";
+
+<Eli5 title="init → plan → apply giống như sửa nhà có báo giá trước" emoji="🧾">
+
+Bạn thuê đội sửa nhà. Đầu tiên đội **chuẩn bị đồ nghề** (init) — mua đúng loại máy khoan cho loại tường nhà bạn.
+
+Tiếp theo họ **đi khảo sát và gửi báo giá** (plan): "sẽ xây thêm 1 phòng (+), sơn lại cửa (~), đập bỏ nhà kho (-)". Chưa đụng vào viên gạch nào. Bạn đọc kỹ, thấy "đập bỏ nhà kho" mà nhà kho đang chứa đồ quý thì bạn **dừng lại**.
+
+Đồng ý báo giá thì họ mới **thi công** (apply) và ghi vào **sổ bàn giao** (state). Muốn dỡ hết thì gọi đội **tháo dỡ** (destroy).
+
+</Eli5>
+
+Thói quen quan trọng nhất khi làm Terraform: **không bao giờ apply khi chưa đọc plan**. Rất nhiều sự cố "lỡ tay xoá database prod" đến từ việc gõ `yes` mà không đọc dòng `-/+`.
+
+<TerraformPlanApplyWorkflowDiagram />
+
+<Technical>
+
+### Bốn lệnh cốt lõi
+
+| Lệnh | Làm gì | Khi nào chạy |
+|---|---|---|
+| `terraform init` | Tải provider/module, cấu hình backend, tạo `.terraform.lock.hcl` | Lần đầu, khi thêm provider/module, khi đổi backend |
+| `terraform plan` | Refresh thực tế, so với code, in diff | Mỗi lần sửa code |
+| `terraform apply` | Thực thi diff (hỏi `yes` trừ khi dùng file plan) | Sau khi review plan |
+| `terraform destroy` | Xoá mọi tài nguyên trong state | Dọn môi trường lab/tạm |
+
+Lệnh phụ nên chạy thường xuyên: `terraform fmt` (định dạng code), `terraform validate` (kiểm tra cú pháp và kiểu dữ liệu, không gọi API).
+
+### Đọc ký hiệu trong plan
+
+| Ký hiệu | Nghĩa | Mức nguy hiểm |
+|---|---|---|
+| `+` | create — tạo mới | Thấp (chú ý chi phí) |
+| `~` | update in-place — sửa tại chỗ | Trung bình |
+| `-/+` | destroy and then create replacement — xoá rồi tạo lại | **Cao**: ID mới, dữ liệu có thể mất |
+| `+/-` | create replacement and then destroy (khi dùng `create_before_destroy`) | Trung bình |
+| `-` | destroy — xoá | **Cao** |
+| `<=` | đọc data source | Không đổi gì |
+
+Dòng `# forces replacement` cho biết thuộc tính nào gây ra thay thế — ví dụ đổi `ami` của EC2 hoặc `engine` của RDS.
+
+### Plan có lưu file
+
+Trong CI, luôn tách plan và apply bằng file để **apply đúng cái đã được review**:
+
+```bash
+terraform plan -out=tfplan      # lưu plan nhị phân
+terraform show tfplan           # xem lại dạng dễ đọc
+terraform apply tfplan          # không hỏi yes, không tính lại diff
+```
+
+Nếu thực tế hoặc state thay đổi sau khi tạo file plan, `apply tfplan` sẽ báo plan đã cũ (stale) và từ chối chạy.
+
+### Cấu trúc tối thiểu của một thư mục
+
+```hcl title="versions.tf"
+terraform {
+  required_version = ">= 1.11"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "ap-southeast-1"
+}
+```
+
+`.terraform.lock.hcl` ghi lại **phiên bản chính xác + checksum** của provider — hãy commit file này để cả team và CI dùng cùng bản. Thư mục `.terraform/` và file `*.tfstate` thì **không** commit.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { command: "terraform init", output: "Initializing the backend...\nInitializing provider plugins...\n- Finding hashicorp/aws versions matching \"~> 6.0\"...\n- Installing hashicorp/aws v6.12.0...\n- Installed hashicorp/aws v6.12.0 (signed by HashiCorp)\nTerraform has created a lock file .terraform.lock.hcl ...\n\nTerraform has been successfully initialized!" },
+    { command: "terraform fmt && terraform validate", output: "main.tf\nSuccess! The configuration is valid." },
+    { command: "terraform plan -out=tfplan", output: "Terraform will perform the following actions:\n\n  # aws_s3_bucket.assets will be created\n  + resource \"aws_s3_bucket\" \"assets\" {\n      + arn           = (known after apply)\n      + bucket        = \"shop-assets-dev-123456789012\"\n      + force_destroy = false\n      ...\n    }\n\nPlan: 1 to add, 0 to change, 0 to destroy.\n\nSaved the plan to: tfplan" },
+    { command: "terraform apply tfplan", output: "aws_s3_bucket.assets: Creating...\naws_s3_bucket.assets: Creation complete after 2s [id=shop-assets-dev-123456789012]\n\nApply complete! Resources: 1 added, 0 changed, 0 destroyed." },
+    { comment: "Chạy lại plan: không có gì thay đổi", command: "terraform plan", output: "aws_s3_bucket.assets: Refreshing state... [id=shop-assets-dev-123456789012]\n\nNo changes. Your infrastructure matches the configuration." },
+    { command: "terraform state list", output: "aws_s3_bucket.assets" },
+    { comment: "Dọn dẹp sau khi thử", command: "terraform destroy", output: "Plan: 0 to add, 0 to change, 1 to destroy.\n\nDo you really want to destroy all resources?\n  Enter a value: yes\n\nDestroy complete! Resources: 1 destroyed." },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Gõ `terraform apply -auto-approve` trên máy cá nhân với prod.** Cờ này bỏ qua bước xác nhận. Chỉ dùng trong CI khi apply một file plan đã được review, hoặc với môi trường lab tạm.
+
+</Callout>
+
+<Callout type="warning" title="Đọc kỹ -/+ trước khi gõ yes">
+
+Đổi `identifier` hoặc `engine` của RDS, `name` của một số tài nguyên, hay `availability_zone` của subnet đều có thể gây `-/+`. Với tài nguyên chứa dữ liệu, cân nhắc `lifecycle { prevent_destroy = true }` để Terraform từ chối xoá.
+
+</Callout>
+
+<Callout type="cost">
+
+`terraform destroy` là bạn tốt của người học: sau mỗi buổi lab hãy destroy các tài nguyên tính tiền theo giờ (NAT Gateway, ALB, RDS). Nhớ rằng S3 bucket còn object sẽ không xoá được trừ khi đặt `force_destroy = true`.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "terraform init", meaning: "Chuẩn bị thư mục làm việc: tải provider, module, cấu hình backend." },
+    { term: "terraform plan", meaning: "Tính và hiển thị diff giữa code và thực tế, chưa thay đổi gì." },
+    { term: "terraform apply", meaning: "Thực hiện các thay đổi trong plan và cập nhật state." },
+    { term: "-/+ (replacement)", meaning: "Tài nguyên sẽ bị xoá rồi tạo lại vì một thuộc tính không sửa tại chỗ được." },
+    { term: ".terraform.lock.hcl", meaning: "File khoá phiên bản provider, nên commit vào Git." },
+    { term: "dependency graph", meaning: "Đồ thị phụ thuộc Terraform tự dựng để quyết định thứ tự và chạy song song." },
+  ]}
+/>
+
+<QuickCheck
+  question="Plan hiện `aws_db_instance.main must be replaced` (ký hiệu `-/+`) với ghi chú `# forces replacement` ở dòng `identifier`. Bạn nên làm gì?"
+  options={[
+    "Gõ yes ngay vì Terraform luôn giữ dữ liệu",
+    "Dừng lại: đây là xoá rồi tạo lại DB, cần kiểm tra backup hoặc giữ nguyên identifier",
+    "Chạy terraform destroy trước cho sạch",
+    "Xoá file state để Terraform quên tài nguyên cũ",
+  ]}
+  answerIndex={1}
+  explanation="Như báo giá ghi 'đập bỏ nhà kho rồi xây lại': đồ trong kho (dữ liệu) có thể mất. Đọc plan là để bắt đúng những dòng -/+ như thế này."
+/>

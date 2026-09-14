@@ -1,0 +1,195 @@
+import { CountVsForEachDiagram } from "../diagrams/count-vs-for-each-diagram";
+
+<Eli5 title="HCL giống như phiếu đặt món ở nhà hàng" emoji="🍜">
+
+Một file Terraform giống **phiếu gọi món**. **Provider** là nhà hàng bạn gọi (AWS, GitHub, Cloudflare). **Resource** là món bạn muốn nấu mới ("1 tô phở tái"). **Data source** là hỏi xem trong bếp **đã có sẵn** gì ("còn loại bánh phở nào?") — hỏi thôi, không nấu.
+
+**Variable** là chỗ để trống cho khách điền ("size: nhỏ/lớn"). **Local** là ghi chú nội bộ của bồi bàn để khỏi viết lại nhiều lần. **Output** là tờ hoá đơn trả về cho bạn: số bàn, mã order.
+
+Khi cần 5 tô giống nhau, bạn không viết 5 dòng — bạn ghi "× 5" (`count`) hoặc liệt kê theo tên từng khách (`for_each`). Cách ghi theo tên an toàn hơn khi có khách rời bàn, như hình bên dưới.
+
+</Eli5>
+
+Hiểu rõ 7 loại block này là đủ để đọc 90% code Terraform ngoài đời, kể cả module trên Registry.
+
+<Technical>
+
+### Bảy loại block cơ bản
+
+| Block | Vai trò | Tham chiếu |
+|---|---|---|
+| `terraform` | Phiên bản Terraform, provider, backend | — |
+| `provider` | Cấu hình kết nối (region, tags mặc định) | — |
+| `resource` | Tài nguyên Terraform **quản lý vòng đời** | `aws_vpc.main.id` |
+| `data` | **Đọc** thông tin có sẵn (AMI, AZ, account) | `data.aws_ami.ubuntu.id` |
+| `variable` | Đầu vào có kiểu, default, validation | `var.env` |
+| `locals` | Giá trị tính toán nội bộ, tránh lặp | `local.name` |
+| `output` | Giá trị xuất ra (cho người dùng hoặc module khác) | `module.vpc.vpc_id` |
+
+### Ví dụ đầy đủ: VPC nhỏ
+
+```hcl title="variables.tf"
+variable "env" {
+  type        = string
+  description = "Tên môi trường"
+
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.env)
+    error_message = "env phải là dev, staging hoặc prod."
+  }
+}
+
+variable "vpc_cidr" {
+  type    = string
+  default = "10.10.0.0/16"
+}
+
+variable "public_subnets" {
+  type = map(object({
+    cidr = string
+    az   = string
+  }))
+}
+```
+
+```hcl title="main.tf"
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+locals {
+  name = "shop-${var.env}"
+  common_tags = {
+    Project     = "shop"
+    Environment = var.env
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr
+  tags       = merge(local.common_tags, { Name = local.name })
+}
+
+resource "aws_subnet" "public" {
+  for_each = var.public_subnets
+
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = each.value.cidr
+  availability_zone       = each.value.az
+  map_public_ip_on_launch = true
+  tags                    = merge(local.common_tags, { Name = "${local.name}-public-${each.key}" })
+}
+
+resource "aws_security_group" "web" {
+  name   = "${local.name}-web"
+  vpc_id = aws_vpc.main.id
+
+  dynamic "ingress" {
+    for_each = [80, 443]
+    content {
+      from_port   = ingress.value
+      to_port     = ingress.value
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
+}
+```
+
+```hcl title="outputs.tf"
+output "vpc_id" {
+  value = aws_vpc.main.id
+}
+
+output "public_subnet_ids" {
+  value = { for key, subnet in aws_subnet.public : key => subnet.id }
+}
+```
+
+```hcl title="dev.tfvars"
+env = "dev"
+public_subnets = {
+  a = { cidr = "10.10.1.0/24", az = "ap-southeast-1a" }
+  b = { cidr = "10.10.2.0/24", az = "ap-southeast-1b" }
+}
+```
+
+Chú ý: `aws_subnet.public` tham chiếu `aws_vpc.main.id` → Terraform **tự biết** phải tạo VPC trước. Hiếm khi cần `depends_on`.
+
+### count hay for_each?
+
+<CountVsForEachDiagram />
+
+| | `count` | `for_each` |
+|---|---|---|
+| Đầu vào | Số nguyên | `map` hoặc `set(string)` |
+| Địa chỉ | `aws_subnet.public[0]` | `aws_subnet.public["a"]` |
+| Xoá phần tử giữa | Chỉ số dịch → thay thế dây chuyền | Chỉ phần tử đó bị xoá |
+| Dùng khi | Bật/tắt một tài nguyên: `count = var.enable_nat ? 1 : 0` | Nhiều bản sao có danh tính riêng |
+
+**Dynamic block** tạo lặp các block lồng bên trong một resource (như `ingress`), khác với `for_each` ở cấp resource.
+
+### Lifecycle rules
+
+```hcl
+resource "aws_db_instance" "main" {
+  # ...
+  lifecycle {
+    prevent_destroy = true               # từ chối mọi plan xoá tài nguyên này
+    ignore_changes  = [password]         # thay đổi ngoài Terraform ở field này được bỏ qua
+  }
+}
+```
+
+`create_before_destroy = true` dùng khi cần tạo bản mới trước rồi mới xoá bản cũ (ví dụ launch template, certificate).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { command: "terraform init && terraform plan -var-file=dev.tfvars", output: "data.aws_availability_zones.available: Reading...\n\n  # aws_subnet.public[\"a\"] will be created\n  # aws_subnet.public[\"b\"] will be created\n  # aws_vpc.main will be created\n  # aws_security_group.web will be created\n\nPlan: 4 to add, 0 to change, 0 to destroy." },
+    { comment: "Thử validation của biến", command: "terraform plan -var-file=dev.tfvars -var env=test", output: "Error: Invalid value for variable\n\n  on variables.tf line 1:\n   1: variable \"env\" {\n\nenv phải là dev, staging hoặc prod." },
+    { comment: "Console tương tác: thử biểu thức HCL mà không tạo gì", command: "terraform console -var-file=dev.tfvars", output: "> local.name\n\"shop-dev\"\n> [for k, v in var.public_subnets : v.cidr]\n[\n  \"10.10.1.0/24\",\n  \"10.10.2.0/24\",\n]" },
+    { command: "terraform apply -var-file=dev.tfvars", output: "Apply complete! Resources: 4 added, 0 changed, 0 destroyed.\n\nOutputs:\n\npublic_subnet_ids = {\n  \"a\" = \"subnet-0a1b2c3d4e5f60001\"\n  \"b\" = \"subnet-0a1b2c3d4e5f60002\"\n}\nvpc_id = \"vpc-0f1e2d3c4b5a69788\"" },
+    { command: "terraform output -raw vpc_id", output: "vpc-0f1e2d3c4b5a69788" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Dùng `count` cho danh sách có thể thay đổi thứ tự.** Xoá một phần tử ở giữa làm các phần tử sau bị "đổi chỗ" và bị thay thế. Với danh sách subnet, bucket, user… hãy dùng `for_each` với khoá ổn định.
+
+</Callout>
+
+<Callout type="warning" title="Không hardcode secret">
+
+Đừng viết mật khẩu DB vào `.tf` hay `.tfvars` commit lên Git. Dùng `sensitive = true` cho variable/output, lấy secret từ Secrets Manager/SSM qua data source, hoặc để RDS tự quản lý (`manage_master_user_password = true`). Nhớ rằng giá trị vẫn nằm dạng rõ trong **state**.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "resource", meaning: "Tài nguyên mà Terraform tạo, sửa, xoá và theo dõi trong state." },
+    { term: "data source", meaning: "Truy vấn thông tin có sẵn, không tạo tài nguyên mới." },
+    { term: "variable / tfvars", meaning: "Đầu vào có kiểu dữ liệu; giá trị cụ thể thường đặt trong file .tfvars." },
+    { term: "locals", meaning: "Biến nội bộ tính một lần, dùng nhiều chỗ." },
+    { term: "output", meaning: "Giá trị xuất ra màn hình hoặc cho module/stack khác dùng." },
+    { term: "for_each", meaning: "Tạo nhiều bản sao định danh bằng khoá của map/set." },
+    { term: "dynamic block", meaning: "Sinh lặp các block lồng (ingress, setting…) bên trong resource." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn cần lấy ID của AMI Ubuntu mới nhất do Canonical phát hành để dùng cho EC2. Nên dùng block nào?"
+  options={[
+    "resource \"aws_ami\" để tạo AMI mới",
+    "variable với default là một AMI ID viết tay",
+    "output để in AMI ra màn hình",
+    "data \"aws_ami\" với most_recent = true và owners của Canonical",
+  ]}
+  answerIndex={3}
+  explanation="Data source là hỏi bếp xem 'đã có sẵn gì' — chỉ đọc. Resource sẽ nấu món mới (tạo AMI), còn hardcode ID sẽ nhanh chóng lỗi thời."
+/>

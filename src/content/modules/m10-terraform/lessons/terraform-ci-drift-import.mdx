@@ -1,0 +1,186 @@
+import { TerraformPrPipelineDiagram } from "../diagrams/terraform-pr-pipeline-diagram";
+
+<Eli5 title="Pipeline Terraform giống như quy trình duyệt chi của kế toán" emoji="🏦">
+
+Ở công ty tử tế, không ai tự rút tiền két. Bạn **lập đề nghị chi** (PR), kế toán **kiểm tra chứng từ** (lint, scan bảo mật), in ra **bảng dự toán** chính xác (plan), trưởng phòng **ký duyệt** (review), rồi thủ quỹ mới **chi tiền** (apply) và ghi sổ (state).
+
+Thỉnh thoảng kiểm toán **đi kiểm két đột xuất** (drift detection): sổ ghi 100 triệu mà két có 95 triệu → có người chi ngoài quy trình, cần tìm hiểu và xử lý.
+
+Còn khoản tiền "có sẵn trong két mà chưa từng vào sổ" (tài nguyên tạo tay)? Thì **nhập sổ** cho đúng (import) — không phải đốt đi làm lại.
+
+</Eli5>
+
+Mục tiêu cuối của M10: **không ai có quyền ghi vào AWS từ laptop**. Mọi thay đổi đi qua PR, có plan được review, apply bằng CI với credentials tạm thời qua OIDC. Đó cũng là cách bạn sẽ được phỏng vấn: "team bạn quản lý thay đổi hạ tầng thế nào?"
+
+<TerraformPrPipelineDiagram />
+
+<Technical>
+
+### Kiểm tra trước khi plan
+
+| Công cụ | Bắt được gì |
+|---|---|
+| `terraform fmt -check -recursive` | Code chưa format |
+| `terraform validate` | Sai cú pháp, sai kiểu, tham chiếu không tồn tại |
+| `tflint` (+ plugin AWS) | Instance type không tồn tại, biến khai báo mà không dùng, quy ước đặt tên |
+| `checkov -d .` / `trivy config .` | Cấu hình không an toàn: bucket public, SG mở 22 ra internet, không mã hoá |
+
+### GitHub Actions: plan trên PR, apply khi merge
+
+```yaml title=".github/workflows/terraform-dev.yml"
+name: terraform-dev
+
+on:
+  pull_request:
+    paths: ["infra/**"]
+  push:
+    branches: [main]
+    paths: ["infra/**"]
+
+permissions:
+  id-token: write      # cho phép lấy OIDC token
+  contents: read
+  pull-requests: write # để comment plan
+
+defaults:
+  run:
+    working-directory: infra/envs/dev
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-terraform-plan
+          aws-region: ap-southeast-1
+      - run: terraform fmt -check -recursive
+      - run: terraform init -input=false
+      - run: terraform validate
+      - uses: terraform-linters/setup-tflint@v4
+      - run: tflint --init && tflint
+      - run: pipx run checkov -d . --quiet
+      - run: terraform plan -input=false -no-color -out=tfplan
+      - run: terraform show -no-color tfplan > plan.txt
+      - run: gh pr comment ${{ github.event.pull_request.number }} --body-file plan.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  apply:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: dev   # có thể bật required reviewers trong Settings → Environments
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-terraform-apply
+          aws-region: ap-southeast-1
+      - run: terraform init -input=false
+      - run: terraform apply -input=false -auto-approve
+```
+
+Hai role tách biệt: role `plan` chỉ đọc (và đọc/ghi file lock), trust policy cho `pull_request`; role `apply` có quyền ghi, trust policy chỉ chấp nhận `sub` là `repo:org/shop:environment:dev`. Phiên bản action (`@v4`, `@v3`) thay đổi theo thời gian — kiểm tra bản mới nhất.
+
+Lưu ý: job apply ở trên tính lại plan lúc merge. Cách chặt hơn là lưu `tfplan` làm artifact và apply đúng file đó, hoặc dùng công cụ chuyên dụng như Atlantis / HCP Terraform.
+
+### Drift: thực tế lệch khỏi code
+
+Drift xảy ra khi ai đó sửa trên Console, hoặc một hệ thống khác (autoscaling) đổi thuộc tính.
+
+```bash
+terraform plan -detailed-exitcode   # 0 = khớp, 1 = lỗi, 2 = có thay đổi
+terraform plan -refresh-only        # chỉ xem thực tế đã đổi gì, không đề xuất sửa
+```
+
+Xử lý drift — chọn **một** trong ba:
+
+1. **Code đúng, Console sai** → `terraform apply` để đưa thực tế về như code.
+2. **Thay đổi tay là đúng** → sửa code cho khớp, plan ra `No changes`.
+3. **Thuộc tính do hệ thống khác quản lý** (ví dụ `desired_capacity` do scaling policy đổi) → `lifecycle { ignore_changes = [desired_capacity] }`.
+
+### Import và moved blocks
+
+Từ Terraform 1.5, bạn import bằng code (review được qua PR) thay vì lệnh CLI:
+
+```hcl title="imports.tf"
+import {
+  to = aws_s3_bucket.legacy_logs
+  id = "shop-legacy-logs-123456789012"
+}
+```
+
+```bash
+terraform plan -generate-config-out=generated.tf   # sinh sẵn block resource để bạn chỉnh lại
+```
+
+Đổi tên hoặc chuyển tài nguyên vào module mà **không tạo lại** (có từ 1.1):
+
+```hcl title="moved.tf"
+moved {
+  from = aws_instance.web
+  to   = module.web.aws_instance.this
+}
+```
+
+Plan sẽ hiện `has moved to` thay vì `-` và `+`. Còn block `removed` (1.7+) giúp Terraform "buông" một tài nguyên mà không xoá nó.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { command: "tflint --init && tflint", output: "1 issue(s) found:\n\nError: \"t3.mirco\" is an invalid value as instance_type (aws_instance_invalid_type)\n\n  on main.tf line 14:\n  14:   instance_type = \"t3.mirco\"" },
+    { command: "checkov -d . --compact --quiet", output: "Check: CKV_AWS_24: \"Ensure no security groups allow ingress from 0.0.0.0:0 to port 22\"\n\tFAILED for resource: aws_security_group.bastion\n\tFile: /main.tf:40-58\n\nPassed checks: 42, Failed checks: 1, Skipped checks: 0" },
+    { comment: "Lab drift: vào Console thêm tag Owner=manual cho VPC, rồi chạy", command: "terraform plan -detailed-exitcode; echo \"exit=$?\"", output: "Note: Objects have changed outside of Terraform\n\n  # aws_vpc.main has changed\n  ~ resource \"aws_vpc\" \"main\" {\n      ~ tags = {\n          + \"Owner\" = \"manual\"\n        }\n    }\n\nTerraform will perform the following actions:\n\n  # aws_vpc.main will be updated in-place\n  ~ resource \"aws_vpc\" \"main\" {\n      ~ tags = {\n          - \"Owner\" = \"manual\" -> null\n        }\n    }\n\nPlan: 0 to add, 1 to change, 0 to destroy.\nexit=2" },
+    { comment: "Đưa thực tế về như code", command: "terraform apply -auto-approve", output: "Apply complete! Resources: 0 added, 1 changed, 0 destroyed." },
+    { comment: "Import bucket tạo tay bằng import block", command: "terraform plan -generate-config-out=generated.tf", output: "aws_s3_bucket.legacy_logs: Preparing import... [id=shop-legacy-logs-123456789012]\n\nPlan: 1 to import, 0 to add, 0 to change, 0 to destroy.\n\nTerraform has generated configuration and written it to generated.tf." },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Dùng một IAM user có `AdministratorAccess` với access key lưu trong GitHub Secrets.** Key sống mãi, lộ là mất cả tài khoản. Dùng OIDC (đã học ở M05/M06) với role quyền hẹp, tách role plan và apply.
+
+</Callout>
+
+<Callout type="warning" title="Plan trên PR từ fork">
+
+Không chạy plan có credentials AWS cho PR từ repo fork (public repo): code Terraform độc hại có thể dùng `external` data source để chạy lệnh tuỳ ý ngay trong lúc plan. Giới hạn trust policy của role theo repo/branch/environment.
+
+</Callout>
+
+<Callout type="tip" title="Chuẩn bị chứng chỉ">
+
+Nội dung M10 bao phủ phần lớn **HashiCorp Certified: Terraform Associate**. Kiểm tra mã đề và nội dung thi hiện hành trên trang HashiCorp trước khi đăng ký.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "tflint", meaning: "Linter cho Terraform, bắt lỗi logic và giá trị không hợp lệ mà validate bỏ qua." },
+    { term: "checkov / trivy config", meaning: "Công cụ quét cấu hình IaC để tìm thiết lập không an toàn." },
+    { term: "drift", meaning: "Hạ tầng thật khác với code/state do thay đổi ngoài Terraform." },
+    { term: "-detailed-exitcode", meaning: "Cờ của plan trả exit 2 khi có thay đổi — tiện cho job phát hiện drift." },
+    { term: "import block", meaning: "Khai báo trong code để đưa tài nguyên có sẵn vào quản lý của Terraform." },
+    { term: "moved block", meaning: "Khai báo đổi địa chỉ tài nguyên mà không xoá/tạo lại." },
+    { term: "OIDC", meaning: "Cơ chế để CI lấy credentials AWS tạm thời mà không lưu access key." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn gom `aws_instance.web` vào `module.web` khi refactor. Plan báo 1 to add, 1 to destroy cho cùng một server. Cách xử lý đúng là gì?"
+  options={[
+    "Chấp nhận, vì server tạo lại cũng giống vậy",
+    "Chạy terraform state rm rồi apply",
+    "Thêm lifecycle ignore_changes cho mọi thuộc tính",
+    "Thêm block moved từ aws_instance.web sang module.web.aws_instance.this rồi plan lại",
+  ]}
+  answerIndex={3}
+  explanation="Server không đổi, chỉ đổi 'số trang trong sổ'. moved giống ghi chú chuyển mục trong sổ kế toán: plan sẽ hiện has moved to, không xoá tạo lại. state rm sẽ làm Terraform quên server và tạo trùng."
+/>

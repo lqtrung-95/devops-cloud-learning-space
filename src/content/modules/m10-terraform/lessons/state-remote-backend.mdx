@@ -1,0 +1,155 @@
+import { StateLockingConcurrentApplyDiagram } from "../diagrams/state-locking-concurrent-apply-diagram";
+
+<Eli5 title="State giống như sổ kiểm kê kho có một chìa khoá duy nhất" emoji="📒">
+
+Kho hàng của công ty có một **sổ kiểm kê**: kệ A có 10 thùng, kệ B có 5 thùng. Terraform cũng có sổ như vậy — file **state** — ghi "block `aws_vpc.main` trong code chính là `vpc-0f1e...` trên AWS".
+
+Nếu mỗi thủ kho giữ **một bản sổ riêng trong cặp** (state local trên laptop), chẳng ai biết người kia đã nhập xuất gì. Nên sổ phải để ở **văn phòng chung** (remote backend, ví dụ S3).
+
+Nhưng văn phòng chung lại có rủi ro mới: hai người cùng mở sổ và cùng ghi một lúc thì người ghi sau xoá mất dòng của người trước. Giải pháp: sổ có **một chìa khoá** (lock) — ai đang ghi thì giữ chìa, người kia phải chờ.
+
+</Eli5>
+
+Mất hoặc hỏng state là một trong những sự cố Terraform đau đớn nhất: tài nguyên vẫn chạy (và vẫn tính tiền) nhưng Terraform "quên" chúng. Vì vậy thiết lập remote state **có locking, versioning, mã hoá** là việc đầu tiên khi làm Terraform theo nhóm.
+
+<StateLockingConcurrentApplyDiagram />
+
+<Technical>
+
+### State chứa gì
+
+`terraform.tfstate` là JSON gồm: `serial` (tăng mỗi lần ghi), `lineage` (định danh của chuỗi state), và danh sách tài nguyên với **ID thật + toàn bộ thuộc tính**. Hệ quả:
+
+- State có thể chứa **secret dạng rõ** (mật khẩu DB, private key) → bucket state phải được bảo vệ như secret.
+- Không bao giờ sửa tay file state. Dùng các lệnh `terraform state`.
+
+### Local vs remote backend
+
+| | Local (`terraform.tfstate` cạnh code) | Remote (S3, HCP Terraform…) |
+|---|---|---|
+| Chia sẻ cho team/CI | Không | Có |
+| Locking | Chỉ trong một máy | Có (tuỳ backend) |
+| Mất laptop | Mất state | An toàn, có versioning |
+| Dùng cho | Thử nghiệm cá nhân | Mọi thứ thật |
+
+### S3 backend với native locking
+
+Trước đây S3 backend cần thêm **một bảng DynamoDB** để làm khoá. Các bản Terraform gần đây (native S3 locking xuất hiện khoảng 1.10 và ổn định từ 1.11 — kiểm tra tài liệu mới nhất) hỗ trợ `use_lockfile = true`: Terraform tạo file `<key>.tflock` ngay trong bucket bằng **conditional write** của S3. Tham số `dynamodb_table` được đánh dấu deprecated. OpenTofu cũng có tính năng tương tự.
+
+```hcl title="bootstrap/main.tf"
+resource "aws_s3_bucket" "tfstate" {
+  bucket = "shop-tfstate-123456789012"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "tfstate" {
+  bucket = aws_s3_bucket.tfstate.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "tfstate" {
+  bucket = aws_s3_bucket.tfstate.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "aws:kms"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "tfstate" {
+  bucket                  = aws_s3_bucket.tfstate.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+```
+
+```hcl title="envs/dev/backend.tf"
+terraform {
+  backend "s3" {
+    bucket       = "shop-tfstate-123456789012"
+    key          = "dev/terraform.tfstate"
+    region       = "ap-southeast-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+```
+
+Bucket state là chuyện "con gà quả trứng": tạo nó bằng một thư mục `bootstrap/` dùng state local (hoặc tạo tay một lần), sau đó mọi stack khác dùng backend S3. Block `backend` **không nhận biến** — muốn đổi giá trị theo môi trường thì dùng `terraform init -backend-config=dev.s3.tfbackend`.
+
+IAM cho người/CI chạy Terraform cần `s3:ListBucket` trên bucket, `s3:GetObject`/`s3:PutObject` trên key state, và `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` trên file `.tflock`.
+
+### Các lệnh state
+
+| Lệnh | Dùng khi |
+|---|---|
+| `terraform state list` | Xem Terraform đang quản lý những gì |
+| `terraform state show aws_vpc.main` | Xem thuộc tính một tài nguyên |
+| `terraform state mv A B` | Đổi tên/di chuyển địa chỉ mà không tạo lại (nay nên dùng block `moved`) |
+| `terraform state rm A` | Terraform "quên" tài nguyên, **không xoá** trên AWS (nay có block `removed`) |
+| `terraform import A id` | Đưa tài nguyên có sẵn vào state (nay nên dùng block `import`) |
+| `terraform force-unlock LOCK_ID` | Gỡ khoá bị kẹt khi tiến trình chết giữa chừng |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "1) Tạo bucket state bằng thư mục bootstrap (state local)", command: "cd bootstrap && terraform init && terraform apply", output: "Apply complete! Resources: 4 added, 0 changed, 0 destroyed." },
+    { comment: "2) Stack dev: thêm backend.tf rồi init, Terraform hỏi chuyển state local lên S3", command: "cd ../envs/dev && terraform init -migrate-state", output: "Initializing the backend...\nDo you want to copy existing state to the new backend?\n  Enter a value: yes\n\nSuccessfully configured the backend \"s3\"! Terraform will automatically\nuse this backend unless the backend configuration changes." },
+    { command: "aws s3 ls s3://shop-tfstate-123456789012/dev/", output: "2026-09-14 09:12:40      18342 terraform.tfstate" },
+    { comment: "3) Trong lúc một terminal khác đang apply, thử apply ở terminal này", command: "terraform apply", output: "Error: Error acquiring the state lock\n\nLock Info:\n  ID:        4b7e2a1c-9d3f-6e8a-1b2c-3d4e5f6a7b8c\n  Path:      shop-tfstate-123456789012/dev/terraform.tfstate\n  Operation: OperationTypeApply\n  Who:       an@an-macbook\n  Version:   1.13.3\n  Created:   2026-09-14 02:13:05 UTC\n\nTerraform acquires a state lock to protect the state from being written\nby multiple users at the same time." },
+    { comment: "4) Xem các phiên bản cũ của state (cứu hộ khi state hỏng)", command: "aws s3api list-object-versions --bucket shop-tfstate-123456789012 --prefix dev/terraform.tfstate --query 'Versions[].[VersionId,LastModified]' --output text", output: "Qx8.hN3kPz0Jt2   2026-09-14T09:20:11+00:00\nT1c9mL0vYw7aBq   2026-09-14T09:12:40+00:00" },
+    { command: "terraform state list", output: "aws_security_group.web\naws_subnet.public[\"a\"]\naws_subnet.public[\"b\"]\naws_vpc.main" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Commit `terraform.tfstate` vào Git.** Vừa lộ secret, vừa không có locking, vừa dễ conflict. Thêm `*.tfstate`, `*.tfstate.*` và `.terraform/` vào `.gitignore` ngay từ đầu.
+
+</Callout>
+
+<Callout type="warning" title="force-unlock chỉ khi chắc chắn">
+
+Chỉ chạy `terraform force-unlock` khi đã xác nhận không còn tiến trình nào đang apply (ví dụ job CI đã bị huỷ). Gỡ khoá của một apply đang chạy chính là tạo ra kịch bản ghi đè trong hình ở trên.
+
+</Callout>
+
+<Callout type="tip" title="Chia nhỏ state">
+
+Một state khổng lồ cho cả công ty làm plan chậm và "bán kính nổ" lớn. Tách theo môi trường và theo lớp (`network`, `data`, `app`) — ví dụ key `dev/network/terraform.tfstate`.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "state", meaning: "File JSON nối địa chỉ trong code với tài nguyên thật và thuộc tính của nó." },
+    { term: "backend", meaning: "Nơi lưu state và thực hiện locking (local, s3, HCP Terraform…)." },
+    { term: "state lock", meaning: "Khoá đảm bảo chỉ một tiến trình được ghi state tại một thời điểm." },
+    { term: "use_lockfile", meaning: "Tuỳ chọn S3 backend dùng file .tflock trong bucket làm khoá, thay cho bảng DynamoDB." },
+    { term: "serial", meaning: "Số thứ tự tăng dần mỗi lần state được ghi." },
+    { term: "force-unlock", meaning: "Lệnh gỡ khoá bị kẹt — nguy hiểm nếu dùng sai lúc." },
+    { term: "state rm", meaning: "Xoá tài nguyên khỏi state mà không xoá trên cloud." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team 4 người cùng làm một stack Terraform, state đang để local trên máy từng người. Thay đổi nào quan trọng nhất cần làm trước?"
+  options={[
+    "Chuyển state lên S3 backend có versioning, mã hoá và locking",
+    "Commit terraform.tfstate lên Git để mọi người cùng pull",
+    "Quy định mỗi người chỉ apply vào buổi sáng",
+    "Chuyển sang dùng count thay cho for_each",
+  ]}
+  answerIndex={0}
+  explanation="Sổ kiểm kê phải ở văn phòng chung và có một chìa khoá. Git không có locking và làm lộ secret trong state; quy ước giờ giấc thì không ngăn được ghi đè."
+/>

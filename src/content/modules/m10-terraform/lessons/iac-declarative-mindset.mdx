@@ -1,0 +1,114 @@
+import { DeclarativeVsImperativeDiagram } from "../diagrams/declarative-vs-imperative-diagram";
+
+<Eli5 title="IaC giống như bản vẽ kiến trúc thay vì dặn thợ từng câu" emoji="📐">
+
+Tưởng tượng bạn xây nhà. Cách thứ nhất: đứng cạnh thợ và dặn từng câu — "xây thêm 1 bức tường", "đổ thêm 1 tầng". Nếu hôm sau bạn lỡ dặn lại y hệt, thợ sẽ xây **thêm** 1 tầng nữa. Đó là kiểu **imperative** (mệnh lệnh từng bước).
+
+Cách thứ hai: đưa thợ **bản vẽ** "nhà 3 tầng, 2 phòng ngủ". Thợ nhìn căn nhà hiện tại, so với bản vẽ, thiếu gì thì xây bù, thừa gì thì phá bớt. Đưa bản vẽ 10 lần thì nhà vẫn 3 tầng. Đó là kiểu **declarative** (khai báo kết quả mong muốn) — cách Terraform làm việc.
+
+Chỗ ví von bị "gãy": thợ thật tự nhìn được căn nhà, còn Terraform phải **ghi sổ** những gì nó đã xây (state) rồi hỏi AWS API để biết thực tế ra sao.
+
+</Eli5>
+
+Ở M07–M08 bạn đã dựng VPC, ALB, ASG, RDS bằng Console. Thử tưởng tượng làm lại y hệt cho `staging`, hoặc khôi phục sau khi ai đó xoá nhầm: hàng trăm cú click, không review được, không biết ai đổi gì. **Infrastructure as Code (IaC)** biến hạ tầng thành file text nằm trong Git — review bằng PR, tái tạo bằng một lệnh, có lịch sử thay đổi.
+
+<DeclarativeVsImperativeDiagram />
+
+<Technical>
+
+### Imperative vs declarative
+
+| | Imperative (bash + AWS CLI, SDK) | Declarative (Terraform, CloudFormation) |
+|---|---|---|
+| Bạn viết | Các **bước** cần làm | **Trạng thái cuối** mong muốn |
+| Chạy lại | Làm lại các bước → dễ tạo trùng | Tính diff → chỉ làm phần chênh lệch |
+| Idempotent | Phải tự viết logic kiểm tra | Có sẵn |
+| Xoá tài nguyên | Viết thêm script xoá | Bỏ khỏi code → plan hiện `-` |
+| Thứ tự | Bạn tự sắp | Công cụ tự dựng dependency graph |
+
+**Idempotent** = chạy 1 lần hay 100 lần đều ra cùng kết quả. Đây là tính chất quan trọng nhất của IaC.
+
+### Terraform hoạt động thế nào (tóm tắt)
+
+1. Bạn viết file `.tf` bằng ngôn ngữ **HCL**.
+2. **Provider** (plugin, ví dụ `hashicorp/aws`) dịch mỗi `resource` thành lời gọi API.
+3. **State** ghi lại tài nguyên thật tương ứng với từng block trong code.
+4. `terraform plan` so **code ↔ state ↔ thực tế** và in ra diff; `terraform apply` thực hiện diff đó.
+
+```hcl title="main.tf"
+resource "aws_s3_bucket" "assets" {
+  bucket = "shop-assets-dev-123456789012"
+
+  tags = {
+    Environment = "dev"
+    ManagedBy   = "terraform"
+  }
+}
+```
+
+### Terraform và các "đối thủ"
+
+| Công cụ | Ngôn ngữ | State ở đâu | Ghi chú |
+|---|---|---|---|
+| **Terraform** | HCL | File state (local/S3/HCP Terraform) | Đa cloud, hệ sinh thái provider lớn nhất |
+| **OpenTofu** | HCL | Như Terraform | Fork mã nguồn mở của Terraform (Linux Foundation), lệnh `tofu` |
+| **CloudFormation** | YAML/JSON | AWS tự quản lý | Chỉ AWS, không cần lo state |
+| **AWS CDK** | TypeScript, Python… | Sinh ra CloudFormation | Dùng vòng lặp/class của ngôn ngữ lập trình |
+| **Pulumi** | TypeScript, Go, Python… | Pulumi Cloud hoặc tự host | Đa cloud, code "thật" |
+
+Năm 2023 HashiCorp đổi license Terraform sang BSL, cộng đồng tách ra **OpenTofu** (giấy phép MPL). Với người học, cú pháp và workflow gần như giống hệt — những gì học ở module này dùng được cho cả hai. Hai bên có tính năng mới khác nhau theo thời gian, nên kiểm tra tài liệu mới nhất khi chọn cho dự án.
+
+### Terraform không làm gì
+
+Terraform giỏi **tạo/sửa/xoá tài nguyên cloud** (provisioning). Cài package, sửa file config bên trong server là việc của **configuration management** (Ansible) hoặc **image** dựng sẵn (Packer, Docker) — bạn sẽ học ở M11.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài Terraform trên macOS (hoặc xem hướng dẫn Linux trên developer.hashicorp.com)", command: "brew tap hashicorp/tap && brew install hashicorp/tap/terraform" },
+    { command: "terraform version", output: "Terraform v1.13.3\non darwin_arm64" },
+    { comment: "Kiểm tra AWS CLI đang dùng đúng tài khoản lab (đã cấu hình ở M06)", command: "aws sts get-caller-identity --query Account --output text", output: "123456789012" },
+    { comment: "Tạo thư mục thử nghiệm với 1 file main.tf như ví dụ ở trên", command: "mkdir tf-hello && cd tf-hello && touch main.tf" },
+    { comment: "Imperative: chạy 2 lần sẽ lỗi hoặc tạo trùng — phải tự xử lý", command: "aws s3 mb s3://shop-assets-dev-123456789012 && aws s3 mb s3://shop-assets-dev-123456789012", output: "make_bucket: shop-assets-dev-123456789012\nmake_bucket failed: s3://shop-assets-dev-123456789012 An error occurred (BucketAlreadyOwnedByYou) ..." },
+    { comment: "Dọn bucket vừa tạo tay — bài sau sẽ tạo lại bằng Terraform", command: "aws s3 rb s3://shop-assets-dev-123456789012", output: "remove_bucket: shop-assets-dev-123456789012" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**"ClickOps" rồi mới viết Terraform sau.** Tạo tay trên Console "cho nhanh" rồi định bổ sung code sau thường dẫn tới hạ tầng không ai tái tạo được. Nếu buộc phải tạo tay (sự cố khẩn cấp), hãy `import` vào Terraform ngay sau đó — bài 6 sẽ hướng dẫn.
+
+</Callout>
+
+<Callout type="info" title="Terraform hay OpenTofu?">
+
+Module này dùng lệnh `terraform`. Nếu công ty bạn dùng OpenTofu, thay `terraform` bằng `tofu` — file `.tf`, provider và workflow gần như giữ nguyên.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "IaC", meaning: "Infrastructure as Code — mô tả hạ tầng bằng file text quản lý trong Git." },
+    { term: "Declarative", meaning: "Khai báo trạng thái cuối mong muốn; công cụ tự tính cách đạt được." },
+    { term: "Imperative", meaning: "Liệt kê từng bước cần làm theo thứ tự." },
+    { term: "Idempotent", meaning: "Chạy nhiều lần vẫn cho cùng một kết quả, không tạo trùng." },
+    { term: "Provider", meaning: "Plugin dịch resource trong HCL thành lời gọi API của một nền tảng (AWS, GitHub…)." },
+    { term: "State", meaning: "Sổ ghi Terraform dùng để nối block trong code với tài nguyên thật." },
+    { term: "OpenTofu", meaning: "Bản fork mã nguồn mở của Terraform, tương thích cú pháp HCL." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn chạy `terraform apply` cho code khai báo 3 EC2. Không ai sửa gì, bạn chạy apply lần nữa. Chuyện gì xảy ra?"
+  options={[
+    "Terraform tạo thêm 3 EC2, tổng cộng 6",
+    "Terraform báo lỗi vì tài nguyên đã tồn tại",
+    "Terraform báo No changes vì thực tế đã khớp với code",
+    "Terraform xoá 3 EC2 cũ rồi tạo 3 cái mới",
+  ]}
+  answerIndex={2}
+  explanation="Như đưa bản vẽ nhà 3 tầng lần thứ hai: thợ so thấy đã đủ 3 tầng nên không xây thêm. Declarative + state giúp Terraform idempotent."
+/>

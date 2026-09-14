@@ -1,0 +1,170 @@
+import { ModuleEnvironmentsDiagram } from "../diagrams/module-environments-diagram";
+
+<Eli5 title="Module giống như căn hộ mẫu của chủ đầu tư" emoji="🏢">
+
+Chủ đầu tư không vẽ lại từ đầu mỗi toà chung cư. Họ có **bản thiết kế căn hộ mẫu** đã được kiểm định: điện, nước, phòng cháy đều chuẩn. Toà A chọn 20 tầng, toà B chọn 35 tầng, sàn gỗ hay sàn gạch — nhưng cùng một bản thiết kế.
+
+Terraform **module** chính là bản thiết kế đó: một thư mục `.tf` nhận **biến đầu vào** (số AZ, instance type, Multi-AZ hay không) và trả ra **output** (VPC ID, ALB DNS). Môi trường `dev`, `staging`, `prod` là các toà nhà khác nhau dùng chung bản thiết kế.
+
+Mỗi toà có **sổ quản lý riêng** (state riêng) — sửa toà A không bao giờ đụng vào sổ của toà B.
+
+</Eli5>
+
+Lab của module này là dựng lại toàn bộ Checkpoint 2 cho `dev` và `staging`. Nếu copy-paste 2 thư mục code, bạn sẽ sửa bug ở dev rồi quên sửa ở staging. Module giúp **DRY** và đảm bảo staging thực sự giống prod về cấu trúc.
+
+<ModuleEnvironmentsDiagram />
+
+<Technical>
+
+### Cấu trúc thư mục khuyến nghị
+
+```text title="infra/"
+infra/
+├── bootstrap/                # bucket state (chạy một lần)
+├── modules/
+│   ├── vpc/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── alb-asg/
+│   └── rds/
+└── envs/
+    ├── dev/
+    │   ├── backend.tf        # key = "dev/terraform.tfstate"
+    │   ├── main.tf           # gọi các module
+    │   └── terraform.tfvars
+    └── staging/
+        ├── backend.tf        # key = "staging/terraform.tfstate"
+        ├── main.tf
+        └── terraform.tfvars
+```
+
+### Gọi module của riêng bạn
+
+```hcl title="envs/dev/main.tf"
+module "vpc" {
+  source = "../../modules/vpc"
+
+  name       = "shop-dev"
+  cidr       = "10.10.0.0/16"
+  az_count   = 2
+  single_nat = true
+}
+
+module "web" {
+  source = "../../modules/alb-asg"
+
+  name               = "shop-dev-web"
+  vpc_id             = module.vpc.vpc_id
+  public_subnet_ids  = module.vpc.public_subnet_ids
+  private_subnet_ids = module.vpc.private_subnet_ids
+  instance_type      = var.instance_type
+  min_size           = 1
+  max_size           = 2
+}
+
+module "db" {
+  source = "../../modules/rds"
+
+  name           = "shop-dev"
+  subnet_ids     = module.vpc.private_subnet_ids
+  allowed_sg_ids = [module.web.instance_security_group_id]
+  instance_class = "db.t4g.micro"
+  multi_az       = false
+}
+```
+
+Output của module này (`module.vpc.vpc_id`) là input của module khác — Terraform tự nối dependency.
+
+### Dùng module từ Registry
+
+```hcl
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 6.0" # luôn pin version; kiểm tra bản mới nhất trên Registry
+
+  name            = "shop-dev"
+  cidr            = "10.10.0.0/16"
+  azs             = ["ap-southeast-1a", "ap-southeast-1b"]
+  private_subnets = ["10.10.11.0/24", "10.10.12.0/24"]
+  public_subnets  = ["10.10.1.0/24", "10.10.2.0/24"]
+
+  enable_nat_gateway = true
+  single_nat_gateway = true
+}
+```
+
+Module cộng đồng như `terraform-aws-modules` tiết kiệm nhiều thời gian, nhưng hãy **tự viết module vpc ít nhất một lần** để hiểu nó tạo ra những gì (route table, NAT, IGW…).
+
+### Thiết kế module tốt
+
+- Input tối thiểu, có `type`, `description`, default hợp lý; `validation` cho giá trị nguy hiểm.
+- Không cấu hình `provider` bên trong module con — để root module truyền vào.
+- Output đủ để module khác dùng (ID, ARN, security group ID).
+- Pin version: `?ref=v1.2.0` với Git source, `version = "..."` với Registry.
+
+### Thư mục theo env vs workspaces vs Terragrunt
+
+| Cách | Ưu | Nhược |
+|---|---|---|
+| **Thư mục theo env** (`envs/dev`, `envs/prod`) | Rõ ràng, backend/quyền IAM tách riêng, dễ review | Lặp lại một ít code gọi module |
+| **Workspaces** (`terraform workspace new staging`) | Một bộ code, state tự tách theo workspace | Dễ apply nhầm workspace, chung backend và thường chung credentials |
+| **Terragrunt** | Wrapper giảm lặp backend/provider, quản lý dependency giữa stack | Thêm một công cụ cần học |
+
+Với dự án có `prod` thật, cách phổ biến là **thư mục theo env** (hoặc Terragrunt). Workspaces hợp với môi trường tạm thời giống nhau (ví dụ mỗi feature branch một stack).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { command: "cd infra/envs/dev && terraform init", output: "Initializing the backend...\nInitializing modules...\n- db in ../../modules/rds\n- vpc in ../../modules/vpc\n- web in ../../modules/alb-asg\nInitializing provider plugins...\n\nTerraform has been successfully initialized!" },
+    { command: "terraform plan -out=tfplan", output: "Plan: 31 to add, 0 to change, 0 to destroy.\n\nChanges to Outputs:\n  + alb_dns_name = (known after apply)" },
+    { command: "terraform apply tfplan", output: "Apply complete! Resources: 31 added, 0 changed, 0 destroyed.\n\nOutputs:\n\nalb_dns_name = \"shop-dev-web-1234567890.ap-southeast-1.elb.amazonaws.com\"" },
+    { command: "curl -s -o /dev/null -w '%{http_code}\\n' http://$(terraform output -raw alb_dns_name)/health", output: "200" },
+    { comment: "Staging dùng cùng module, chỉ khác input và state", command: "cd ../staging && terraform init && terraform plan", output: "Plan: 33 to add, 0 to change, 0 to destroy." },
+    { comment: "Tiêu chí đạt của module: xoá sạch rồi dựng lại không chỉnh tay", command: "cd ../dev && terraform destroy -auto-approve && terraform apply -auto-approve", output: "Destroy complete! Resources: 31 destroyed.\n...\nApply complete! Resources: 31 added, 0 changed, 0 destroyed." },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Module "thần thánh" có 60 biến và mọi thứ đều là `count = var.enable_x ? 1 : 0`.** Module khó đọc hơn cả code gốc. Giữ module nhỏ, một mục đích (vpc, alb-asg, rds), ghép lại ở root.
+
+</Callout>
+
+<Callout type="warning" title="Đổi source/tên module = đổi địa chỉ">
+
+Đổi `module "web"` thành `module "app"` làm mọi địa chỉ đổi từ `module.web.*` sang `module.app.*` → plan sẽ xoá và tạo lại tất cả. Dùng block `moved` (bài sau) để đổi tên an toàn.
+
+</Callout>
+
+<Callout type="cost">
+
+Staging "giống prod" không có nghĩa phải to bằng prod. Dùng `single_nat_gateway = true`, instance nhỏ, RDS single-AZ, và destroy staging ngoài giờ làm việc khi đang học.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "module", meaning: "Thư mục .tf tái sử dụng được, giao tiếp qua variable và output." },
+    { term: "root module", meaning: "Thư mục bạn chạy terraform (ví dụ envs/dev), nơi gọi các module con." },
+    { term: "source", meaning: "Nơi lấy module: đường dẫn local, Git URL hoặc Terraform Registry." },
+    { term: "Terraform Registry", meaning: "Kho module/provider công khai, ví dụ terraform-aws-modules." },
+    { term: "workspace", meaning: "Nhiều state độc lập cho cùng một thư mục code." },
+    { term: "Terragrunt", meaning: "Công cụ wrapper giúp giảm lặp cấu hình backend/provider giữa nhiều stack." },
+  ]}
+/>
+
+<QuickCheck
+  question="Staging và prod cần cùng kiến trúc VPC + ALB + RDS nhưng khác kích thước, và team muốn quyền IAM để apply prod tách biệt hẳn. Cách tổ chức nào hợp lý nhất?"
+  options={[
+    "Copy toàn bộ code sang thư mục prod rồi sửa tay từng số",
+    "Một thư mục duy nhất, dùng workspace prod và staging chung credentials",
+    "Module dùng chung + thư mục envs/staging và envs/prod với tfvars, backend key và role IAM riêng",
+    "Viết hai module khác nhau cho staging và prod",
+  ]}
+  answerIndex={2}
+  explanation="Như căn hộ mẫu dùng cho nhiều toà: bản thiết kế chung (module), mỗi toà tự chọn thông số (tfvars) và có sổ quản lý, chìa khoá riêng (state + IAM)."
+/>
