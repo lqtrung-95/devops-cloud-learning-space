@@ -8,6 +8,7 @@ import { m06AwsCoreIamModule } from "./modules/m06-aws-core-iam/module-meta";
 import { m07AwsNetworkingComputeModule } from "./modules/m07-aws-networking-compute/module-meta";
 import { m08AwsStorageDatabaseServerlessModule } from "./modules/m08-aws-storage-database-serverless/module-meta";
 import { m10TerraformModule } from "./modules/m10-terraform/module-meta";
+import { m12KubernetesCoreModule } from "./modules/m12-kubernetes-core/module-meta";
 
 /** All modules in learning order. Add new modules here after they pass `pnpm validate:module`. */
 export const curriculumModules: ModuleDefinition[] = [
@@ -20,4 +21,5 @@ export const curriculumModules: ModuleDefinition[] = [
   m07AwsNetworkingComputeModule,
   m08AwsStorageDatabaseServerlessModule,
   m10TerraformModule,
+  m12KubernetesCoreModule,
 ];

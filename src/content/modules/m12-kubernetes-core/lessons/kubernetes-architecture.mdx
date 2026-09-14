@@ -1,0 +1,136 @@
+import { ClusterArchitectureExplorerDiagram } from "../diagrams/cluster-architecture-explorer-diagram";
+
+<Eli5 title="Kubernetes giống như ban quản lý một cảng container" emoji="⚓">
+
+Ở M04 bạn đã học đóng gói app thành **container** — những thùng hàng chuẩn. Chạy 3 thùng trên 1 máy thì dễ. Nhưng khi có **300 thùng trên 20 máy**, ai quyết định thùng nào đặt ở đâu? Thùng bị hỏng lúc 3 giờ sáng thì ai thay? Khách muốn tìm "quầy api" thì hỏi ai?
+
+**Kubernetes** là **ban quản lý cảng**. Bạn không chỉ tay "đặt thùng này lên cầu tàu số 4". Bạn nộp một **tờ kế hoạch**: "tôi muốn luôn có 3 thùng loại `web`". Ban quản lý ghi vào **sổ cái**, cử người **xếp chỗ**, và có **đội đi tuần** liên tục so kế hoạch với thực tế — thiếu thùng thì bổ sung.
+
+Mỗi **cầu tàu (node)** có một **đốc công (kubelet)** nhận việc từ ban quản lý và bảo công nhân (container runtime) mở thùng.
+
+Chỗ phép so sánh "gãy": thùng hàng thật bị hỏng thì sửa; còn pod hỏng thì Kubernetes **vứt đi và tạo cái mới** — pod là đồ dùng một lần.
+
+</Eli5>
+
+## Vì sao DevOps cần Kubernetes?
+
+Docker Compose chạy tốt trên **một** máy. Production cần: nhiều máy, tự thay thế khi hỏng, rolling update không downtime, tự scale, service discovery, quản lý cấu hình/secret thống nhất. Kubernetes gom tất cả vào **một API khai báo** — và đó là nền tảng của EKS (M13), GitOps (M14) và kỳ thi **CKA**.
+
+<ClusterArchitectureExplorerDiagram />
+
+<Technical>
+
+### Control plane — bộ não
+
+| Thành phần | Việc chính | Ghi nhớ |
+|---|---|---|
+| `kube-apiserver` | REST API: authn → authz (RBAC) → admission → ghi etcd | Cửa ngõ **duy nhất** vào etcd |
+| `etcd` | Key-value store phân tán (Raft) lưu mọi object | Backup định kỳ! Cần số node lẻ (3, 5) |
+| `kube-scheduler` | Gán pod chưa có `nodeName` cho node phù hợp | Lọc (filter) rồi chấm điểm (score) |
+| `kube-controller-manager` | Chạy các controller: Deployment, ReplicaSet, Node, Job… | Mỗi controller = một vòng lặp reconcile |
+| `cloud-controller-manager` | Nói chuyện với cloud: tạo load balancer, gắn node | Có trên EKS/GKE, không có trên kind |
+
+### Worker node — tay chân
+
+- **kubelet**: watch pod được gán cho node mình, gọi runtime qua **CRI**, chạy probes, báo status.
+- **container runtime**: `containerd` hoặc `CRI-O`. Docker Engine không còn được kubelet dùng trực tiếp từ v1.24 (dockershim bị gỡ) — nhưng image build bằng Docker vẫn chạy bình thường vì cùng chuẩn OCI.
+- **kube-proxy**: biến IP ảo của Service thành luật iptables/nftables/IPVS. Một số CNI (Cilium) thay thế luôn kube-proxy.
+- **CNI plugin**: cấp IP cho pod, nối mạng giữa các node (kindnet, Calico, Cilium, Amazon VPC CNI).
+
+### Chuyện gì xảy ra khi `kubectl apply -f deploy.yaml`?
+
+1. `kubectl` gửi object tới API server → xác thực, kiểm tra quyền, chạy admission → lưu vào etcd.
+2. **Deployment controller** thấy Deployment mới → tạo **ReplicaSet**.
+3. **ReplicaSet controller** thấy thiếu pod → tạo 3 object Pod (chưa có node).
+4. **Scheduler** thấy pod chưa có node → chọn node → ghi `spec.nodeName`.
+5. **kubelet** trên node đó thấy pod của mình → gọi containerd pull image và chạy container.
+6. kubelet báo status `Running` → API server → etcd. Bạn thấy nó trong `kubectl get pods`.
+
+Để ý: **không ai ra lệnh trực tiếp cho ai**. Mọi thành phần chỉ *watch* API server và tự làm phần việc của mình. Đó là lý do Kubernetes chịu lỗi tốt.
+
+### Khai báo (declarative) — mọi object đều có 4 phần
+
+```yaml title="hello-pod.yaml"
+apiVersion: v1          # nhóm API + phiên bản
+kind: Pod               # loại object
+metadata:
+  name: hello
+  labels:
+    app: hello
+spec:                   # trạng thái MONG MUỐN (bạn viết)
+  containers:
+    - name: hello
+      image: nginx:1.27
+      ports:
+        - containerPort: 80
+# status:               # trạng thái THỰC TẾ (Kubernetes điền)
+```
+
+### Công cụ học tập
+
+| Công cụ | Dùng khi |
+|---|---|
+| `kind` | Cluster nhiều node chạy trong Docker — nhanh, hợp CI và lab |
+| `minikube` | Cluster local có nhiều addon sẵn |
+| `kubectl` | CLI chính thức, dùng trong kỳ thi CKA |
+| `k9s` | Giao diện terminal để duyệt cluster nhanh |
+| `kubectx` / `kubens` | Đổi cluster / namespace mặc định |
+
+</Technical>
+
+## Thực hành
+
+```yaml title="kind-config.yaml"
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+```
+
+<Terminal
+  commands={[
+    { comment: "Tạo cluster 3 node (cần Docker đang chạy)", command: "kind create cluster --name lab --config kind-config.yaml" },
+    { comment: "Xem các node", command: "kubectl get nodes -o wide", output: "NAME                STATUS   ROLES           AGE   VERSION   INTERNAL-IP\nlab-control-plane   Ready    control-plane   62s   v1.34.0   172.18.0.4\nlab-worker          Ready    <none>          41s   v1.34.0   172.18.0.2\nlab-worker2         Ready    <none>          41s   v1.34.0   172.18.0.3" },
+    { comment: "Control plane cũng chạy dưới dạng pod trong namespace kube-system", command: "kubectl get pods -n kube-system", output: "NAME                                        READY   STATUS    RESTARTS   AGE\ncoredns-7c65d6cfc9-8xk2p                    1/1     Running   0          60s\netcd-lab-control-plane                      1/1     Running   0          70s\nkindnet-4hq9z                               1/1     Running   0          45s\nkube-apiserver-lab-control-plane            1/1     Running   0          70s\nkube-controller-manager-lab-control-plane   1/1     Running   0          70s\nkube-proxy-2vbnm                            1/1     Running   0          45s\nkube-scheduler-lab-control-plane            1/1     Running   0          70s" },
+    { comment: "Tạo pod từ file và xem nó được xếp vào node nào", command: "kubectl apply -f hello-pod.yaml && kubectl get pod hello -o wide", output: "pod/hello created\nNAME    READY   STATUS    RESTARTS   AGE   IP           NODE\nhello   1/1     Running   0          8s    10.244.1.2   lab-worker" },
+    { comment: "Xem chuỗi sự kiện: Scheduled → Pulling → Created → Started", command: "kubectl get events --field-selector involvedObject.name=hello" },
+    { comment: "Tra cứu field bất kỳ ngay trong terminal — cứu cánh trong kỳ thi", command: "kubectl explain pod.spec.containers.ports" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Chạy "pod trần" (không có Deployment) cho app thật.** Pod chỉ là một thùng hàng — node chết hoặc bạn xoá nó thì mất luôn, không ai tạo lại. Luôn để một controller (Deployment, StatefulSet, Job…) quản lý pod.
+
+</Callout>
+
+<Callout type="info" title="Phiên bản thay đổi nhanh">
+
+Kubernetes ra một minor version khoảng mỗi 4 tháng và mỗi bản được hỗ trợ ~14 tháng. Output trong bài dùng số phiên bản minh hoạ — kiểm tra tài liệu mới nhất trên kubernetes.io trước khi làm lab.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "control plane", meaning: "Bộ não cluster: API server, etcd, scheduler, controller manager." },
+    { term: "node", meaning: "Máy (VM/vật lý) chạy pod; có kubelet, runtime, kube-proxy." },
+    { term: "etcd", meaning: "Sổ cái key-value lưu toàn bộ trạng thái cluster." },
+    { term: "kubelet", meaning: "Agent trên mỗi node, đảm bảo container của pod đang chạy." },
+    { term: "desired vs actual state", meaning: "`spec` bạn khai báo vs `status` thực tế; controller kéo cái sau về cái trước." },
+    { term: "CRI / CNI", meaning: "Chuẩn giao tiếp với container runtime / với plugin mạng." },
+  ]}
+/>
+
+<QuickCheck
+  question="kube-scheduler bị crash trong 10 phút. Điều gì xảy ra với app đang chạy và pod mới tạo?"
+  options={[
+    "Toàn bộ pod đang chạy bị dừng ngay",
+    "Pod đang chạy vẫn phục vụ bình thường; pod mới nằm ở Pending vì chưa được xếp node",
+    "Pod mới được kubelet tự chọn node",
+    "etcd mất dữ liệu",
+  ]}
+  answerIndex={1}
+  explanation="Nhân viên xếp bến nghỉ thì thùng đã đặt vẫn nằm yên, chỉ thùng mới chưa có chỗ. kubelet không tự chọn node — nó chỉ chạy pod đã được gán cho mình."
+/>

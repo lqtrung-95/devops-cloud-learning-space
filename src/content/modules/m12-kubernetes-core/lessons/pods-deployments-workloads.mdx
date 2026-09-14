@@ -1,0 +1,148 @@
+import { DeploymentReconcileRollingUpdateDiagram } from "../diagrams/deployment-reconcile-rolling-update-diagram";
+
+<Eli5 title="Deployment giống như quản lý ca của một chuỗi quán cà phê" emoji="☕">
+
+Chủ chuỗi không dặn "anh Nam đứng quầy số 2". Chủ chỉ dặn quản lý ca: **"lúc nào cũng phải có 3 barista pha đồ uống"**. Một bạn ốm nghỉ đột xuất? Quản lý gọi ngay người thay. Đó là **ReplicaSet**: giữ đúng số người.
+
+Khi quán đổi **công thức mới (v2)**, quản lý không đuổi cả 3 người rồi mới tuyển lại (quán sẽ đóng cửa). Quản lý **gọi thêm 1 người đã học công thức mới**, người đó sẵn sàng thì cho 1 người cũ nghỉ — cứ thế cuốn chiếu. Đó là **Deployment rolling update**.
+
+Mỗi **barista** là một **Pod**: có thể nghỉ bất cứ lúc nào, và người thay thế có tên khác (pod mới có tên và IP mới).
+
+</Eli5>
+
+## Vì sao DevOps cần hiểu kỹ phần này?
+
+Mọi lần deploy trên Kubernetes — bằng `kubectl`, Helm hay Argo CD — cuối cùng đều là **sửa `spec` của một workload** và để controller làm phần còn lại. Hiểu vòng lặp reconcile giúp bạn đoán được deploy sẽ diễn ra thế nào, và rollback trong vài giây khi có chuyện.
+
+<DeploymentReconcileRollingUpdateDiagram />
+
+<Technical>
+
+### Pod — đơn vị nhỏ nhất
+
+- Một Pod gồm **1 hoặc nhiều container** dùng chung network namespace (cùng IP, gọi nhau qua `localhost`) và có thể chung volume.
+- Mẫu nhiều container phổ biến: **init container** (chạy xong trước app, ví dụ đợi DB) và **sidecar** (chạy song song, ví dụ proxy, log shipper). Sidecar "native" khai báo trong `initContainers` với `restartPolicy: Always`.
+- Pod là **ephemeral**: IP thay đổi mỗi lần tạo lại → không bao giờ gọi pod bằng IP, hãy dùng Service (bài sau).
+
+### Deployment → ReplicaSet → Pod
+
+```yaml title="web-deployment.yaml"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5          # giữ 5 ReplicaSet cũ để rollback
+  selector:
+    matchLabels:
+      app: web                      # PHẢI khớp template.metadata.labels
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                   # được tạo dư tối đa 1 pod
+      maxUnavailable: 0             # không bao giờ thiếu pod sẵn sàng
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/acme/web:1.4.0
+          ports:
+            - containerPort: 8080
+```
+
+- **Deployment** quản lý **phiên bản**: mỗi lần `template` đổi → tạo ReplicaSet mới (tên có hash, ví dụ `web-7d4b9c6f8`).
+- **ReplicaSet** chỉ lo **số lượng**. Hầu như không bao giờ tạo ReplicaSet bằng tay.
+- `selector` bất biến sau khi tạo. Sửa sai selector = xoá Deployment tạo lại.
+- Đổi `replicas` **không** tạo revision mới; chỉ đổi `template` (image, env, resources…) mới tạo.
+
+### Chiến lược cập nhật
+
+| Chiến lược | Cách chạy | Dùng khi |
+|---|---|---|
+| `RollingUpdate` (mặc định) | Cuốn chiếu theo `maxSurge`/`maxUnavailable` (mặc định 25%/25%) | App stateless, v1 và v2 chạy song song được |
+| `Recreate` | Xoá hết pod cũ rồi mới tạo pod mới | App không cho phép 2 phiên bản cùng lúc (có downtime) |
+
+Canary/blue-green chuẩn chỉnh cần thêm công cụ như Argo Rollouts — sẽ gặp ở M14.
+
+### Các loại workload khác
+
+| Workload | "Nhân sự" kiểu gì | Ví dụ |
+|---|---|---|
+| `Deployment` | Nhân viên thay thế được cho nhau | Web, API stateless |
+| `StatefulSet` | Nhân viên có tên cố định + tủ đồ riêng | Postgres, Kafka, Redis cluster |
+| `DaemonSet` | Mỗi toà nhà (node) đúng 1 bảo vệ | Log agent, node-exporter, CNI |
+| `Job` | Việc làm một lần tới khi xong | Migration DB, xử lý batch |
+| `CronJob` | Việc định kỳ theo lịch cron | Backup mỗi đêm, gửi báo cáo |
+
+```yaml title="db-backup-cronjob.yaml"
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-backup
+spec:
+  schedule: "30 2 * * *"            # 2:30 sáng mỗi ngày
+  concurrencyPolicy: Forbid         # lần trước chưa xong thì không chạy chồng
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: postgres:17
+              command: ["sh", "-c", "pg_dump -h postgres -U app shop > /backup/shop.sql"]
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Sinh YAML nhanh bằng lệnh imperative — kỹ năng tiết kiệm thời gian cho CKA", command: "kubectl create deployment web --image=nginx:1.26 --replicas=3 --dry-run=client -o yaml > web.yaml" },
+    { command: "kubectl apply -f web.yaml && kubectl get deploy,rs,pods -l app=web", output: "deployment.apps/web created\nNAME                  READY   UP-TO-DATE   AVAILABLE   AGE\ndeployment.apps/web   3/3     3            3           12s\n\nNAME                             DESIRED   CURRENT   READY   AGE\nreplicaset.apps/web-5d7f8b7c4d   3         3         3       12s\n\nNAME                       READY   STATUS    RESTARTS   AGE\npod/web-5d7f8b7c4d-2xkqp   1/1     Running   0          12s\npod/web-5d7f8b7c4d-9fj4t   1/1     Running   0          12s\npod/web-5d7f8b7c4d-tq8wz   1/1     Running   0          12s" },
+    { comment: "Thử tự lành: xoá 1 pod rồi theo dõi", command: "kubectl delete pod web-5d7f8b7c4d-2xkqp && kubectl get pods -l app=web -w" },
+    { comment: "Rolling update lên image mới", command: "kubectl set image deployment/web nginx=nginx:1.27 && kubectl rollout status deployment/web", output: "deployment.apps/web image updated\nWaiting for deployment \"web\" rollout to finish: 1 out of 3 new replicas have been updated...\nWaiting for deployment \"web\" rollout to finish: 2 out of 3 new replicas have been updated...\ndeployment \"web\" successfully rolled out" },
+    { comment: "Ghi lý do thay đổi để lịch sử dễ đọc", command: "kubectl annotate deployment/web kubernetes.io/change-cause='nginx 1.27'" },
+    { command: "kubectl rollout history deployment/web", output: "deployment.apps/web\nREVISION  CHANGE-CAUSE\n1         <none>\n2         nginx 1.27" },
+    { comment: "Deploy lỗi? Quay về revision trước ngay lập tức", command: "kubectl rollout undo deployment/web --to-revision=1" },
+    { comment: "Scale thủ công", command: "kubectl scale deployment/web --replicas=5" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Dùng tag `latest` trong Deployment.** `kubectl apply` lại cùng YAML sẽ không tạo rollout nào (template không đổi), các node có thể đang chạy các bản `latest` khác nhau, và `rollout undo` không biết quay về đâu. Luôn dùng tag bất biến như `1.4.0` hoặc digest `@sha256:…`.
+
+</Callout>
+
+<Callout type="warning" title="Rolling update không cứu được app thiếu readinessProbe">
+
+Không có readinessProbe, Kubernetes coi container vừa start là "sẵn sàng" và gỡ pod cũ ngay — người dùng có thể dính lỗi trong lúc app mới còn đang khởi động. Probes ở bài 4 là mảnh ghép bắt buộc cho zero-downtime.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Pod", meaning: "1+ container chung IP/volume; đơn vị nhỏ nhất Kubernetes lập lịch." },
+    { term: "ReplicaSet", meaning: "Controller giữ đúng số pod khớp selector." },
+    { term: "Deployment", meaning: "Quản lý ReplicaSet theo phiên bản: rolling update, rollback." },
+    { term: "reconcile loop", meaning: "Vòng lặp liên tục đưa thực tế về trạng thái mong muốn." },
+    { term: "maxSurge / maxUnavailable", meaning: "Số pod được dư / được thiếu trong lúc rolling update." },
+    { term: "DaemonSet / Job / CronJob", meaning: "Mỗi node 1 pod / chạy tới khi xong / chạy theo lịch." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn cần chạy agent thu thập log trên TẤT CẢ node, kể cả node mới được thêm sau này. Chọn workload nào?"
+  options={["Deployment với replicas bằng số node", "StatefulSet", "DaemonSet", "CronJob chạy mỗi phút"]}
+  answerIndex={2}
+  explanation="DaemonSet = mỗi toà nhà đúng một bảo vệ; node mới vào là tự có pod. Deployment không đảm bảo mỗi node một pod và không tự tăng khi thêm node."
+/>

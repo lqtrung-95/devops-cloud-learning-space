@@ -1,0 +1,198 @@
+import { ProbeBehaviorSimulatorDiagram } from "../diagrams/probe-behavior-simulator-diagram";
+
+<Eli5 title="Vận hành pod giống như quản lý nhân viên ca đêm ở bệnh viện" emoji="🏥">
+
+**ConfigMap & Secret** là **tủ hồ sơ và két sắt** của khoa: quy trình làm việc (cấu hình) để trong tủ, mã tủ thuốc (mật khẩu) để trong két. Nhân viên mới chỉ cần được chỉ chỗ tủ — không phải "khắc" quy trình vào người (image).
+
+**Probes** là **y tá trưởng đi kiểm tra**: "Bạn đã thay đồ xong chưa?" (**startup**), "Bạn nhận bệnh nhân được chưa?" (**readiness**), "Bạn còn tỉnh không hay phải cho về nghỉ và gọi người thay?" (**liveness**).
+
+**Requests/limits** là **suất ăn**: request là suất được đảm bảo giữ chỗ, limit là mức tối đa được lấy. **HPA** là trưởng khoa thấy phòng chờ đông thì **gọi thêm bác sĩ trực**, vắng thì cho bớt người.
+
+</Eli5>
+
+## Vì sao DevOps cần phần này?
+
+Đây là khác biệt giữa "chạy được trên cluster" và "chạy được ở production". Thiếu probes → deploy gây lỗi 502. Thiếu requests → scheduler xếp chồng pod và node sập. Liveness sai → restart dây chuyền trong sự cố. Và CKA hỏi rất nhiều về đúng những field này.
+
+<ProbeBehaviorSimulatorDiagram />
+
+<Technical>
+
+### ConfigMap & Secret
+
+```yaml title="api-config.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+data:
+  LOG_LEVEL: info
+  FEATURE_CHECKOUT_V2: "true"
+  app.yaml: |
+    cache:
+      ttlSeconds: 60
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-auth
+type: Opaque
+stringData:                 # tiện khi viết tay; Kubernetes lưu dạng base64 trong data
+  POSTGRES_PASSWORD: change-me
+```
+
+Hai cách đưa vào pod:
+
+| Cách | Cú pháp | Cập nhật khi ConfigMap đổi? |
+|---|---|---|
+| Biến môi trường | `envFrom` / `valueFrom.configMapKeyRef` | **Không** — phải restart pod |
+| Volume mount | `volumes[].configMap` | Có, file tự cập nhật sau ~1 phút (trừ khi dùng `subPath`) |
+
+<Callout type="warning" title="Secret KHÔNG được mã hoá mặc định">
+
+base64 chỉ là mã hoá ký tự, ai `kubectl get secret -o yaml` cũng giải được. Bảo vệ Secret bằng RBAC chặt, bật encryption at rest cho etcd (EKS đã mã hoá sẵn), và **đừng commit Secret thật vào Git** — M14 sẽ dùng External Secrets Operator.
+
+</Callout>
+
+### Probes
+
+```yaml title="api-deployment.yaml (trích đoạn container)"
+containers:
+  - name: api
+    image: ghcr.io/acme/api:2.3.1
+    envFrom:
+      - configMapRef:
+          name: api-config
+    env:
+      - name: POSTGRES_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: postgres-auth
+            key: POSTGRES_PASSWORD
+    ports:
+      - containerPort: 8080
+    startupProbe:
+      httpGet: { path: /healthz, port: 8080 }
+      periodSeconds: 5
+      failureThreshold: 30        # cho tối đa 150s để khởi động
+    readinessProbe:
+      httpGet: { path: /ready, port: 8080 }   # có thể kiểm tra DB, cache…
+      periodSeconds: 5
+    livenessProbe:
+      httpGet: { path: /healthz, port: 8080 } # chỉ kiểm tra chính tiến trình
+      periodSeconds: 10
+      failureThreshold: 3
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { memory: 512Mi }
+```
+
+| Probe | Fail thì sao | Nên kiểm tra gì |
+|---|---|---|
+| `startupProbe` | Hết `failureThreshold` → restart; trong lúc chạy, 2 probe kia bị hoãn | App đã khởi động xong |
+| `readinessProbe` | Gỡ pod khỏi EndpointSlice, **không restart** | Sẵn sàng nhận traffic (có thể gồm phụ thuộc) |
+| `livenessProbe` | kubelet **restart container** | Tiến trình có bị treo không — **không** kiểm tra DB |
+
+Loại check: `httpGet`, `tcpSocket`, `exec`, `grpc`.
+
+### Requests, limits & QoS
+
+- **requests**: scheduler dùng để xếp chỗ (node phải còn đủ). CPU `250m` = 1/4 core.
+- **limits**: CPU vượt → bị **throttle** (chậm lại). Memory vượt → **OOMKilled** (exit code 137).
+- Nhiều team chỉ đặt memory limit, bỏ CPU limit để tránh throttle không cần thiết — tuỳ chính sách tổ chức.
+
+| QoS class | Điều kiện | Khi node thiếu RAM |
+|---|---|---|
+| `Guaranteed` | Mọi container có requests = limits cho cả CPU và memory | Bị đuổi sau cùng |
+| `Burstable` | Có ít nhất một request/limit nhưng không đủ điều kiện trên | Ở giữa |
+| `BestEffort` | Không đặt gì cả | Bị đuổi đầu tiên |
+
+### HPA & PodDisruptionBudget
+
+```yaml title="api-hpa-pdb.yaml"
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60   # % so với CPU *request*
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: api
+```
+
+- HPA cần **metrics-server** và cần pod có **CPU request** (utilization tính theo request).
+- Công thức: `desiredReplicas = ceil(currentReplicas × currentMetric / targetMetric)`.
+- **PDB** bảo vệ khỏi *disruption tự nguyện* (`kubectl drain`, nâng cấp node, Karpenter dồn node): không cho rút quá nhiều pod cùng lúc. PDB không chống được node chết đột ngột.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo ConfigMap và Secret imperative", command: "kubectl create configmap api-config --from-literal=LOG_LEVEL=info && kubectl create secret generic postgres-auth --from-literal=POSTGRES_PASSWORD='S3cure!'" },
+    { comment: "Secret chỉ là base64 — thấy tận mắt", command: "kubectl get secret postgres-auth -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d", output: "S3cure!" },
+    { comment: "Cài metrics-server (trên kind thêm cờ --kubelet-insecure-tls vào args của container)", command: "kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml" },
+    { command: "kubectl top pods -l app=api", output: "NAME                   CPU(cores)   MEMORY(bytes)\napi-6c9d7f5b8-4kx2m    12m          140Mi\napi-6c9d7f5b8-m9qzt    9m           138Mi" },
+    { comment: "Xem QoS class của pod", command: "kubectl get pod api-6c9d7f5b8-4kx2m -o jsonpath='{.status.qosClass}'", output: "Burstable" },
+    { comment: "Tạo HPA nhanh bằng lệnh", command: "kubectl autoscale deployment api --cpu-percent=60 --min=2 --max=10" },
+    { comment: "Tạo tải rồi theo dõi HPA ở terminal khác", command: "kubectl run load --image=busybox:1.36 --restart=Never -- /bin/sh -c 'while true; do wget -q -O- http://api; done'" },
+    { command: "kubectl get hpa api -w", output: "NAME   REFERENCE        TARGETS         MINPODS   MAXPODS   REPLICAS   AGE\napi    Deployment/api   cpu: 8%/60%     2         10        2          2m\napi    Deployment/api   cpu: 187%/60%   2         10        2          3m\napi    Deployment/api   cpu: 187%/60%   2         10        7          3m15s\napi    Deployment/api   cpu: 54%/60%    2         10        7          4m" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Kiểm tra database trong livenessProbe.** DB chập chờn 1 phút → mọi pod API fail liveness → restart hàng loạt → khi DB lên lại, cả hệ thống vẫn đang khởi động. Kiểm tra phụ thuộc ở **readiness**, còn liveness chỉ hỏi "tiến trình của tôi còn phản hồi không?". Bấm thử kịch bản "Database sập" trong mô phỏng ở trên.
+
+</Callout>
+
+<Callout type="tip" title="HPA báo TARGETS là unknown?">
+
+Gần như luôn là một trong hai lý do: metrics-server chưa chạy (`kubectl top pods` lỗi), hoặc container không đặt `resources.requests.cpu`.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "ConfigMap / Secret", meaning: "Cấu hình thường / nhạy cảm, tách khỏi image, đưa vào pod qua env hoặc volume." },
+    { term: "startup / readiness / liveness", meaning: "Đã khởi động xong? / nhận traffic được? / còn sống hay phải restart?" },
+    { term: "requests / limits", meaning: "Tài nguyên được giữ chỗ khi xếp lịch / mức tối đa được dùng." },
+    { term: "OOMKilled", meaning: "Container bị kernel giết vì vượt memory limit (exit 137)." },
+    { term: "QoS class", meaning: "Guaranteed / Burstable / BestEffort — thứ tự bị đuổi khi node thiếu RAM." },
+    { term: "HPA", meaning: "Tự điều chỉnh số replica theo CPU/memory/metric tuỳ chỉnh." },
+    { term: "PodDisruptionBudget", meaning: "Giới hạn số pod bị rút cùng lúc khi drain/nâng cấp node." },
+  ]}
+/>
+
+<QuickCheck
+  question="Container có `limits.cpu: 500m` nhưng app thỉnh thoảng cần 1 core trong vài giây. Chuyện gì xảy ra?"
+  options={[
+    "Container bị OOMKilled",
+    "Pod bị đuổi khỏi node ngay",
+    "Container bị throttle — chạy chậm lại nhưng không bị giết",
+    "HPA tăng limit lên 1 core",
+  ]}
+  answerIndex={2}
+  explanation="CPU là tài nguyên 'nén được': vượt suất thì bị bắt ăn chậm lại. Memory mới là 'không nén được' — vượt là bị đuổi (OOMKilled). HPA thêm pod, không sửa limit."
+/>

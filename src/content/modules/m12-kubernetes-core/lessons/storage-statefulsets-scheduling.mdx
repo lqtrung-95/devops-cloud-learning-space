@@ -1,0 +1,182 @@
+import { StatefulsetVolumeBindingDiagram } from "../diagrams/statefulset-volume-binding-diagram";
+
+<Eli5 title="Storage giống như tủ đồ ở hồ bơi, StatefulSet giống phòng khách sạn có số" emoji="🏨">
+
+Filesystem của container giống **cái giỏ đồ bạn cầm theo người**: rời hồ bơi (pod chết) là giỏ bị vứt. Muốn giữ đồ, bạn **làm phiếu xin tủ** (**PVC** — PersistentVolumeClaim). Nhân viên xem **bảng giá loại tủ** (**StorageClass**: tủ thường, tủ lớn, tủ chống nước) rồi cấp cho bạn **một cái tủ thật** (**PV** — PersistentVolume).
+
+Deployment giống khách vãng lai: ai tới cũng được, không cần nhớ tên. Còn database cần **StatefulSet** — như **phòng khách sạn có số cố định**: khách phòng `postgres-0` đi ra rồi quay lại vẫn vào đúng phòng `postgres-0` và mở đúng tủ của mình.
+
+**Scheduling** là lễ tân xếp phòng theo yêu cầu: "tôi muốn tầng có hồ bơi" (**nodeSelector/affinity**), còn một số tầng treo biển "chỉ dành cho nhân viên" (**taint**) — chỉ ai có thẻ phù hợp (**toleration**) mới được xếp vào.
+
+</Eli5>
+
+## Vì sao DevOps cần phần này?
+
+Mất dữ liệu là sự cố không thể "rollback". Hiểu PV/PVC giúp bạn biết dữ liệu nằm ở đâu, sống bao lâu, bị xoá khi nào. Hiểu scheduling giúp giải thích 90% trường hợp pod `Pending` và cho phép dành node GPU, node spot, node hệ thống cho đúng workload.
+
+<StatefulsetVolumeBindingDiagram />
+
+<Technical>
+
+### PV, PVC, StorageClass
+
+| Object | Ai tạo | Vai trò |
+|---|---|---|
+| `StorageClass` | Admin cluster | "Loại đĩa" + provisioner (ví dụ `ebs.csi.aws.com`, `rancher.io/local-path`) |
+| `PersistentVolumeClaim` | Team app | "Tôi cần 10Gi, ReadWriteOnce, loại gp3" |
+| `PersistentVolume` | Thường do provisioner tự tạo (dynamic provisioning) | Ổ đĩa thật đã cấp phát |
+
+- **Access modes**: `ReadWriteOnce` (1 node đọc ghi), `ReadWriteOncePod` (đúng 1 pod), `ReadOnlyMany`, `ReadWriteMany` (cần hệ thống file chia sẻ như EFS/NFS — EBS **không** hỗ trợ RWX).
+- **reclaimPolicy**: `Delete` (xoá PVC là xoá luôn đĩa — mặc định với dynamic provisioning) hoặc `Retain` (giữ đĩa lại để khôi phục thủ công).
+- **volumeBindingMode: WaitForFirstConsumer**: chờ pod được xếp node rồi mới tạo đĩa — tránh tạo EBS ở zone a trong khi pod chạy ở zone b.
+
+```yaml title="gp3-storageclass.yaml (EKS, dùng ở M13)"
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+```
+
+### StatefulSet cho Postgres
+
+```yaml title="postgres-statefulset.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  clusterIP: None              # headless: DNS postgres-0.postgres trỏ thẳng pod
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: postgres-auth, key: POSTGRES_PASSWORD }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+        # storageClassName bỏ trống = dùng StorageClass mặc định (kind: standard)
+```
+
+StatefulSet đảm bảo: **tên ổn định** (`postgres-0`, `postgres-1`…), **DNS ổn định** qua headless Service, **PVC riêng** cho từng pod, tạo/xoá **theo thứ tự**. Scale xuống **không xoá PVC** — dữ liệu còn đó chờ bạn scale lên lại.
+
+<Callout type="info" title="Postgres trên Kubernetes hay RDS?">
+
+StatefulSet không tự lo replication, backup, failover. Ở production trên AWS, nhiều team chọn **RDS** (M08) cho database quan trọng, hoặc dùng operator chuyên dụng (ví dụ CloudNativePG). Lab này dùng StatefulSet để hiểu cơ chế.
+
+</Callout>
+
+### Scheduling: chọn node cho pod
+
+| Cơ chế | Ai đặt | Ý nghĩa |
+|---|---|---|
+| `nodeSelector` | Pod | "Chỉ xếp vào node có label này" (đơn giản, bắt buộc) |
+| `nodeAffinity` | Pod | Như trên nhưng có `required…` (bắt buộc) và `preferred…` (ưu tiên), toán tử `In`, `NotIn`… |
+| `podAntiAffinity` | Pod | "Đừng xếp 2 replica của tôi cùng node/zone" |
+| `taints` | Node | "Tránh xa tôi" — `NoSchedule`, `PreferNoSchedule`, `NoExecute` |
+| `tolerations` | Pod | "Tôi chịu được taint đó" — được *phép* vào, không bị *ép* vào |
+| `topologySpreadConstraints` | Pod | Rải đều pod qua zone/node |
+
+```yaml title="gpu-job (trích đoạn pod spec)"
+spec:
+  nodeSelector:
+    workload: gpu
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: gpu
+      effect: NoSchedule
+```
+
+Toleration chỉ cho phép vào node có taint; muốn **chắc chắn** pod chạy ở node GPU thì phải kết hợp thêm `nodeSelector`/affinity.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "StorageClass mặc định trên kind", command: "kubectl get storageclass", output: "NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE\nstandard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false                  2d" },
+    { command: "kubectl apply -f postgres-statefulset.yaml && kubectl get pvc,pv", output: "NAME                                    STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE\npersistentvolumeclaim/data-postgres-0   Bound    pvc-7f3a2c1e-9b4d-4e8a-a1f2-3c5d6e7f8a9b   10Gi       RWO            standard       40s\n\nNAME                                                        CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                   STORAGECLASS   AGE\npersistentvolume/pvc-7f3a2c1e-9b4d-4e8a-a1f2-3c5d6e7f8a9b   10Gi       RWO            Delete           Bound    shop/data-postgres-0    standard       35s" },
+    { comment: "Ghi dữ liệu thử", command: "kubectl exec postgres-0 -- psql -U postgres -c \"CREATE TABLE t(id int); INSERT INTO t VALUES (42);\"" },
+    { comment: "Giết pod, chờ tạo lại, đọc lại dữ liệu", command: "kubectl delete pod postgres-0 && kubectl wait --for=condition=Ready pod/postgres-0 --timeout=90s && kubectl exec postgres-0 -- psql -U postgres -tc 'SELECT * FROM t;'", output: "pod \"postgres-0\" deleted\npod/postgres-0 condition met\n       42" },
+    { comment: "Taint một worker, xem pod mới tránh nó", command: "kubectl taint nodes lab-worker2 dedicated=gpu:NoSchedule" },
+    { comment: "Gỡ taint (dấu - ở cuối)", command: "kubectl taint nodes lab-worker2 dedicated=gpu:NoSchedule-" },
+    { comment: "Label node để dùng với nodeSelector", command: "kubectl label nodes lab-worker workload=gpu && kubectl get nodes -L workload" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Xoá namespace/PVC để "dọn dẹp" khi `reclaimPolicy: Delete`.** Đĩa thật bị xoá theo, dữ liệu mất vĩnh viễn. Với dữ liệu quan trọng: dùng StorageClass `Retain`, backup định kỳ (snapshot, `pg_dump`) và thử khôi phục thật sự.
+
+</Callout>
+
+<Callout type="cost" title="Ổ EBS mồ côi">
+
+Trên EKS, `terraform destroy` cluster không tự xoá EBS được tạo bởi PVC với policy `Retain`. Sau lab, kiểm tra EC2 → Volumes trạng thái `available` và xoá — chúng tính tiền theo GB-tháng dù không gắn vào đâu.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "PersistentVolumeClaim (PVC)", meaning: "Yêu cầu dung lượng lưu trữ của pod: size, access mode, class." },
+    { term: "PersistentVolume (PV)", meaning: "Ổ lưu trữ thật trong cluster, gắn 1–1 với PVC." },
+    { term: "StorageClass", meaning: "Loại đĩa + provisioner để cấp PV tự động." },
+    { term: "StatefulSet", meaning: "Workload có tên, DNS và PVC ổn định cho từng pod." },
+    { term: "headless Service", meaning: "`clusterIP: None`, DNS trả thẳng IP từng pod." },
+    { term: "taint / toleration", meaning: "Node xua đuổi pod / pod được phép chịu taint đó." },
+    { term: "node affinity", meaning: "Luật bắt buộc hoặc ưu tiên chọn node theo label." },
+  ]}
+/>
+
+<QuickCheck
+  question="PVC `data-postgres-0` ở `Pending` mãi. `kubectl describe pvc` báo: `storageclass.storage.k8s.io 'fast-ssd' not found`. Cách sửa đúng?"
+  options={[
+    "Tạo StorageClass `fast-ssd` hoặc sửa volumeClaimTemplates dùng StorageClass có sẵn (cần tạo lại StatefulSet vì template bất biến)",
+    "Restart pod postgres-0",
+    "Đổi accessModes sang ReadWriteMany",
+    "Xoá taint trên các node",
+  ]}
+  answerIndex={0}
+  explanation="Phiếu xin tủ ghi loại tủ không tồn tại nên nhân viên không cấp được. `volumeClaimTemplates` của StatefulSet không sửa tại chỗ được — phải xoá (có thể `--cascade=orphan`) và tạo lại."
+/>
