@@ -7,6 +7,7 @@ import { m05CicdGithubActionsModule } from "./modules/m05-cicd-github-actions/mo
 import { m06AwsCoreIamModule } from "./modules/m06-aws-core-iam/module-meta";
 import { m07AwsNetworkingComputeModule } from "./modules/m07-aws-networking-compute/module-meta";
 import { m08AwsStorageDatabaseServerlessModule } from "./modules/m08-aws-storage-database-serverless/module-meta";
+import { m09AwsWellArchitectedCostModule } from "./modules/m09-aws-well-architected-cost/module-meta";
 import { m10TerraformModule } from "./modules/m10-terraform/module-meta";
 import { m12KubernetesCoreModule } from "./modules/m12-kubernetes-core/module-meta";
 import { m15ObservabilityModule } from "./modules/m15-observability/module-meta";
@@ -21,6 +22,7 @@ export const curriculumModules: ModuleDefinition[] = [
   m06AwsCoreIamModule,
   m07AwsNetworkingComputeModule,
   m08AwsStorageDatabaseServerlessModule,
+  m09AwsWellArchitectedCostModule,
   m10TerraformModule,
   m12KubernetesCoreModule,
   m15ObservabilityModule,

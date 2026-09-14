@@ -1,0 +1,86 @@
+import { WellArchitectedSixPillarsDiagram } from "../diagrams/well-architected-six-pillars-diagram";
+
+<Eli5 title="Well-Architected Framework giống danh sách kiểm tra trước khi mở nhà hàng" emoji="📋">
+
+Trước khi mở nhà hàng, một chuỗi nhà hàng chuyên nghiệp không chỉ hỏi "món có ngon không". Họ có **danh sách kiểm tra** theo nhiều khía cạnh: quy trình bếp có chuẩn không (vận hành), cửa có khoá tốt không (bảo mật), bếp dự phòng có sẵn không (độ tin cậy), phục vụ có nhanh không (hiệu năng), có lãng phí nguyên liệu không (chi phí), có dùng năng lượng hợp lý không (bền vững).
+
+AWS Well-Architected Framework là **danh sách kiểm tra tương tự cho kiến trúc cloud** — 6 trụ cột, mỗi trụ cột là một bộ câu hỏi để tự đánh giá trước khi tin rằng hệ thống "đã sẵn sàng production".
+
+</Eli5>
+
+Đây là cách AWS (và đề thi SAA) tổ chức tư duy kiến trúc: mọi quyết định — chọn RDS hay tự cài Postgres, Multi-AZ hay không, Spot hay On-Demand — đều là đánh đổi giữa các trụ cột này. Không có kiến trúc nào tối ưu tuyệt đối cả 6; bạn ưu tiên theo bài toán thật.
+
+<WellArchitectedSixPillarsDiagram />
+
+<Technical>
+
+### 6 trụ cột
+
+1. **Operational Excellence** — vận hành bằng code (IaC), giám sát, cải tiến liên tục qua runbook và postmortem.
+2. **Security** — bảo vệ nhiều lớp (defense in depth), least privilege, mã hoá, giám sát (CloudTrail, GuardDuty, Config).
+3. **Reliability** — hệ thống tự phục hồi (self-healing), chịu được lỗi hạ tầng, có kế hoạch DR đã được test.
+4. **Performance Efficiency** — chọn đúng loại resource cho đúng tải, dùng managed service, đo lường và điều chỉnh liên tục.
+5. **Cost Optimization** — không trả tiền cho thứ không dùng, đúng loại pricing model, đo được ai/dự án nào tốn tiền.
+6. **Sustainability** — giảm lãng phí năng lượng: tắt resource nhàn rỗi, chọn region/instance hiệu quả hơn.
+
+### Well-Architected Tool
+
+Công cụ miễn phí trên Console: bạn định nghĩa "workload" (một hệ thống/app), trả lời bộ câu hỏi theo từng trụ cột, công cụ liệt kê **High Risk Issue (HRI)** và **Medium Risk Issue (MRI)** kèm gợi ý khắc phục — không tính thêm chi phí AWS ngoài phí resource bạn đang chạy.
+
+### Đánh đổi thường gặp
+
+| Chọn A | Đánh đổi với |
+|---|---|
+| Multi-AZ RDS (Reliability ↑) | Cost ↑ (gần gấp đôi chi phí instance) |
+| Instance nhỏ hơn (Cost ↓) | Performance ↓ nếu đo tải sai |
+| Nhiều lớp kiểm tra bảo mật (Security ↑) | Operational complexity ↑, có thể chậm deploy |
+| Spot instance (Cost ↓ mạnh) | Reliability ↓ nếu dùng cho phần không chịu được gián đoạn |
+
+Không trụ cột nào "thắng tuyệt đối" — review kiến trúc nghĩa là nêu rõ đánh đổi và có lý do cho lựa chọn, không phải chọn cực đoan một phía.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem danh sách workload đã tạo trong Well-Architected Tool", command: "aws wellarchitected list-workloads --query \"WorkloadSummaries[].[WorkloadId,WorkloadName,RiskCounts]\" --output table" },
+    { comment: "Tạo workload mới cho app checkpoint", command: "aws wellarchitected create-workload --workload-name \"checkpoint-2-shop-app\" --description \"HA shop app tren AWS\" --environment PRODUCTION --review-owner \"trung\" --lenses \"wellarchitected\" --aws-regions ap-southeast-1", output: "{\n    \"WorkloadId\": \"abcd1234ef5678gh9012ijkl34mn5678\",\n    \"WorkloadArn\": \"arn:aws:wellarchitected:...\"\n}" },
+    { comment: "Xem tổng số câu hỏi High Risk còn lại", command: "aws wellarchitected get-workload --workload-id abcd1234ef5678gh9012ijkl34mn5678 --query \"Workload.RiskCounts\"", output: "{\n    \"UNANSWERED\": 12,\n    \"HIGH\": 3,\n    \"MEDIUM\": 5,\n    \"NONE\": 20,\n    \"NOT_APPLICABLE\": 2\n}" },
+  ]}
+/>
+
+<Callout type="tip" title="Dùng trong phỏng vấn/thi cử">
+
+Khi đề bài SAA mô tả một kiến trúc và hỏi "vấn đề lớn nhất là gì", hãy map nhanh vào 6 trụ cột: thiếu Multi-AZ → Reliability; SG mở 0.0.0.0/0:22 → Security; instance luôn 90% CPU → Performance; EBS gp2 cũ chưa nâng gp3 → Cost.
+
+</Callout>
+
+<Callout type="mistake">
+
+**Coi Well-Architected review là việc làm một lần rồi thôi.** Kiến trúc thay đổi liên tục (thêm feature, đổi tải) — review nên lặp lại định kỳ (vd mỗi quý hoặc trước milestone lớn), không phải chỉ trước khi go-live.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Well-Architected Framework", meaning: "Bộ nguyên tắc AWS chia thành 6 trụ cột để đánh giá kiến trúc." },
+    { term: "Pillar", meaning: "Một trong 6 khía cạnh: Operational Excellence, Security, Reliability, Performance Efficiency, Cost Optimization, Sustainability." },
+    { term: "Well-Architected Tool", meaning: "Công cụ miễn phí trên Console để tự review workload theo bộ câu hỏi." },
+    { term: "High Risk Issue (HRI)", meaning: "Rủi ro nghiêm trọng được Well-Architected Tool xác định cho một câu hỏi." },
+    { term: "Defense in depth", meaning: "Nhiều lớp bảo vệ độc lập, mất một lớp vẫn còn lớp khác (thuộc Security)." },
+    { term: "Trade-off", meaning: "Đánh đổi — cải thiện một trụ cột thường ảnh hưởng tới trụ cột khác." },
+  ]}
+/>
+
+<QuickCheck
+  question="Đề bài: app chạy 1 EC2 duy nhất, RDS Single-AZ, SG mở SSH cho 0.0.0.0/0, không có alarm nào. CTO hỏi rủi ro LỚN NHẤT thuộc trụ cột nào để ưu tiên sửa trước?"
+  options={[
+    "Sustainability, vì 1 instance tiết kiệm điện",
+    "Cost Optimization, vì instance đang rẻ",
+    "Reliability và Security đều đang ở mức rủi ro cao — không có single point of failure protection và SG mở toàn cầu",
+    "Performance Efficiency, vì cần đổi sang instance mạnh hơn",
+  ]}
+  answerIndex={2}
+  explanation="Không có Multi-AZ/ASG = single point of failure (Reliability); SG mở SSH toàn cầu = lỗ hổng bảo mật nghiêm trọng (Security). Đây là 2 rủi ro cao nhất cần ưu tiên trước Cost hay Performance."
+/>

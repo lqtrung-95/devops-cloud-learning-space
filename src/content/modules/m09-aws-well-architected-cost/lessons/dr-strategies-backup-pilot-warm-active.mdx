@@ -1,0 +1,95 @@
+import { DrStrategyCostRtoDiagram } from "../diagrams/dr-strategy-cost-rto-diagram";
+
+<Eli5 title="4 chiến lược DR giống 4 mức chuẩn bị chi nhánh dự phòng" emoji="🏪">
+
+**Backup & Restore**: bạn chỉ giữ **công thức món ăn và danh sách nhà cung cấp** ở nơi khác. Cháy quán thì dựng quán mới từ đầu — chậm, nhưng rẻ vì bình thường không tốn gì.
+
+**Pilot Light**: bạn giữ sẵn **bếp trưởng và công thức** ở chi nhánh dự phòng, nhưng bếp chưa hoạt động (không có nhân viên phục vụ). Cần thì bật bếp lên nhanh hơn dựng từ đầu.
+
+**Warm Standby**: chi nhánh dự phòng đã **mở cửa, có nhân viên, phục vụ được** — chỉ là quy mô nhỏ hơn quán chính. Cần thì tuyển thêm người, mở rộng ngay.
+
+**Multi-site Active-Active**: cả hai chi nhánh đều **đang phục vụ khách thật** mỗi ngày. Một chi nhánh cháy, chi nhánh kia vốn đã quen tải, gần như khách không nhận ra gì thay đổi — nhưng nuôi 2 chi nhánh đầy đủ thì tốn gấp đôi.
+
+</Eli5>
+
+Đây là 4 mức đầu tư DR theo tài liệu AWS, xếp theo thứ tự RTO/RPO giảm dần và chi phí tăng dần. Không có "chiến lược đúng" tuyệt đối — chọn theo RTO/RPO mà business chấp nhận (bài trước) và ngân sách thực tế.
+
+<DrStrategyCostRtoDiagram />
+
+<Technical>
+
+### 4 chiến lược DR (từ rẻ → đắt)
+
+1. **Backup & Restore**: backup định kỳ (RDS automated backup, AMI, S3 cross-region replication, AWS Backup) sang region DR. Khi sự cố: dựng hạ tầng bằng IaC (Terraform/CloudFormation) + restore từ backup. RTO: giờ. RPO: theo tần suất backup.
+2. **Pilot Light**: thành phần lõi (thường là database) chạy sẵn dạng thu nhỏ ở region DR với replication liên tục (RDS cross-region read replica, hoặc DB tự quản lý với replication). App server **không chạy**, chỉ có AMI/launch template sẵn sàng. Khi sự cố: promote DB, scale up, bật app server. RTO: chục phút. RPO: vài phút.
+3. **Warm Standby**: toàn bộ stack chạy ở cả 2 region, nhưng DR chạy **capacity thấp** (vd ASG min=1 thay vì min=4). Khi sự cố: scale-out nhanh + đổi routing (Route 53). RTO: vài phút. RPO: gần 0.
+4. **Multi-site Active-Active**: cả 2+ region cùng phục vụ traffic thật, thường qua Route 53 latency-based hoặc weighted routing. Data layer cần replication 2 chiều (phức tạp — cần xử lý conflict). RTO/RPO: gần 0. Chi phí và độ phức tạp vận hành cao nhất.
+
+### Thành phần AWS thường dùng
+
+| Nhu cầu | Dịch vụ |
+|---|---|
+| Backup tập trung nhiều dịch vụ (EBS, RDS, EFS, DynamoDB…) | AWS Backup — đặt lịch, retention, copy cross-region |
+| Replicate object sang region khác | S3 Cross-Region Replication (CRR) |
+| Replicate database sang region khác | RDS/Aurora cross-region read replica, Aurora Global Database |
+| Routing giữa các region | Route 53 (failover routing, latency routing) |
+| Hạ tầng dựng lại nhanh, nhất quán | IaC (Terraform) — không dựng tay khi hoảng loạn |
+
+### Viết DR plan thực tế
+
+Một DR plan hữu ích cần trả lời:
+
+- RTO/RPO mục tiêu là bao nhiêu, ai (business) đã duyệt?
+- Chiến lược nào trong 4 loại trên, và vì sao (chi phí vs yêu cầu)?
+- Runbook cụ thể: ai làm gì, lệnh nào chạy, theo thứ tự nào?
+- Đã **test thật** lần gần nhất là khi nào, kết quả RTO/RPO đo được?
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Bật S3 Cross-Region Replication cho backup bucket (cần versioning ở cả 2 bucket)", command: "aws s3api put-bucket-replication --bucket shop-backups-ap-southeast-1 --replication-configuration file://replication.json" },
+    { comment: "Tạo backup plan chạy hằng ngày, retention 30 ngày, copy sang region khác", command: "aws backup create-backup-plan --backup-plan file://backup-plan.json --query BackupPlanId --output text", output: "6f0a1234-5b6c-7d8e-9f01-234567890abc" },
+    { comment: "Thử restore RDS từ snapshot và đo thời gian (bấm giờ trước khi chạy)", command: "date -u +%T && aws rds restore-db-instance-from-db-snapshot --db-instance-identifier app-db-dr-test --db-snapshot-identifier app-db-before-v42 --db-subnet-group-name app-db-subnets --no-publicly-accessible", output: "09:00:00\n{\n    \"DBInstance\": { \"DBInstanceStatus\": \"creating\" }\n}" },
+    { comment: "Sau khi available, ghi lại thời gian đã mất — đó là RTO thực đo được", command: "aws rds describe-db-instances --db-instance-identifier app-db-dr-test --query DBInstances[0].DBInstanceStatus --output text", output: "available" },
+    { comment: "Dọn dẹp instance test để tránh tính phí", command: "aws rds delete-db-instance --db-instance-identifier app-db-dr-test --skip-final-snapshot" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Viết DR plan trên giấy nhưng chưa restore thử lần nào.** Snapshot có thể lỗi, script IaC có thể outdated, quyền IAM có thể thiếu — chỉ phát hiện khi đã quá muộn (giữa sự cố thật). Test restore ít nhất mỗi quý hoặc sau mỗi thay đổi hạ tầng lớn.
+
+</Callout>
+
+<Callout type="cost">
+
+Pilot light/warm standby/active-active đều nghĩa là **trả tiền cho region thứ hai** dù không sự cố. Với hệ thống học tập/demo, backup & restore (rẻ nhất) thường đủ — đừng over-engineer DR cho app chưa có traffic thật.
+
+</Callout>
+
+<Callout type="info" title="Liên hệ Checkpoint 2">
+
+Checkpoint 2 của bạn dùng Multi-AZ (chống lỗi AZ, không phải DR cross-region) + automated backup (chuẩn bị cho backup & restore nếu cần). Đó là mức đầu tư hợp lý cho một app học tập — không cần active-active multi-region.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Backup & Restore", meaning: "Chiến lược DR rẻ nhất: chỉ giữ backup, dựng lại toàn bộ khi cần." },
+    { term: "Pilot Light", meaning: "Giữ sẵn lõi (thường là DB) chạy thu nhỏ ở region DR, phần còn lại bật khi cần." },
+    { term: "Warm Standby", meaning: "Chạy sẵn toàn bộ stack ở region DR với capacity thấp, scale lên khi cần." },
+    { term: "Active-Active", meaning: "Nhiều region cùng phục vụ traffic thật, gần như không gián đoạn khi 1 region hỏng." },
+    { term: "AWS Backup", meaning: "Dịch vụ backup tập trung cho nhiều loại resource, hỗ trợ copy cross-region." },
+    { term: "Cross-Region Replication (CRR)", meaning: "Tự động sao chép object S3 sang bucket ở region khác." },
+  ]}
+/>
+
+<QuickCheck
+  question="Startup có ngân sách hạn chế, app không quá quan trọng (downtime vài giờ chấp nhận được), nhưng vẫn muốn có kế hoạch phục hồi khi region chính gặp sự cố lớn. Chiến lược hợp lý nhất?"
+  options={["Multi-site active-active", "Không cần DR vì đã có Multi-AZ", "Warm standby", "Backup & Restore với AWS Backup + IaC để dựng lại nhanh"]}
+  answerIndex={3}
+  explanation="Multi-AZ chống lỗi AZ trong 1 region, không phải DR cross-region cho sự cố region. Với ngân sách hạn chế và RTO chấp nhận vài giờ, Backup & Restore là đủ và rẻ nhất — không cần trả tiền chạy sẵn ở region thứ hai."
+/>

@@ -1,0 +1,101 @@
+import { CostOptimizationLeversDiagram } from "../diagrams/cost-optimization-levers-diagram";
+
+<Eli5 title="Tối ưu chi phí AWS giống quản lý chi tiêu nhà hàng" emoji="🧾">
+
+Một nhà hàng giỏi quản lý chi phí không chỉ "cắt giảm bừa" — họ làm 4 việc: **đo đúng size** (không mua tủ lạnh to gấp 10 lần cần dùng — right-sizing), **đặt trước nguyên liệu dùng chắc chắn** để được giá sỉ (Savings Plans/Reserved), **thuê nhân viên thời vụ cho việc có thể gián đoạn** thay vì thuê full-time đắt hơn (Spot), và **ghi sổ theo từng món/từng ca** để biết chính xác tiền đi đâu (tagging + Cost Explorer).
+
+Không phải cắt giảm nào cũng an toàn: thuê thời vụ (Spot) cho đầu bếp chính nấu món quan trọng nhất thì rủi ro — nhân viên thời vụ có thể nghỉ bất cứ lúc nào.
+
+</Eli5>
+
+Chi phí AWS "chảy máu" âm thầm là chuyện rất phổ biến: EBS volume mồ côi, RDS dev chạy 24/7 không ai dùng cuối tuần, EC2 to hơn nhu cầu thật gấp nhiều lần. Đây cũng là trụ cột Cost Optimization của Well-Architected, và là kỹ năng CTO/team lead luôn cần ở một DevOps engineer.
+
+<CostOptimizationLeversDiagram />
+
+<Technical>
+
+### Right-sizing
+
+Dùng CloudWatch (CPUUtilization, MemoryUtilization qua CloudWatch Agent, NetworkIn/Out) đo tải **thật** trong ít nhất 1–2 tuần (bao gồm giờ cao điểm) trước khi đổi instance type. **Compute Optimizer** tự phân tích và gợi ý instance type phù hợp hơn dựa trên lịch sử dùng thực tế.
+
+### Pricing models cho EC2/RDS
+
+| Model | Cam kết | Hợp cho |
+|---|---|---|
+| On-Demand | Không cam kết, trả theo giờ/giây | Tải không đoán trước, thử nghiệm ngắn hạn |
+| Savings Plans (Compute/EC2 Instance) | Cam kết chi tiêu $/giờ trong 1–3 năm | Tải nền tảng ổn định, đã biết trước sẽ dùng lâu dài |
+| Reserved Instances | Cam kết instance type cụ thể 1–3 năm | Workload rất ổn định, biết chắc instance type |
+| Spot | Không cam kết, giá theo thị trường, có thể bị thu hồi (cảnh báo ngắn) | Batch job, CI runner, xử lý dữ liệu chịu được gián đoạn |
+
+Nguyên tắc chọn: **tải nền tảng ổn định → Savings Plans**; **tải chịu gián đoạn được, muốn rẻ nhất → Spot**; **tải không chắc chắn → On-Demand**. Kiểm tra tài liệu AWS mới nhất vì các loại Savings Plans/RI thay đổi theo thời gian.
+
+### Tagging strategy
+
+Tag nhất quán (vd `project`, `env`, `owner`, `cost-center`) gắn từ lúc **tạo resource** (qua IaC hoặc AWS Config rule bắt buộc tag), không phải gắn hồi tố. Cost Explorer và **Cost Allocation Tags** (phải kích hoạt tag làm cost allocation tag trong Billing Console) cho phép lọc chi phí theo tag — trả lời được câu "dự án nào, môi trường nào đang tốn tiền nhất".
+
+```bash title="Ví dụ tag bắt buộc trên mọi resource (áp qua IaC)"
+Tags:
+  project: shop-app
+  env: staging
+  owner: trung
+  cost-center: engineering
+```
+
+### Công cụ theo dõi chi phí
+
+- **AWS Budgets**: đặt ngưỡng chi tiêu, gửi cảnh báo email/SNS khi vượt %.
+- **Cost Explorer**: xem xu hướng chi phí theo service/tag/account, dự báo tháng tới.
+- **Cost Anomaly Detection**: tự phát hiện chi tiêu bất thường (vd một service bỗng tăng vọt) mà không cần đặt ngưỡng cố định.
+- **Trusted Advisor** (cost checks): gợi ý idle load balancer, EBS không gắn, RDS idle...
+
+### Những khoản "chảy máu" âm thầm phổ biến
+
+- EBS volume `available` (không gắn vào instance nào) sau khi terminate.
+- Elastic IP không gắn vào resource đang chạy (bị tính phí khi không dùng).
+- NAT Gateway chạy 24/7 cho môi trường dev chỉ dùng giờ hành chính.
+- Snapshot cũ không còn ai cần nhưng không có lifecycle xoá.
+- Log CloudWatch không đặt retention (lưu vĩnh viễn).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem gợi ý right-sizing từ Compute Optimizer", command: "aws compute-optimizer get-ec2-instance-recommendations --instance-arns arn:aws:ec2:ap-southeast-1:123456789012:instance/i-0123456789abcdef0 --query \"instanceRecommendations[0].recommendationOptions[0].instanceType\" --output text", output: "t4g.large" },
+    { comment: "Tìm EBS volume mồ côi (available = không gắn vào máy nào)", command: "aws ec2 describe-volumes --filters Name=status,Values=available --query \"Volumes[].[VolumeId,Size,CreateTime]\" --output table" },
+    { comment: "Gắn tag project/env/owner cho mọi resource trong 1 lệnh (ví dụ EC2 + volume)", command: "aws ec2 create-tags --resources i-0123456789abcdef0 vol-0a1b2c3d4e5f67890 --tags Key=project,Value=shop-app Key=env,Value=staging Key=owner,Value=trung" },
+    { comment: "Tạo budget alert 25 USD/tháng, gửi email khi đạt 80%", command: "aws budgets create-budget --account-id 123456789012 --budget file://budget.json --notifications-with-subscribers file://notifications.json" },
+    { comment: "Xem chi phí tháng này theo tag project (cần bật cost allocation tag trước)", command: "aws ce get-cost-and-usage --time-period Start=2026-09-01,End=2026-09-14 --granularity MONTHLY --metrics UnblendedCost --group-by Type=TAG,Key=project", output: "{\n  \"ResultsByTime\": [\n    { \"Groups\": [ { \"Keys\": [\"project$shop-app\"], \"Metrics\": { \"UnblendedCost\": { \"Amount\": \"18.42\" } } } ] }\n  ]\n}" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Dùng Spot cho database chính hoặc thành phần không chịu được gián đoạn.** AWS có thể thu hồi Spot với cảnh báo chỉ khoảng 2 phút. Chỉ dùng Spot cho phần stateless/chịu được retry: CI runner, batch job, worker xử lý hàng đợi (SQS) có thể xử lý lại.
+
+</Callout>
+
+<Callout type="cost">
+
+Cam kết Savings Plans/Reserved **sai dự báo tải** (vd mua cho 3 năm rồi 6 tháng sau đổi kiến trúc sang serverless) tự biến thành khoản lãng phí không thể huỷ giữa chừng. Chỉ cam kết cho phần tải bạn **chắc chắn** còn dùng lâu dài.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Right-sizing", meaning: "Chọn lại instance/DB class khớp với tải thực đo được, tránh dư thừa." },
+    { term: "Savings Plans", meaning: "Cam kết mức chi tiêu $/giờ trong 1–3 năm để được giá rẻ hơn On-Demand." },
+    { term: "Spot Instance", meaning: "Instance giá rẻ dùng capacity dư của AWS, có thể bị thu hồi bất cứ lúc nào." },
+    { term: "Cost allocation tag", meaning: "Tag được kích hoạt để Cost Explorer/CUR dùng lọc và nhóm chi phí." },
+    { term: "AWS Budgets", meaning: "Dịch vụ đặt ngưỡng chi tiêu và cảnh báo khi vượt." },
+    { term: "Cost Anomaly Detection", meaning: "Tự phát hiện chi tiêu bất thường không theo ngưỡng cố định." },
+  ]}
+/>
+
+<QuickCheck
+  question="CI/CD pipeline chạy build/test song song, mỗi job vài phút, chịu được việc bị dừng giữa chừng và chạy lại. Muốn giảm chi phí compute nhiều nhất, chọn gì?"
+  options={["Reserved Instances 3 năm", "Spot Instances cho CI runner", "Savings Plans cam kết 1 năm", "Instance to hơn để chạy nhanh hơn"]}
+  answerIndex={1}
+  explanation="CI job ngắn, chịu được gián đoạn và retry — đúng đối tượng lý tưởng cho Spot (rẻ nhất, chấp nhận rủi ro bị thu hồi). Cam kết dài hạn (Savings Plans/RI) không hợp vì tải job có thể thay đổi."
+/>

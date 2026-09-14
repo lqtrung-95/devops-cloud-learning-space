@@ -1,0 +1,102 @@
+import { HaFtDrIncidentTimelineDiagram } from "../diagrams/ha-ft-dr-incident-timeline-diagram";
+
+<Eli5 title="HA, fault tolerance và DR giống ba mức độ chuẩn bị cho hoả hoạn" emoji="🚒">
+
+**High Availability (HA)**: nhà hàng cam kết "luôn mở cửa phục vụ", đo bằng **% thời gian hoạt động** (vd 99.9%).
+
+**Fault Tolerance**: nhà hàng có **bếp dự phòng chạy song song ngay lúc này** — bếp chính hỏng, bếp dự phòng tiếp quản **ngay lập tức**, khách không kịp nhận ra. Đây là một cách để đạt HA.
+
+**Disaster Recovery (DR)**: khi cả toà nhà cháy rụi (thảm hoạ lớn hơn), có **kế hoạch dựng lại ở địa điểm khác** — chấp nhận gián đoạn một khoảng thời gian và có thể mất một ít dữ liệu, miễn là biết chính xác sẽ mất bao lâu và mất bao nhiêu.
+
+Hai con số đo "chấp nhận mất bao nhiêu" là **RTO** (mất bao lâu để phục vụ lại) và **RPO** (mất dữ liệu tối đa bao lâu trước sự cố).
+
+</Eli5>
+
+Ba khái niệm này hay bị dùng lẫn lộn. Phân biệt rõ giúp bạn thiết kế đúng mức đầu tư: không phải hệ thống nào cũng cần active-active toàn cầu, nhưng hệ thống nào cũng cần biết RTO/RPO thật của mình là bao nhiêu.
+
+<HaFtDrIncidentTimelineDiagram />
+
+<Technical>
+
+### Định nghĩa chính xác
+
+- **Availability** = thời gian hệ thống hoạt động / tổng thời gian, thường viết dạng "99.9%" (SLA). 99.9% ≈ tối đa ~8.7 giờ downtime/năm; 99.99% ≈ ~52 phút/năm.
+- **Fault tolerance**: hệ thống **tiếp tục hoạt động đúng** ngay cả khi một thành phần lỗi — không chỉ "phục hồi nhanh" mà là "không ai nhận ra có lỗi". Đắt hơn HA thông thường vì cần dư thừa (redundancy) chạy sẵn.
+- **Disaster Recovery**: kế hoạch phục hồi sau sự cố lớn (mất cả region, lỗi con người xoá nhầm, ransomware) — chấp nhận gián đoạn có kiểm soát.
+
+### RTO và RPO
+
+- **RTO (Recovery Time Objective)**: thời gian tối đa chấp nhận được từ lúc sự cố tới lúc hệ thống **phục vụ lại**. RTO nhỏ → cần hạ tầng dự phòng sẵn sàng cao hơn → tốn tiền hơn.
+- **RPO (Recovery Point Objective)**: khoảng dữ liệu tối đa chấp nhận **mất** (tính từ lúc backup/replicate gần nhất tới lúc sự cố). RPO nhỏ → cần replication gần thời gian thực → tốn tiền hơn.
+
+```text
+Sự cố xảy ra lúc T
+        │
+────────┼──────────────────────────► thời gian
+   RPO ←┤                    ├→ RTO
+(dữ liệu mất       (thời gian phục hồi
+ tối đa: từ lần      dịch vụ, từ lúc
+ backup gần nhất      sự cố tới lúc
+ tới lúc T)            chạy lại)
+```
+
+Ví dụ: RTO = 15 phút, RPO = 5 phút nghĩa là "sau sự cố, app phải chạy lại trong 15 phút, và dữ liệu mất tối đa là 5 phút gần nhất trước sự cố".
+
+### RTO/RPO quyết định kiến trúc nào
+
+| Yêu cầu business | RTO/RPO tương ứng | Kiến trúc gợi ý |
+|---|---|---|
+| App nội bộ, ít quan trọng | Giờ / ngày | Backup & restore |
+| E-commerce vừa | Phút | Multi-AZ + automated backup, có thể thêm pilot light |
+| Ngân hàng, giao dịch tài chính | Giây / gần 0 | Multi-AZ + multi-region active-active |
+
+### Đo RTO/RPO thật, không chỉ viết trên giấy
+
+Nhiều team viết "RTO: 1 giờ" trong tài liệu nhưng **chưa từng thử restore thật**. Cách kiểm chứng: chạy game day — cố tình gây sự cố (terminate instance, force failover RDS, restore snapshot) và bấm giờ thật.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Đo RTO thật: bấm giờ từ lúc force failover tới lúc app phản hồi lại bình thường", command: "date -u +%T && aws rds reboot-db-instance --db-instance-identifier app-db --force-failover", output: "08:00:03\n{\n    \"DBInstance\": { \"DBInstanceStatus\": \"rebooting\" }\n}" },
+    { comment: "Theo dõi tới khi status trở lại available", command: "watch -n 5 \"aws rds describe-db-instances --db-instance-identifier app-db --query DBInstances[0].DBInstanceStatus --output text\"" },
+    { comment: "Đo RPO: xem snapshot/backup gần nhất trước một mốc thời gian bất kỳ", command: "aws rds describe-db-instance-automated-backups --db-instance-identifier app-db --query \"DBInstanceAutomatedBackups[0].[RestoreWindow.EarliestTime,RestoreWindow.LatestTime]\" --output text", output: "2026-09-07T00:00:00+00:00\t2026-09-14T08:05:00+00:00" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Nhầm HA với fault tolerance.** ASG với `min=1` (chỉ 1 instance) rồi tự khởi động lại khi crash là HA yếu (có gián đoạn vài phút), không phải fault tolerant. Fault tolerant cần ≥ 2 instance ở ≥ 2 AZ chạy song song, ALB chuyển traffic tức thì khi 1 cái chết.
+
+</Callout>
+
+<Callout type="warning">
+
+RTO/RPO phải được **business** đặt ra (dựa trên chi phí downtime thực tế), không phải kỹ thuật tự quyết rồi áp đặt. Kỹ thuật đề xuất kiến trúc + chi phí tương ứng, business chọn mức chấp nhận được.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Availability", meaning: "Tỷ lệ thời gian hệ thống hoạt động được, thường biểu diễn theo SLA (99.9%…)." },
+    { term: "Fault tolerance", meaning: "Hệ thống tiếp tục hoạt động đúng ngay cả khi một thành phần lỗi, không có gián đoạn nhận thấy được." },
+    { term: "Disaster Recovery (DR)", meaning: "Kế hoạch phục hồi hệ thống sau sự cố lớn ở địa điểm/hạ tầng khác." },
+    { term: "RTO", meaning: "Thời gian tối đa chấp nhận để phục hồi dịch vụ sau sự cố." },
+    { term: "RPO", meaning: "Lượng dữ liệu tối đa (tính theo thời gian) chấp nhận mất khi phục hồi." },
+    { term: "Game day", meaning: "Buổi diễn tập cố tình gây sự cố để đo RTO/RPO và luyện quy trình ứng cứu thật." },
+  ]}
+/>
+
+<QuickCheck
+  question="Sếp nói: 'Hệ thống của mình downtime tối đa 10 phút và mất dữ liệu tối đa 1 phút là chấp nhận được.' Đây là đang đặt ra gì?"
+  options={[
+    "Availability SLA duy nhất, không liên quan RPO",
+    "RTO = 10 phút, RPO = 1 phút",
+    "RTO = 1 phút, RPO = 10 phút",
+    "Chỉ là yêu cầu về fault tolerance, không phải DR",
+  ]}
+  answerIndex={1}
+  explanation="'Downtime tối đa' = RTO (thời gian phục hồi); 'mất dữ liệu tối đa' = RPO. RTO 10 phút, RPO 1 phút — hai con số độc lập, đo hai thứ khác nhau."
+/>

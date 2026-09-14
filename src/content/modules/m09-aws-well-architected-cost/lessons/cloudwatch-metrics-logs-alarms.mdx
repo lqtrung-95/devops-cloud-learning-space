@@ -1,0 +1,102 @@
+import { CloudwatchMetricsAlarmFlowDiagram } from "../diagrams/cloudwatch-metrics-alarm-flow-diagram";
+
+<Eli5 title="CloudWatch giống hệ thống cảm biến và chuông báo của toà nhà" emoji="🌡️">
+
+**Metric** giống **cảm biến nhiệt độ** đặt khắp toà nhà, tự động ghi số liệu mỗi vài phút — không cần ai đi đo tay.
+
+**Log** giống **camera an ninh** ghi lại chi tiết từng sự kiện — khi có chuyện, bạn tua lại xem chính xác điều gì đã xảy ra.
+
+**Alarm** giống **chuông báo cháy**: không phải cứ nhiệt độ tăng nhẹ là kêu, mà có **ngưỡng và thời gian** rõ ràng ("trên 60°C liên tục 5 phút thì mới báo"). Chuông reo xong còn có thể **tự động** gọi cứu hoả (Auto Scaling) và báo cho bảo vệ (SNS → email/Slack) — không cần ai ngồi canh 24/7.
+
+</Eli5>
+
+Không có giám sát, mọi sự cố đều do **user báo trước** khi kỹ sư biết — quá muộn. CloudWatch là nền tảng giám sát mặc định của AWS, và biết đọc metric/log/alarm là kỹ năng sống còn của DevOps/SRE.
+
+<CloudwatchMetricsAlarmFlowDiagram />
+
+<Technical>
+
+### Metrics
+
+- Nhiều dịch vụ AWS tự gửi metric miễn phí (EC2 CPUUtilization mỗi 5 phút mặc định, chi tiết hơn — 1 phút — cần bật **detailed monitoring**).
+- Metric nằm trong **namespace** (`AWS/EC2`, `AWS/RDS`, `AWS/Lambda`...) và có **dimension** (vd `InstanceId`) để lọc theo resource cụ thể.
+- Muốn đo RAM/disk thực tế trên EC2 → cài **CloudWatch Agent** (AWS không tự đo được bên trong OS qua hypervisor).
+- **Custom metric**: app tự gửi số liệu riêng (vd số đơn hàng/phút) qua `PutMetricData`.
+
+### Logs
+
+- **CloudWatch Logs** nhận log từ Lambda (tự động), EC2/ECS (qua CloudWatch Agent/awslogs driver), VPC Flow Logs, v.v. Log group mặc định **lưu vĩnh viễn** — luôn đặt `retention-in-days`.
+- **Logs Insights**: query log bằng cú pháp riêng, hữu ích để lọc lỗi hoặc đếm request theo pattern mà không cần tải cả log về.
+
+```text title="Logs Insights query — top 10 lỗi 5xx"
+fields @timestamp, @message
+| filter @message like /5\d\d/
+| sort @timestamp desc
+| limit 10
+```
+
+### Alarms
+
+- Một alarm theo dõi **1 metric**, so với **ngưỡng**, qua **N chu kỳ đánh giá liên tiếp** (giảm báo động giả do nhiễu tạm thời).
+- 3 trạng thái: `OK`, `ALARM`, `INSUFFICIENT_DATA` (chưa đủ dữ liệu để đánh giá).
+- Hành động khi ALARM: gửi **SNS** (email/Slack qua Lambda/webhook), kích hoạt **Auto Scaling policy**, hoặc gọi **EC2 action** (reboot/stop instance không phản hồi).
+- **Composite alarm**: gộp nhiều alarm con bằng AND/OR để tránh "bão thông báo" (alert fatigue) khi nhiều thứ cùng đỏ vì 1 nguyên nhân gốc.
+
+### Dashboard
+
+Gom nhiều metric quan trọng (CPU, latency ALB, connections RDS, lỗi Lambda) vào **1 màn hình** để nhìn nhanh sức khoẻ hệ thống — nền tảng cho Operational Excellence.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem metric CPU trung bình của 1 instance trong 1 giờ qua", command: "aws cloudwatch get-metric-statistics --namespace AWS/EC2 --metric-name CPUUtilization --dimensions Name=InstanceId,Value=i-0123456789abcdef0 --start-time 2026-09-14T07:00:00Z --end-time 2026-09-14T08:00:00Z --period 300 --statistics Average --query \"Datapoints[].[Timestamp,Average]\" --output table" },
+    { comment: "Tạo alarm CPU > 80% trong 3 chu kỳ 5 phút liên tiếp", command: "aws cloudwatch put-metric-alarm --alarm-name high-cpu-app --namespace AWS/EC2 --metric-name CPUUtilization --dimensions Name=InstanceId,Value=i-0123456789abcdef0 --statistic Average --period 300 --evaluation-periods 3 --threshold 80 --comparison-operator GreaterThanThreshold --alarm-actions arn:aws:sns:ap-southeast-1:123456789012:ops-alerts" },
+    { comment: "Xem trạng thái hiện tại của alarm", command: "aws cloudwatch describe-alarms --alarm-names high-cpu-app --query \"MetricAlarms[0].[StateValue,StateReason]\" --output text", output: "OK\tThreshold Crossed: no datapoints were greater than the threshold" },
+    { comment: "Đặt retention cho log group Lambda (mặc định vĩnh viễn)", command: "aws logs put-retention-policy --log-group-name /aws/lambda/resize-image --retention-in-days 30" },
+    { comment: "Query log bằng Logs Insights", command: "aws logs start-query --log-group-name /aws/lambda/resize-image --start-time 1757836800 --end-time 1757840400 --query-string 'fields @timestamp, @message | filter @message like /ERROR/ | limit 10'", output: "{\n    \"queryId\": \"a1b2c3d4-5678-90ab-cdef-EXAMPLE22222\"\n}" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Tạo alarm với evaluation period = 1 chu kỳ ngắn.** Một lần CPU tăng đột biến vài giây (vd do cron job khác) sẽ làm alarm reo giả, khiến team dần "quen" bỏ qua cảnh báo (alert fatigue) — nguy hiểm hơn cả việc không có alarm.
+
+</Callout>
+
+<Callout type="warning">
+
+Alarm chỉ hữu ích khi có **người/hệ thống hành động** khi nó kêu. Alarm gửi vào một kênh Slack không ai đọc, hoặc gọi Auto Scaling policy sai cấu hình, cũng vô dụng như không có alarm.
+
+</Callout>
+
+<Callout type="cost">
+
+Custom metric, detailed monitoring (1 phút thay vì 5 phút) và log lưu lâu đều **tính phí thêm**. Chỉ bật chi tiết cho metric/log thực sự cần điều tra sự cố, và luôn đặt retention hợp lý cho log group.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Metric", meaning: "Số liệu theo thời gian (CPU, latency, connections…) mà CloudWatch thu thập." },
+    { term: "Namespace / dimension", meaning: "Cách CloudWatch nhóm và lọc metric theo dịch vụ và resource cụ thể." },
+    { term: "CloudWatch Agent", meaning: "Phần mềm cài trên EC2 để gửi metric OS-level (RAM, disk) và log tuỳ chỉnh." },
+    { term: "Alarm", meaning: "Theo dõi 1 metric so với ngưỡng qua nhiều chu kỳ, có 3 trạng thái OK/ALARM/INSUFFICIENT_DATA." },
+    { term: "Logs Insights", meaning: "Công cụ query log CloudWatch bằng cú pháp riêng, không cần tải log về." },
+    { term: "Alert fatigue", meaning: "Hiện tượng bị 'chai' cảnh báo do quá nhiều alarm giả, dẫn tới bỏ qua cả cảnh báo thật." },
+  ]}
+/>
+
+<QuickCheck
+  question="Alarm CPUUtilization của một EC2 hiện trạng thái INSUFFICIENT_DATA suốt 30 phút. Khả năng cao nhất là gì?"
+  options={[
+    "CPU đang rất cao, gần 100%",
+    "Instance đã bị dừng/terminate hoặc alarm chưa nhận đủ datapoint để đánh giá",
+    "Alarm đang ở trạng thái báo động, cần xử lý ngay",
+    "CPU đang ở mức 0% ổn định",
+  ]}
+  answerIndex={1}
+  explanation="INSUFFICIENT_DATA nghĩa là CloudWatch chưa có đủ số liệu để so với ngưỡng — thường do instance đã dừng/terminate, hoặc metric mới bật chưa đủ chu kỳ, chứ không phải đang OK hay đang ALARM."
+/>
