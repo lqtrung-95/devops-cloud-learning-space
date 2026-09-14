@@ -1,0 +1,172 @@
+import { WorkflowAnatomyExplorerDiagram } from "../diagrams/workflow-anatomy-explorer-diagram";
+
+<Eli5 title="GitHub Actions giống bếp nhà hàng nhận order" emoji="🧑‍🍳">
+
+**Chuông order** reo (có người push code, mở PR) — đó là **event**. Quản lý lấy ra **tờ quy trình** tương ứng dán trên tường — **workflow**.
+
+Tờ quy trình chia việc cho nhiều **tổ bếp**: tổ sơ chế, tổ nướng, tổ đóng hộp — mỗi tổ là một **job**. Các tổ làm **song song**, trừ khi quy trình ghi "tổ đóng hộp phải đợi tổ nướng xong" (`needs`). Mỗi tổ làm theo **danh sách việc từng bước** — các **step**.
+
+Mỗi tổ được phát **một gian bếp sạch trơn** (**runner**) — không có sẵn nguyên liệu của tổ khác, dùng xong dọn sạch. Muốn chuyển đồ giữa các tổ phải gửi qua **quầy trung chuyển** (artifact).
+
+</Eli5>
+
+### Vì sao DevOps quan tâm?
+
+GitHub Actions là công cụ CI/CD được dùng rất rộng rãi, và mô hình **event → workflow → job → step → runner** xuất hiện ở hầu hết công cụ khác. Đọc hiểu một file workflow người khác viết (và phát hiện chỗ nó thiếu an toàn) là kỹ năng dùng hằng ngày.
+
+<WorkflowAnatomyExplorerDiagram />
+
+<Technical>
+
+### Một workflow CI hoàn chỉnh
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Quyền mặc định tối thiểu cho GITHUB_TOKEN
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test -- --coverage
+
+  build:
+    needs: [lint, test]              # chỉ chạy khi cả hai job trên xanh
+    if: github.event_name == 'push'  # PR thì không cần build image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image
+        run: docker build -t shop-api:${{ github.sha }} .
+```
+
+Số version của action (`@v5`) là **tag do tác giả action quản lý** và tăng theo thời gian — kiểm tra trang Marketplace/Releases để dùng bản mới nhất.
+
+### Các khối xây dựng
+
+| Khái niệm | Ý nghĩa | Ghi nhớ |
+|---|---|---|
+| **event** (`on:`) | Thứ kích hoạt workflow | `push`, `pull_request`, `workflow_dispatch`, `schedule` (cron, giờ UTC), `release`, `workflow_call` |
+| **workflow** | File YAML trong `.github/workflows/` | Một repo nhiều workflow |
+| **job** | Nhóm step chạy trên một runner | Song song mặc định; `needs` để xếp thứ tự |
+| **step** | `uses:` (gọi action) hoặc `run:` (lệnh shell) | Tuần tự, chung filesystem trong job |
+| **runner** | Máy chạy job | GitHub-hosted (VM sạch) hoặc self-hosted |
+| **action** | Đơn vị tái sử dụng | Từ Marketplace, repo khác, hoặc trong repo |
+
+### Context và expression
+
+Cú pháp `${{ ... }}` được GitHub **thay giá trị trước khi** step chạy:
+
+```yaml
+- run: echo "Commit ${{ github.sha }} trên nhánh ${{ github.ref_name }} bởi ${{ github.actor }}"
+- if: failure()                      # chỉ chạy khi step trước lỗi
+  run: ./scripts/notify-slack.sh
+- if: startsWith(github.ref, 'refs/tags/v')
+  run: echo "Đây là bản release"
+```
+
+Context hay dùng: `github` (thông tin event, repo, commit), `env`, `secrets`, `vars`, `matrix`, `needs` (output của job trước), `runner`.
+
+### Truyền dữ liệu giữa step và job
+
+```yaml
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - id: meta
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+  deploy:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Deploy ${{ needs.version.outputs.tag }}"
+```
+
+### `GITHUB_TOKEN` và `permissions`
+
+Mỗi lần chạy, GitHub cấp một token tạm `GITHUB_TOKEN` hết hạn khi job kết thúc. Luôn khai báo `permissions:` tối thiểu ở đầu file và nới rộng theo từng job cần (vd. `packages: write` để push GHCR, `id-token: write` cho OIDC).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Liệt kê workflow trong repo", command: "gh workflow list", output: "NAME  STATE   ID\nCI    active  81234567\nCD    active  81234568" },
+    { comment: "Chạy tay workflow có workflow_dispatch", command: "gh workflow run CI --ref main", output: "✓ Created workflow_dispatch event for ci.yml at main" },
+    { comment: "Theo dõi lần chạy mới nhất", command: "gh run watch", output: "✓ main CI · 9876543210\nTriggered via workflow_dispatch about 1 minute ago\n\nJOBS\n✓ lint in 21s\n✓ test in 1m29s\n- build (skipped)" },
+    { comment: "Job lỗi? Chỉ xem log của step lỗi", command: "gh run view 9876543211 --log-failed", output: "test  Run npm test  FAIL src/discount.test.ts\ntest  Run npm test    ✕ applies 10% over 1M VND (4 ms)\ntest  Run npm test  ##[error]Process completed with exit code 1." },
+    { comment: "Chạy lại riêng các job lỗi", command: "gh run rerun 9876543211 --failed" },
+    { comment: "Lint cú pháp workflow trước khi push (công cụ actionlint)", command: "actionlint .github/workflows/ci.yml", output: ".github/workflows/ci.yml:31:9: input \"node-versoin\" is not defined in action \"actions/setup-node@v5\" [action]" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Tưởng các job dùng chung file với nhau.** Job `build` không thấy `node_modules` hay `dist/` mà job `test` tạo ra — mỗi job là một runner mới. Mỗi job phải tự checkout, hoặc truyền file bằng `actions/upload-artifact` / `actions/download-artifact`.
+
+</Callout>
+
+<Callout type="warning" title="Action của bên thứ ba là code chạy với quyền của bạn">
+
+Tag như `@v4` có thể bị tác giả (hoặc kẻ chiếm tài khoản) trỏ sang code khác. Sự cố `tj-actions/changed-files` (3/2025) là ví dụ: tag bị sửa để in secret ra log. Với action ngoài GitHub/tổ chức tin cậy, **pin theo commit SHA đầy đủ** (`uses: owner/action@<40-ký-tự-sha> # v1.2.3`) và để Dependabot cập nhật.
+
+</Callout>
+
+<Callout type="cost">
+
+GitHub-hosted runner miễn phí cho repo public; repo private có hạn mức phút miễn phí rồi tính tiền theo phút, runner Windows/macOS và runner lớn đắt hơn Linux. Job treo vô hạn sẽ đốt phút tới mức timeout mặc định rất dài — đặt `timeout-minutes` cho mỗi job. Kiểm tra bảng giá mới nhất.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "workflow", meaning: "File YAML trong .github/workflows mô tả quy trình tự động." },
+    { term: "event / trigger", meaning: "Sự kiện kích hoạt workflow: push, pull_request, schedule…" },
+    { term: "job", meaning: "Nhóm step chạy trên cùng một runner; song song trừ khi có needs." },
+    { term: "step", meaning: "Một bước trong job: gọi action (uses) hoặc chạy lệnh (run)." },
+    { term: "runner", meaning: "Máy thực thi job: GitHub-hosted hoặc self-hosted." },
+    { term: "action", meaning: "Khối tái sử dụng được gọi bằng uses, nhận tham số qua with." },
+    { term: "GITHUB_TOKEN", meaning: "Token tạm tự cấp cho mỗi lần chạy, quyền giới hạn bởi permissions." },
+  ]}
+/>
+
+<QuickCheck
+  question="Workflow có 3 job: lint, test, deploy. Bạn muốn lint và test chạy song song, deploy chỉ chạy khi cả hai thành công. Khai báo nào đúng?"
+  options={[
+    "Đặt deploy ở cuối file, GitHub tự chạy theo thứ tự",
+    "Trong job deploy thêm needs: [lint, test]",
+    "Gộp cả ba vào một job với nhiều step",
+    "Thêm needs: deploy vào lint và test",
+  ]}
+  answerIndex={1}
+  explanation="Tổ đóng hộp ghi rõ 'đợi tổ sơ chế và tổ nướng xong'. Không có needs, các job luôn chạy song song bất kể thứ tự trong file."
+/>

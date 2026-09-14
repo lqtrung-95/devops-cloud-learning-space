@@ -1,0 +1,200 @@
+import { PipelineStagesFailureDiagram } from "../diagrams/pipeline-stages-failure-diagram";
+
+<Eli5 title="Pipeline giống các trạm kiểm tra ở nhà máy sữa" emoji="🥛">
+
+Mỗi hộp sữa đi qua băng chuyền với **nhiều trạm kiểm tra** xếp theo thứ tự: trạm cân (nhanh, rẻ), trạm soi dị vật, trạm xét nghiệm vi sinh (chậm, đắt), rồi mới **đóng thùng** và **nhập kho**.
+
+Trạm **rẻ và nhanh đặt trước** để loại hàng lỗi sớm, đỡ tốn công cho trạm đắt phía sau. Và nguyên tắc sắt: **hộp nào trượt một trạm là bị gạt khỏi băng chuyền ngay** — không bao giờ lọt vào kho.
+
+Pipeline phần mềm cũng vậy: **lint → unit test → quét code → build image → quét image → push**. Trạm nào đỏ, mọi trạm sau dừng, và image lỗi không bao giờ tới registry.
+
+</Eli5>
+
+### Vì sao DevOps quan tâm?
+
+Đây chính là thứ bạn sẽ xây ở công việc thật và trong Checkpoint 1. Một pipeline tốt **chặn lỗi trước khi merge**, chạy **đủ nhanh** để dev không lách (mục tiêu của module: merge tới có image mới dưới 10 phút), và tạo ra **artifact có thể truy vết** về đúng commit.
+
+<PipelineStagesFailureDiagram />
+
+<Technical>
+
+### Workflow 1 — CI cho Pull Request
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# PR có commit mới → huỷ lần chạy cũ, đỡ tốn phút runner
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test -- --coverage
+      - uses: actions/upload-artifact@v4
+        if: always()                   # vẫn upload report kể cả khi test fail
+        with:
+          name: coverage-report
+          path: coverage/
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: npm audit --audit-level=high
+```
+
+SAST sâu hơn (CodeQL, Semgrep) thường chạy thành workflow riêng. CodeQL có thể bật nhanh qua *Settings → Code security* ("default setup") — tính năng và giá cho repo private thay đổi theo gói GitHub, kiểm tra tài liệu mới nhất.
+
+### Chặn merge khi CI đỏ
+
+Workflow chỉ **báo** đỏ; muốn **chặn** phải cấu hình nhánh `main` (Settings → Rules → **Rulesets**, hoặc Branch protection kiểu cũ):
+
+- **Require a pull request before merging** (có thể yêu cầu ít nhất 1 approval)
+- **Require status checks to pass** → chọn check `lint-test`, `dependency-audit`
+- **Block force pushes**
+
+### Workflow 2 — CD khi merge `main` hoặc tạo release
+
+```yaml title=".github/workflows/cd.yml"
+name: CD
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+  packages: write        # push lên GHCR bằng GITHUB_TOKEN
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build (chưa push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true                       # nạp image vào Docker của runner để quét
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan — chặn nếu có CRITICAL
+        uses: aquasecurity/trivy-action@<commit-sha>   # lấy SHA của release mới nhất
+        with:
+          image-ref: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+```
+
+Vài điểm cần hiểu:
+
+- `docker/metadata-action` sinh tag tự động: push `main` → `sha-<commit>`; push tag `v1.4.0` → thêm `1.4.0` và `1.4`. Mặc định `type=sha` dùng SHA **ngắn**; `format=long` cho SHA đầy đủ để khớp với `github.sha` ở bước quét.
+- Bước Push build lại gần như tức thì nhờ cache, và **chỉ chạy nếu Trivy pass** (step lỗi thì các step sau bị bỏ qua).
+- Tên repo GHCR phải viết thường; `metadata-action` tự chuyển, còn nếu tự ghép chuỗi thì cẩn thận với owner có chữ hoa.
+- Các action `actions/*`, `docker/*` dùng major tag cho dễ đọc; số version tăng theo thời gian — kiểm tra bản mới nhất.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chạy đúng các bước CI trên máy trước khi push", command: "npm ci && npm run lint && npm test -- --coverage", output: "Test Suites: 12 passed, 12 total\nTests:       87 passed, 87 total\nAll files |   84.2 |    76.9 |   81.0 |   84.6 |" },
+    { comment: "Bật required status checks cho main bằng API (hoặc làm trên giao diện Rulesets)", command: "gh api -X PUT repos/acme/shop-api/branches/main/protection --input protection.json" },
+    { comment: "Tạo release → workflow CD gắn tag semver", command: "git tag v1.4.0 && git push origin v1.4.0" },
+    { command: "gh run list --workflow CD --limit 1", output: "STATUS  TITLE   WORKFLOW  BRANCH  EVENT  ELAPSED\n✓       v1.4.0  CD        v1.4.0  push   5m48s" },
+    { comment: "Kiểm tra image đã lên GHCR với đủ tag", command: "docker buildx imagetools inspect ghcr.io/acme/shop-api:1.4.0 --format '{{json .Manifest.Digest}}'", output: "\"sha256:4be1c0…9a2f\"" },
+    { comment: "Tải coverage report của một lần chạy", command: "gh run download 9876543212 -n coverage-report -D ./coverage-ci" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Push image trước rồi mới quét.** Lúc Trivy báo đỏ thì image lỗi đã nằm trên registry, và một hệ thống deploy tự động có thể đã kéo về. Quét **trước** khi push (build `load: true` → scan → push).
+
+</Callout>
+
+<Callout type="mistake">
+
+**Có workflow CI nhưng không bật required status checks.** Pipeline đỏ mà nút Merge vẫn xanh — sớm muộn sẽ có người merge "tí sửa sau".
+
+</Callout>
+
+<Callout type="tip">
+
+Pipeline chậm? Theo thứ tự: bật cache dependency (`cache: npm`), cache layer Docker (`type=gha`), `concurrency` huỷ lần chạy cũ, tách job chạy song song, chỉ build image khi merge chứ không phải mỗi PR. Bài cuối module đi sâu phần này.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "lint", meaning: "Kiểm tra style và lỗi hiển nhiên trong code mà không chạy code." },
+    { term: "SAST", meaning: "Static Application Security Testing: quét source tìm lỗ hổng." },
+    { term: "required status check", meaning: "Check bắt buộc xanh thì PR mới được merge." },
+    { term: "ruleset", meaning: "Bộ luật bảo vệ nhánh/tag của GitHub, thay thế dần branch protection." },
+    { term: "concurrency", meaning: "Giới hạn lần chạy đồng thời, có thể huỷ lần chạy cũ." },
+    { term: "artifact (Actions)", meaning: "File lưu lại sau khi job xong: report, binary, log." },
+    { term: "metadata-action", meaning: "Action sinh tag/label image theo SHA, nhánh, semver." },
+  ]}
+/>
+
+<QuickCheck
+  question="Pipeline của bạn: build 6 phút → push → deploy staging → lint 20 giây. Lint thường xuyên fail. Nên sửa thế nào?"
+  options={[
+    "Đưa lint lên đầu và chỉ build/push khi lint + test đã xanh",
+    "Bỏ lint vì tốn thời gian",
+    "Giữ nguyên, thêm retry cho lint",
+    "Chạy lint sau khi deploy production",
+  ]}
+  answerIndex={0}
+  explanation="Trạm cân rẻ và nhanh phải đứng đầu băng chuyền. Hàng lỗi bị loại sau 20 giây thay vì sau 6 phút build và một lần deploy vô ích."
+/>

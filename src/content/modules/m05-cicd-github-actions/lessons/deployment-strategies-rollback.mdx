@@ -1,0 +1,170 @@
+import { DeploymentStrategyTrafficDiagram } from "../diagrams/deployment-strategy-traffic-diagram";
+
+<Eli5 title="Chiến lược deploy giống cách quán phở đổi công thức nước dùng" emoji="🍲">
+
+Quán phở có 4 nồi nước dùng và muốn đổi sang công thức mới.
+
+- **Rolling**: đổ bỏ và nấu lại **từng nồi một**. Không cần thêm bếp, nhưng trong lúc chuyển, khách có người ăn vị cũ, người ăn vị mới — và nếu công thức mới dở, khi phát hiện ra thì đã có mấy nồi bị đổi.
+- **Blue-green**: thuê **thêm một gian bếp** nấu sẵn 4 nồi công thức mới, nếm thử kỹ, rồi **chuyển toàn bộ khách sang một lượt**. Dở thì chuyển về bếp cũ ngay — nhưng tốn gấp đôi bếp.
+- **Canary**: múc công thức mới cho **vài khách quen** ngồi góc quán trước (5%). Họ khen thì tăng dần; họ nhăn mặt thì chỉ vài người bị ảnh hưởng.
+
+Còn **feature flag** giống món mới có sẵn trong bếp nhưng **chưa in lên thực đơn** — bật cho ai, lúc nào là do quản lý quyết, không cần nấu lại.
+
+</Eli5>
+
+### Vì sao DevOps quan tâm?
+
+Deploy không lỗi 100% là không tồn tại. Điều phân biệt team giỏi là **giới hạn số người bị ảnh hưởng** và **rollback trong vài phút**. Checkpoint 1 yêu cầu bạn tự deploy app lên VM với healthcheck trước khi chuyển traffic và viết cách rollback — bài này là nền tảng cho việc đó.
+
+<DeploymentStrategyTrafficDiagram />
+
+<Technical>
+
+### So sánh ba chiến lược
+
+| | Rolling | Blue-green | Canary |
+|---|---|---|---|
+| Tài nguyên thêm | Rất ít (`maxSurge`) | Gấp đôi trong lúc chuyển | Ít |
+| Hai version chạy cùng lúc | Có | Không (chuyển một lần) | Có |
+| Người dùng bị ảnh hưởng nếu lỗi | Tăng dần theo tiến độ | 100% sau khi chuyển (nhưng quay về nhanh) | Chỉ % canary |
+| Rollback | Rolling ngược, chậm | Chuyển traffic về, rất nhanh | Rút canary, nhanh |
+| Hỗ trợ sẵn | K8s Deployment, ECS | ALB target group, CodeDeploy, DNS | Argo Rollouts, Flagger, ALB weighted, CodeDeploy |
+
+**Feature flag** tách *deploy* (đưa code lên server) khỏi *release* (bật tính năng cho người dùng). Code mới có thể nằm trên production nhiều ngày ở trạng thái tắt. Dịch vụ: LaunchDarkly, Unleash, AWS AppConfig…
+
+### Rollback: chuẩn bị từ trước
+
+- **Artifact bất biến**: rollback = deploy lại image `sha-` trước đó. Không build lại, không `git revert` rồi chờ pipeline.
+- **Database migration theo kiểu expand/contract**: bước 1 thêm cột mới (code cũ vẫn chạy được), bước 2 deploy code dùng cột mới, bước 3 mới xoá cột cũ. Nếu migration phá vỡ code cũ, rollback image cũng vô ích.
+- **Ghi lại version đang chạy** ở nơi dễ xem (file trên server, tag trên instance, output của workflow).
+
+### Checkpoint 1: auto-deploy lên một VM
+
+```text
+ git push main ─▶ GitHub Actions: test → build → Trivy → push GHCR
+                          │
+                          ▼ (environment: production, OIDC)
+                   AWS SSM Run Command ─▶ EC2 t3.micro
+                                            ├─ nginx (HTTPS, reverse proxy)
+                                            └─ docker compose: api + db
+```
+
+Dùng **SSM Run Command** thay SSH: không phải mở port 22 ra Internet, không lưu SSH private key trong GitHub, mọi lệnh có log trong AWS. (SSH qua action như `appleboy/ssh-action` cũng chạy được — nếu dùng, giới hạn IP và pin action theo SHA.)
+
+Trên VM, `compose.yaml` đọc tag từ biến môi trường để deploy/rollback chỉ là đổi một giá trị:
+
+```yaml title="/opt/shop/compose.yaml (trích)"
+services:
+  api:
+    image: ghcr.io/acme/shop-api:${IMAGE_TAG:?IMAGE_TAG is required}
+    ports:
+      - "127.0.0.1:3000:3000"      # chỉ nginx trên host truy cập được
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/healthz"]
+      interval: 10s
+      retries: 5
+    restart: unless-stopped
+```
+
+```bash title="/opt/shop/deploy.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+NEW_TAG="$1"
+cd /opt/shop
+PREV_TAG="$(cat current-tag 2>/dev/null || echo none)"
+
+IMAGE_TAG="$NEW_TAG" docker compose pull api
+if IMAGE_TAG="$NEW_TAG" docker compose up -d --wait --wait-timeout 90 api; then
+  echo "$PREV_TAG" > previous-tag
+  echo "$NEW_TAG" > current-tag
+  echo "Deployed $NEW_TAG"
+else
+  echo "Healthcheck failed, rolling back to $PREV_TAG" >&2
+  IMAGE_TAG="$PREV_TAG" docker compose up -d --wait api
+  exit 1
+fi
+```
+
+Job deploy trong workflow:
+
+```yaml title=".github/workflows/cd.yml (job deploy)"
+  deploy:
+    needs: build-scan-push
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Run deploy.sh on the VM via SSM
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ vars.INSTANCE_ID }}" \
+            --document-name AWS-RunShellScript \
+            --parameters "commands=['/opt/shop/deploy.sh sha-${{ github.sha }}']" \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "${{ vars.INSTANCE_ID }}"
+```
+
+`docker compose up -d` với một container vẫn có **vài giây gián đoạn** khi container cũ bị thay. Muốn zero-downtime thật trên một VM, chạy hai bản `api-blue` (port 3001) và `api-green` (port 3002): bật bản mới, đợi healthy, đổi `upstream` trong nginx, `nginx -s reload`, rồi mới tắt bản cũ — blue-green thu nhỏ.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Trên VM: xem version đang chạy", command: "cat /opt/shop/current-tag", output: "sha-3f9c2e1a7d…" },
+    { comment: "Deploy thử một tag bằng tay (đúng lệnh pipeline sẽ gọi)", command: "sudo /opt/shop/deploy.sh sha-8a41d0c9e2…", output: "[+] Pulling 1/1\n ✔ api Pulled\n[+] Running 1/1\n ✔ Container shop-api-1  Healthy\nDeployed sha-8a41d0c9e2…" },
+    { comment: "Kiểm tra qua nginx + HTTPS", command: "curl -sS -o /dev/null -w '%{http_code}\\n' https://shop.example.com/healthz", output: "200" },
+    { comment: "Rollback nhanh về bản trước", command: "sudo /opt/shop/deploy.sh \"$(cat /opt/shop/previous-tag)\"", output: "Deployed sha-3f9c2e1a7d…" },
+    { comment: "Từ laptop: xem lịch sử lệnh SSM đã chạy trên instance", command: "aws ssm list-commands --instance-id i-0abc123def4567890 --max-items 3 --query 'Commands[].[RequestedDateTime,Status]' --output table" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Rollback bằng `git revert` rồi đợi pipeline chạy lại 10 phút.** Trong lúc sự cố, mỗi phút đều đắt. Rollback phải là "deploy lại artifact cũ" — vài chục giây. Revert code để sửa lâu dài làm sau.
+
+</Callout>
+
+<Callout type="mistake">
+
+**Migration xoá/đổi tên cột cùng lúc với deploy code mới.** Code cũ (đang chạy song song khi rolling, hoặc khi cần rollback) sẽ lỗi ngay. Dùng expand/contract qua nhiều lần deploy.
+
+</Callout>
+
+<Callout type="cost">
+
+Blue-green trên cloud nghĩa là **trả tiền gấp đôi** số instance trong lúc chuyển — và gấp đôi mãi mãi nếu quên tắt môi trường cũ. Với Checkpoint 1, một `t3.micro` có thể nằm trong free tier tuỳ tài khoản và thời điểm; **stop instance** khi không dùng, đặt AWS Budget cảnh báo. Kiểm tra bảng giá và điều kiện free tier mới nhất.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "rolling update", meaning: "Thay dần từng instance sang version mới." },
+    { term: "blue-green", meaning: "Hai môi trường song song, chuyển toàn bộ traffic sang bản mới một lần." },
+    { term: "canary", meaning: "Cho một phần nhỏ traffic dùng bản mới, tăng dần nếu chỉ số ổn." },
+    { term: "feature flag", meaning: "Công tắc bật/tắt tính năng lúc chạy, tách deploy khỏi release." },
+    { term: "rollback", meaning: "Quay về version chạy tốt trước đó." },
+    { term: "blast radius", meaning: "Phạm vi người dùng/hệ thống bị ảnh hưởng khi có lỗi." },
+    { term: "expand/contract", meaning: "Đổi schema DB qua nhiều bước tương thích ngược." },
+    { term: "SSM Run Command", meaning: "Dịch vụ AWS chạy lệnh trên instance mà không cần SSH." },
+  ]}
+/>
+
+<QuickCheck
+  question="App thanh toán có 2 triệu user. Bản mới thay đổi logic tính phí, team muốn nếu có bug thì càng ít người bị ảnh hưởng càng tốt và phát hiện dựa trên số liệu thật. Chọn chiến lược nào?"
+  options={[
+    "Rolling update với 50% instance mỗi đợt",
+    "Canary 1–5% traffic, theo dõi error rate và doanh thu, tăng dần",
+    "Blue-green chuyển 100% traffic ngay",
+    "Deploy thẳng rồi rollback nếu khách phàn nàn",
+  ]}
+  answerIndex={1}
+  explanation="Cho vài khách quen nếm nồi nước dùng mới trước: canary giới hạn blast radius ở vài phần trăm và dùng số liệu thật để quyết định tăng tiếp hay rút lại."
+/>

@@ -1,0 +1,225 @@
+import { MatrixCacheCalculatorDiagram } from "../diagrams/matrix-cache-calculator-diagram";
+
+<Eli5 title="Cache, matrix và reusable workflow giống chuỗi quán cơm tấm" emoji="🍛">
+
+**Cache** giống **nồi nước mắm pha sẵn** từ hôm qua: sáng ra không phải pha lại từ đầu, chỉ cần kiểm tra công thức (file lock) có đổi không. Đổi công thức thì mới pha nồi mới.
+
+**Matrix** giống việc **nếm thử cùng một món ở nhiều chi nhánh cùng lúc** — quận 1 dùng gạo A, quận 3 dùng gạo B, Hà Nội dùng bếp gas khác. Mỗi tổ hợp một người nếm, **song song**, để chắc món ngon ở mọi nơi.
+
+**Reusable workflow** giống **sổ tay công thức chuẩn của cả chuỗi**: 20 chi nhánh không tự viết công thức riêng; ai cũng "làm theo trang 5 của sổ tay", chỉ ghi chú khác nhau (tên chi nhánh). Sửa sổ tay một chỗ, cả chuỗi được cập nhật.
+
+</Eli5>
+
+### Vì sao DevOps quan tâm?
+
+Khi công ty có hàng chục service, copy-paste 20 file workflow gần giống nhau là **nợ kỹ thuật**: sửa một lỗ hổng phải sửa 20 chỗ. Cache và matrix quyết định pipeline chạy **3 phút hay 15 phút** và hoá đơn phút runner mỗi tháng. Dependabot giữ dependency và action luôn được vá mà không ai phải nhớ.
+
+<MatrixCacheCalculatorDiagram />
+
+<Technical>
+
+### Cache dependency
+
+Cách đơn giản nhất: dùng tuỳ chọn `cache` có sẵn trong action setup ngôn ngữ.
+
+```yaml
+- uses: actions/setup-node@v5
+  with:
+    node-version: 22
+    cache: npm            # cache thư mục ~/.npm, key theo hash của package-lock.json
+- run: npm ci
+```
+
+Tự kiểm soát bằng `actions/cache`:
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: ~/.cache/pip
+    key: pip-${{ runner.os }}-${{ hashFiles('**/requirements*.txt') }}
+    restore-keys: |
+      pip-${{ runner.os }}-
+```
+
+- `key` khớp chính xác → **cache hit**. Không khớp → thử `restore-keys` theo tiền tố (cache gần đúng), cuối job lưu cache mới.
+- Cache bị giới hạn dung lượng mỗi repo và tự xoá khi lâu không dùng — kiểm tra tài liệu mới nhất về hạn mức.
+- Cache Docker layer: `cache-from: type=gha` / `cache-to: type=gha,mode=max` trong `docker/build-push-action`.
+- **Cache ≠ artifact**: cache để tăng tốc (có thể mất, không đảm bảo); artifact để lưu kết quả (report, binary) và chuyển file giữa các job.
+
+### Matrix
+
+```yaml
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false        # một tổ hợp lỗi không huỷ các tổ hợp khác
+      max-parallel: 4
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [20, 22]
+        include:
+          - os: ubuntu-latest
+            node: 24
+            experimental: true
+        exclude:
+          - os: windows-latest
+            node: 20
+    continue-on-error: ${{ matrix.experimental == true }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci && npm test
+```
+
+Tổ hợp = 2 × 2 − 1 (exclude) + 1 (include) = **4 job** song song. Matrix hợp cho **thư viện** hỗ trợ nhiều runtime/OS. Với **ứng dụng** deploy lên một runtime cố định, thường chỉ cần một tổ hợp — đừng nhân phút runner vô ích.
+
+### Reusable workflow (`workflow_call`)
+
+```yaml title="acme/platform-workflows/.github/workflows/docker-build.yml"
+name: Docker build, scan, push
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        type: string
+        required: true
+      context:
+        type: string
+        default: "."
+    secrets:
+      registry-token:
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - run: echo "Build ${{ inputs.image-name }} từ ${{ inputs.context }}"
+      # … build → Trivy → push như bài Pipeline
+```
+
+```yaml title="shop-api/.github/workflows/cd.yml"
+name: CD
+on:
+  push:
+    branches: [main]
+jobs:
+  image:
+    uses: acme/platform-workflows/.github/workflows/docker-build.yml@v1
+    with:
+      image-name: shop-api
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+```
+
+- Gọi bằng `uses:` ở **mức job** (không phải step). Nên trỏ tới tag hoặc SHA, không trỏ `@main`.
+- Repo chứa reusable workflow phải cho phép repo gọi truy cập (public, hoặc cấu hình chia sẻ trong organization).
+- `secrets: inherit` truyền mọi secret của caller — tiện nhưng rộng; truyền từng secret rõ ràng là an toàn hơn.
+
+### Composite action — tái sử dụng ở mức step
+
+```yaml title=".github/actions/setup-app/action.yml"
+name: Setup app
+description: Checkout-ready Node setup + install
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v5
+      with:
+        node-version: 22
+        cache: npm
+    - run: npm ci
+      shell: bash
+```
+
+Gọi trong step: `- uses: ./.github/actions/setup-app`. **Reusable workflow** = cả một (hoặc nhiều) job chuẩn; **composite action** = một nhóm step chèn vào job của bạn.
+
+### Dependabot tự cập nhật dependency
+
+```yaml title=".github/dependabot.yml"
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+```
+
+Dependabot mở PR → CI chạy như mọi PR → review và merge. **Renovate** là lựa chọn thay thế với nhiều tuỳ chỉnh hơn (automerge theo luật, lịch chi tiết).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Liệt kê cache của repo", command: "gh cache list --limit 5", output: "ID          KEY                                              SIZE      CREATED       ACCESSED\n1834567890  node-cache-Linux-x64-npm-9f2c1b…                 142 MiB   2 days ago    3 minutes ago\n1834567123  pip-Linux-3a77e0…                                 61 MiB    5 days ago    1 day ago" },
+    { comment: "Xoá một cache hỏng để buộc tạo lại", command: "gh cache delete 1834567123", output: "✓ Deleted 1 cache from acme/shop-api" },
+    { comment: "Log của step setup-node khi cache hit", command: "gh run view 9876543213 --log | grep -i 'cache restored'", output: "test (ubuntu-latest, 22)  Setup Node  Cache restored from key: node-cache-Linux-x64-npm-9f2c1b…" },
+    { comment: "Tìm các file workflow gần giống nhau — ứng viên chuyển sang reusable workflow", command: "grep -l 'docker/build-push-action' */.github/workflows/*.yml | wc -l", output: "14" },
+    { comment: "Xem PR do Dependabot mở", command: "gh pr list --author app/dependabot --limit 3", output: "#57  build(deps): bump the minor-and-patch group with 6 updates  dependabot/npm_and_yarn/minor-and-patch-8c1f…\n#56  build(deps): bump node from 22.11-alpine to 22.12-alpine       dependabot/docker/node-22.12-alpine\n#55  build(deps): bump docker/build-push-action from 5 to 6       dependabot/github_actions/docker/build-push-action-6" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Cache thư mục `node_modules` với key cố định như `deps-v1`.** Cache không bao giờ được làm mới khi lock file đổi, test chạy với dependency cũ và "chạy trên CI được mà local lỗi". Key phải chứa `hashFiles` của lock file.
+
+</Callout>
+
+<Callout type="mistake">
+
+**Reusable workflow trỏ `@main`.** Ai đó sửa repo platform, 20 service đồng loạt đỏ (hoặc tệ hơn: bị chèn bước độc hại). Gọi theo tag phiên bản hoặc SHA, nâng cấp có chủ đích.
+
+</Callout>
+
+<Callout type="cost">
+
+Matrix 3 OS × 4 version = 12 job cho **mỗi** commit. Runner Windows/macOS đắt hơn Linux đáng kể với repo private. Chỉ chạy matrix đầy đủ trên `main` hoặc lịch hằng đêm; PR chạy một tổ hợp chính. Kiểm tra bảng giá mới nhất.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "cache key", meaning: "Chuỗi định danh cache, thường gồm OS và hash của lock file." },
+    { term: "restore-keys", meaning: "Tiền tố dự phòng để lấy cache gần đúng khi key không khớp." },
+    { term: "matrix", meaning: "Sinh nhiều job song song từ các tổ hợp tham số." },
+    { term: "fail-fast", meaning: "Huỷ các job còn lại của matrix khi một job lỗi (mặc định bật)." },
+    { term: "reusable workflow", meaning: "Workflow có on: workflow_call, được job ở workflow khác gọi bằng uses." },
+    { term: "composite action", meaning: "Action gom nhiều step, dùng như một step trong job." },
+    { term: "Dependabot", meaning: "Bot của GitHub tự mở PR cập nhật dependency, image và action." },
+  ]}
+/>
+
+<QuickCheck
+  question="Công ty có 15 microservice, mỗi repo copy cùng một workflow build → Trivy → push. Cần đổi mức chặn Trivy từ CRITICAL sang HIGH,CRITICAL cho tất cả. Cách tổ chức tốt nhất về lâu dài?"
+  options={[
+    "Sửa tay 15 file, lần sau lại sửa 15 file",
+    "Dùng matrix với 15 tổ hợp trong một repo",
+    "Tạo reusable workflow ở repo platform, 15 repo gọi bằng uses theo tag; đổi một chỗ rồi nâng tag",
+    "Tắt Trivy để khỏi phải đồng bộ",
+  ]}
+  answerIndex={2}
+  explanation="Sổ tay công thức chuẩn của cả chuỗi: sửa trang 5 một lần, mọi chi nhánh làm theo. Gọi theo tag giúp từng service nâng cấp có kiểm soát."
+/>

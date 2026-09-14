@@ -1,0 +1,124 @@
+import { CicdAssemblyLineDiagram } from "../diagrams/cicd-assembly-line-diagram";
+
+<Eli5 title="CI/CD giống dây chuyền lắp ráp xe máy" emoji="🏭">
+
+Ngày xưa, mỗi thợ tự lắp một phần xe ở nhà riêng suốt một tháng, rồi cuối tháng mới mang tới xưởng **ghép lại**. Kết quả: ốc không vừa lỗ, dây điện sai màu, cả xưởng mất một tuần sửa. Đó là "integration hell".
+
+**Continuous Integration (CI)**: thợ gắn linh kiện vào **khung xe chung nhiều lần mỗi ngày**, và **máy kiểm tra tự động** soi ngay sau mỗi lần gắn. Sai là biết liền, sửa khi còn nhỏ.
+
+**Continuous Delivery**: xe hoàn thiện, đã kiểm định, **luôn đậu sẵn ở bãi** — chỉ chờ quản lý **ký phiếu xuất xưởng**. **Continuous Deployment**: bỏ luôn chữ ký — xe qua kiểm định là **tự lên xe tải** giao đại lý.
+
+Chỗ ví von bị "gãy": phần mềm "xuất xưởng" rồi vẫn **thu hồi được trong vài phút** (rollback) — rẻ hơn thu hồi xe rất nhiều. Đó là lý do team phần mềm dám tự động hoá tới tận production.
+
+</Eli5>
+
+### Vì sao DevOps quan tâm?
+
+CI/CD là **xương sống** của DevOps: biến "deploy" từ sự kiện đáng sợ mỗi quý thành việc nhàm chán nhiều lần mỗi ngày. Hầu hết job description DevOps/SRE đều yêu cầu "xây dựng và vận hành CI/CD pipeline" — và bạn sẽ dùng nó cho mọi module sau (Terraform, Kubernetes, GitOps).
+
+<CicdAssemblyLineDiagram />
+
+<Technical>
+
+### Ba khái niệm, hai chữ "CD"
+
+| | Tự động tới đâu | Ai quyết định lên production | Điều kiện tiên quyết |
+|---|---|---|---|
+| **Continuous Integration** | Build + test mỗi commit, merge vào nhánh chính thường xuyên | Deploy vẫn là quy trình riêng | Test tự động, nhánh sống ngắn |
+| **Continuous Delivery** | Tới staging; artifact luôn sẵn sàng release | Con người bấm duyệt | CI tốt + deploy tự động hoá hoàn toàn |
+| **Continuous Deployment** | Tới production | Bộ kiểm tra tự động | Test rất tốt, monitoring, rollback nhanh, feature flag |
+
+Nguyên tắc cốt lõi giống nhau: **batch nhỏ** (commit nhỏ, PR nhỏ) → lỗi dễ tìm, rollback dễ, review nhanh.
+
+### Pipeline as code
+
+Pipeline được mô tả bằng **file trong repo**, đi qua code review như code. Luồng điển hình:
+
+```text
+PR mở / cập nhật  ──▶  lint → unit test → SAST              (CI, chặn merge nếu đỏ)
+merge vào main    ──▶  build image → scan → push registry   (tạo artifact bất biến)
+                  ──▶  deploy staging → [duyệt] → production (CD)
+```
+
+**Build once, deploy many**: image được build **một lần** từ commit, rồi *chính image đó* đi qua staging và production. Không build lại cho từng môi trường — chỉ khác cấu hình truyền vào.
+
+### Đo lường: DORA metrics
+
+Nghiên cứu DORA (Google Cloud) dùng các chỉ số để đánh giá hiệu quả delivery — rất hay gặp khi phỏng vấn:
+
+| Chỉ số | Câu hỏi |
+|---|---|
+| **Deployment frequency** | Bao lâu deploy production một lần? |
+| **Lead time for changes** | Từ commit tới production mất bao lâu? |
+| **Change failure rate** | Bao nhiêu % deploy gây sự cố? |
+| **Time to restore** | Có sự cố thì bao lâu khôi phục? |
+
+Tên và cách nhóm các chỉ số được DORA cập nhật qua các năm — kiểm tra báo cáo mới nhất.
+
+### Công cụ CI/CD phổ biến
+
+| Công cụ | File cấu hình | Ghi chú |
+|---|---|---|
+| **GitHub Actions** | `.github/workflows/*.yml` | Tích hợp sẵn với GitHub, marketplace action lớn — module này dùng |
+| **GitLab CI/CD** | `.gitlab-ci.yml` | Khái niệm stage/job tương tự, mạnh ở self-hosted |
+| **Jenkins** | `Jenkinsfile` (Groovy) | Lâu đời, cực nhiều plugin, tự vận hành server — còn rất phổ biến ở doanh nghiệp |
+| **CircleCI** | `.circleci/config.yml` | SaaS, orbs tương tự action |
+
+Học chắc một công cụ là đọc hiểu được các công cụ khác: đều là **trigger → job → step → runner/agent**.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Làm việc trên nhánh ngắn hạn, commit nhỏ", command: "git switch -c feat/discount-rule && git commit -am 'feat: apply 10% discount over 1M VND'" },
+    { command: "git push -u origin feat/discount-rule" },
+    { comment: "Mở PR bằng GitHub CLI — CI tự chạy", command: "gh pr create --fill --base main", output: "https://github.com/acme/shop-api/pull/42" },
+    { comment: "Xem trạng thái các check trên PR", command: "gh pr checks 42 --watch", output: "✓ lint        18s\n✓ test        1m32s\n✓ codeql      2m05s\nAll checks were successful" },
+    { comment: "Liệt kê các lần chạy workflow gần đây", command: "gh run list --limit 3", output: "STATUS  TITLE                       WORKFLOW  BRANCH              EVENT         ELAPSED\n✓       feat: apply 10% discount…   CI        feat/discount-rule  pull_request  2m10s\n✓       fix: rounding in invoice    CD        main                push          6m41s\nX       chore: bump express         CI        deps/express        pull_request  1m03s" },
+    { comment: "Merge khi xanh — workflow CD trên main chạy tiếp", command: "gh pr merge 42 --squash --delete-branch" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Gọi "có Jenkins/GitHub Actions" là "đã có CI".** Nếu nhánh feature sống 3 tuần mới merge, hoặc pipeline đỏ cả tuần mà mọi người vẫn merge, thì đó chỉ là *máy chạy script*. CI là **thói quen**: tích hợp thường xuyên và sửa build đỏ ngay lập tức.
+
+</Callout>
+
+<Callout type="mistake">
+
+**Build lại image riêng cho staging và production.** Hai lần build có thể ra hai kết quả khác nhau (dependency mới, base image mới). Build một lần, promote cùng một image qua các môi trường.
+
+</Callout>
+
+<Callout type="tip">
+
+Muốn thuyết phục team đầu tư CI/CD? Đo **lead time** và **deployment frequency** hiện tại trước, rồi so sánh sau khi có pipeline. Con số nói thay bạn.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Continuous Integration", meaning: "Merge code thường xuyên, mỗi lần đều build và test tự động." },
+    { term: "Continuous Delivery", meaning: "Luôn có artifact sẵn sàng release; lên production cần người duyệt." },
+    { term: "Continuous Deployment", meaning: "Mọi thay đổi qua kiểm tra tự động đều tự lên production." },
+    { term: "pipeline", meaning: "Chuỗi bước tự động từ commit tới artifact/deploy." },
+    { term: "artifact", meaning: "Sản phẩm build bất biến (image, binary) được promote qua các môi trường." },
+    { term: "lead time", meaning: "Thời gian từ commit tới khi chạy ở production." },
+    { term: "DORA metrics", meaning: "Bộ chỉ số đo hiệu quả delivery: tần suất, lead time, tỉ lệ lỗi, thời gian khôi phục." },
+  ]}
+/>
+
+<QuickCheck
+  question="Pipeline của team tự động build, test, deploy staging. Lên production cần tech lead bấm 'Approve' trên GitHub. Đây là mô hình nào?"
+  options={[
+    "Chỉ Continuous Integration",
+    "Continuous Deployment",
+    "Continuous Delivery",
+    "Không phải CI/CD vì còn bước thủ công",
+  ]}
+  answerIndex={2}
+  explanation="Xe đã kiểm định đậu sẵn ở bãi, chỉ chờ quản lý ký xuất xưởng: đó là Continuous Delivery. Bỏ nút Approve mới là Continuous Deployment."
+/>
