@@ -1,0 +1,138 @@
+import { S3LifecycleStorageClassDiagram } from "../diagrams/s3-lifecycle-storage-class-diagram";
+import { S3PresignedUrlUploadDiagram } from "../diagrams/s3-presigned-url-upload-diagram";
+
+<Eli5 title="S3 giống như dịch vụ kho bãi có bảo vệ, phiếu gửi hàng và kho lạnh" emoji="🏭">
+
+Kho S3 có **bảo vệ ở cổng** (Block Public Access, bucket policy): mặc định không ai lạ được vào. Muốn cho một khách gửi đúng một kiện hàng, bạn không đưa họ chìa khoá kho — bạn viết **phiếu gửi hàng có chữ ký**, ghi rõ "kiện số 7f3c, hạn 5 phút". Đó là **pre-signed URL**.
+
+Hàng mới về để ở **kệ trước cửa** (Standard) cho dễ lấy. Hàng lâu không ai hỏi thì chuyển ra **kho phía sau** (Standard-IA), rồi **kho lạnh ngoại thành** (Glacier) — thuê rẻ nhưng muốn lấy phải đặt lịch. Người quản lý kho làm việc này tự động theo **lifecycle rule**.
+
+Còn **versioning** giống việc kho giữ lại cả thùng cũ khi bạn gửi thùng mới cùng mã — lỡ tay ghi đè hay xoá vẫn lấy lại được.
+
+</Eli5>
+
+Với DevOps, S3 có mặt ở khắp nơi: artifact build, Terraform state, backup database, log ALB/CloudTrail, file người dùng, static website. Một bucket public nhầm là sự cố bảo mật kinh điển; một bucket không có lifecycle là hoá đơn tăng mãi.
+
+<S3PresignedUrlUploadDiagram />
+
+<Technical>
+
+### Bảo mật bucket: nhiều lớp cùng quyết định
+
+- **Block Public Access (BPA)**: công tắc tổng ở cấp account và bucket. Bucket mới mặc định đã bật BPA và tắt ACL (Object Ownership = bucket owner enforced). Giữ nguyên trừ khi thật sự cần public.
+- **IAM policy**: gắn vào user/role — "role này được làm gì".
+- **Bucket policy**: gắn vào bucket — "ai được làm gì với bucket này", dùng để cho account khác, CloudFront (OAC) hoặc bắt buộc HTTPS.
+- Explicit **Deny** luôn thắng (như logic đánh giá policy ở M06).
+
+```json title="bucket-policy.json — chỉ cho truy cập qua HTTPS"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::shop-uploads-123456789012", "arn:aws:s3:::shop-uploads-123456789012/*"],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    }
+  ]
+}
+```
+
+### Pre-signed URL
+
+- Tạo bằng SDK hoặc CLI, ký bằng credentials của người tạo; người dùng URL có **đúng quyền của người ký**, cho đúng object/thao tác, tới khi hết hạn.
+- Ký bằng credentials tạm (IAM role) thì URL cũng hết hiệu lực khi session của role hết hạn, dù `expires` dài hơn.
+- `aws s3 presign` trong CLI chỉ tạo URL **download (GET)**. URL upload (`PUT` hoặc presigned POST) tạo bằng SDK, ví dụ boto3 `generate_presigned_url("put_object", ...)`.
+- Trình duyệt upload trực tiếp cần cấu hình **CORS** trên bucket.
+
+### Storage classes
+
+| Class | Dùng khi | Lưu ý |
+|---|---|---|
+| Standard | Truy cập thường xuyên | Không phí truy xuất |
+| Intelligent-Tiering | Không đoán được tần suất | Tự chuyển tầng, có phí giám sát nhỏ/object |
+| Standard-IA / One Zone-IA | Ít truy cập nhưng cần ngay | Tối thiểu 30 ngày, phí/GB khi lấy; One Zone chỉ 1 AZ |
+| Glacier Instant Retrieval | Lưu trữ, vài lần/quý, cần mili-giây | Tối thiểu 90 ngày |
+| Glacier Flexible Retrieval | Lưu trữ, chờ phút–giờ được | Phải restore trước khi đọc; tối thiểu 90 ngày |
+| Glacier Deep Archive | Lưu trữ tuân thủ nhiều năm | Rẻ nhất, restore tính bằng giờ; tối thiểu 180 ngày |
+
+<S3LifecycleStorageClassDiagram />
+
+### Lifecycle, versioning, static website
+
+```json title="lifecycle.json"
+{
+  "Rules": [
+    {
+      "ID": "uploads-tiering",
+      "Filter": { "Prefix": "uploads/" },
+      "Status": "Enabled",
+      "Transitions": [{ "Days": 30, "StorageClass": "STANDARD_IA" }],
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 90 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}
+```
+
+- **Versioning** bật rồi chỉ có thể *suspend*, không tắt hẳn. Xoá object tạo *delete marker*; bản cũ vẫn tính tiền → cần `NoncurrentVersionExpiration`.
+- **Static website hosting** cho endpoint HTTP công khai. Production nên dùng **CloudFront + Origin Access Control** trỏ vào bucket private để có HTTPS, cache và không mở public bucket.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra BPA của bucket", command: "aws s3api get-public-access-block --bucket shop-uploads-123456789012", output: "{\n    \"PublicAccessBlockConfiguration\": {\n        \"BlockPublicAcls\": true,\n        \"IgnorePublicAcls\": true,\n        \"BlockPublicPolicy\": true,\n        \"RestrictPublicBuckets\": true\n    }\n}" },
+    { comment: "Bật versioning", command: "aws s3api put-bucket-versioning --bucket shop-uploads-123456789012 --versioning-configuration Status=Enabled" },
+    { comment: "Áp bucket policy bắt buộc HTTPS", command: "aws s3api put-bucket-policy --bucket shop-uploads-123456789012 --policy file://bucket-policy.json" },
+    { comment: "Áp lifecycle rule", command: "aws s3api put-bucket-lifecycle-configuration --bucket shop-uploads-123456789012 --lifecycle-configuration file://lifecycle.json" },
+    { comment: "URL download có hạn 10 phút (CLI chỉ hỗ trợ GET)", command: "aws s3 presign s3://shop-uploads-123456789012/uploads/u-42/7f3c.jpg --expires-in 600", output: "https://shop-uploads-123456789012.s3.ap-southeast-1.amazonaws.com/uploads/u-42/7f3c.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=...&X-Amz-Expires=600&X-Amz-Signature=9b1c..." },
+    { comment: "Xem các version của một object", command: "aws s3api list-object-versions --bucket shop-uploads-123456789012 --prefix uploads/u-42/7f3c.jpg --query \"Versions[].[VersionId,IsLatest]\" --output text", output: "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY\tTrue\nfUQh2a7v1c.CQ0sTzG9xO0nN4Bq7Rkq1\tFalse" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Tắt Block Public Access để "cho frontend upload được".** Kết quả: ai cũng có thể ghi/đọc bucket. Hãy dùng pre-signed URL (upload) và CloudFront + OAC (phục vụ file) — bucket vẫn private.
+
+</Callout>
+
+<Callout type="cost">
+
+Lifecycle chuyển **hàng triệu object nhỏ** sang IA/Glacier có thể **đắt hơn** giữ nguyên: mỗi transition tính phí request, IA tính tối thiểu 128 KB/object, Glacier cộng thêm metadata overhead. Upload multipart dở dang cũng âm thầm tính tiền — luôn thêm `AbortIncompleteMultipartUpload`.
+
+</Callout>
+
+<Callout type="warning">
+
+Pre-signed URL là **bearer token**: ai có link là dùng được tới khi hết hạn. Đặt hạn ngắn, key do server quyết định, và đừng log nguyên URL.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Block Public Access", meaning: "Công tắc chặn mọi cấu hình làm bucket/object public, ở cấp account và bucket." },
+    { term: "Bucket policy", meaning: "Resource-based policy gắn vào bucket, quy định principal nào được làm gì." },
+    { term: "Pre-signed URL", meaning: "URL có chữ ký và hạn dùng, cấp quyền tạm cho một thao tác trên một object." },
+    { term: "Storage class", meaning: "Lớp lưu trữ đánh đổi giữa giá lưu, tốc độ và phí truy xuất." },
+    { term: "Lifecycle rule", meaning: "Quy tắc tự chuyển lớp hoặc xoá object theo tuổi/prefix/tag." },
+    { term: "Versioning", meaning: "Giữ nhiều phiên bản của cùng key, chống ghi đè/xoá nhầm." },
+    { term: "OAC", meaning: "Origin Access Control — cho CloudFront đọc bucket private." },
+  ]}
+/>
+
+<QuickCheck
+  question="Dev lỡ chạy script xoá hết object trong prefix reports/ của bucket đã bật versioning. Điều gì xảy ra?"
+  options={[
+    "Dữ liệu mất vĩnh viễn, phải restore từ Glacier",
+    "S3 từ chối lệnh xoá vì versioning đang bật",
+    "S3 tạo delete marker; các version cũ vẫn còn và có thể khôi phục bằng cách xoá delete marker",
+    "Object tự chuyển sang Standard-IA",
+  ]}
+  answerIndex={2}
+  explanation="Versioning như kho giữ lại thùng cũ: lệnh DELETE không kèm version-id chỉ đặt 'biển đã xoá' (delete marker). Gỡ biển đó là object hiện lại."
+/>

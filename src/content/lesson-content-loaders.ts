@@ -15,4 +15,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "m05-cicd-github-actions": (lessonSlug) => import(`./modules/m05-cicd-github-actions/lessons/${lessonSlug}.mdx`),
   "m06-aws-core-iam": (lessonSlug) => import(`./modules/m06-aws-core-iam/lessons/${lessonSlug}.mdx`),
   "m07-aws-networking-compute": (lessonSlug) => import(`./modules/m07-aws-networking-compute/lessons/${lessonSlug}.mdx`),
+  "m08-aws-storage-database-serverless": (lessonSlug) => import(`./modules/m08-aws-storage-database-serverless/lessons/${lessonSlug}.mdx`),
 };

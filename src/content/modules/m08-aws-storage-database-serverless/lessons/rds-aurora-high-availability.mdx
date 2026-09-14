@@ -1,0 +1,113 @@
+import { RdsMultiAzVsReadReplicaDiagram } from "../diagrams/rds-multi-az-vs-read-replica-diagram";
+
+<Eli5 title="RDS giống như thuê kế toán trưởng có người dự bị và thư ký chép sổ" emoji="📒">
+
+Tự chạy Postgres trên EC2 giống **tự làm kế toán**: tự mua sổ, tự photo sổ mỗi tối, tự thay sổ khi rách. **RDS** là thuê dịch vụ kế toán: họ lo backup, vá lỗi, thay máy hỏng — bạn chỉ lo ghi sổ cho đúng.
+
+**Multi-AZ** là có một **kế toán dự bị ngồi ở chi nhánh khác**, chép song song từng dòng ngay khi kế toán chính ghi. Chi nhánh chính cháy → người dự bị lên thay, khách vẫn gọi cùng số điện thoại. Nhưng người dự bị **không tiếp khách** khi chưa phải lên thay.
+
+**Read replica** là **thư ký chép lại sổ** để trả lời các câu hỏi tra cứu. Thư ký chép hơi chậm một nhịp (replica lag), và nếu kế toán chính nghỉ, bạn phải **tự bổ nhiệm** thư ký lên thay.
+
+</Eli5>
+
+Database thường là phần khó scale và khó khôi phục nhất của hệ thống. Hiểu rõ khác biệt Multi-AZ (chống sự cố hạ tầng) vs read replica (chia tải đọc) vs backup (chống lỗi dữ liệu) giúp bạn trả lời đúng cả trong sự cố thật lẫn trong đề SAA.
+
+<RdsMultiAzVsReadReplicaDiagram />
+
+<Technical>
+
+### Ba cơ chế — ba mục đích
+
+| | Multi-AZ | Read replica | Backup / snapshot |
+|---|---|---|---|
+| Mục đích | Sẵn sàng cao (HA) | Scale đọc, DR cross-region | Khôi phục khi dữ liệu hỏng/xoá nhầm |
+| Replication | Đồng bộ | Bất đồng bộ | Chụp định kỳ + transaction log |
+| Đọc được? | Không (dạng DB instance) | Có, endpoint riêng | Không — phải restore ra instance mới |
+| Chuyển đổi | Failover tự động, cùng endpoint | Promote thủ công, endpoint khác | Restore tạo instance **mới** |
+| Chống xoá nhầm bảng? | Không | Không | **Có** |
+
+- **Multi-AZ DB instance**: 1 primary + 1 standby không đọc được. Failover thường khoảng 1–2 phút.
+- **Multi-AZ DB cluster** (MySQL/Postgres): 1 writer + 2 reader standby đọc được ở 3 AZ, failover thường nhanh hơn. Kiểm tra engine/phiên bản hỗ trợ.
+- Read replica có thể ở **region khác** → vừa phục vụ user xa, vừa là một phần kế hoạch DR.
+
+### Backup & restore
+
+- **Automated backups**: snapshot hằng ngày + transaction log, retention 1–35 ngày → **point-in-time restore (PITR)**, thường tới vài phút gần nhất.
+- **Manual snapshot**: giữ tới khi bạn xoá; chụp trước migration lớn. Có thể copy sang region/account khác.
+- Restore luôn tạo **DB instance mới với endpoint mới** — kế hoạch DR phải tính bước đổi cấu hình app.
+
+### Parameter group & kết nối
+
+- Cấu hình engine (`max_connections`, `log_min_duration_statement`...) nằm trong **parameter group**. Default group không sửa được → tạo custom group. Tham số *static* cần reboot mới áp dụng.
+- Đặt DB trong **private subnet** qua DB subnet group ≥ 2 AZ, `--no-publicly-accessible`, SG chỉ nhận port 5432 từ SG của app.
+- Nhiều Lambda mở kết nối liên tục → dùng **RDS Proxy** để gom connection pool.
+
+### Aurora khác gì?
+
+- Storage phân tán tự động: **6 bản sao dữ liệu trên 3 AZ**, tự tăng dung lượng.
+- Tối đa 15 Aurora Replica dùng chung storage (lag thấp), **cluster endpoint** cho ghi và **reader endpoint** cân bằng tải đọc; replica có thể được promote tự động khi writer hỏng.
+- **Aurora Global Database** cho DR cross-region; **Aurora Serverless v2** tự co giãn capacity.
+
+```bash title="Tạo custom parameter group cho Postgres 16"
+aws rds create-db-parameter-group --db-parameter-group-name app-pg16 \
+  --db-parameter-group-family postgres16 --description "app tuning"
+aws rds modify-db-parameter-group --db-parameter-group-name app-pg16 \
+  --parameters "ParameterName=log_min_duration_statement,ParameterValue=500,ApplyMethod=immediate"
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra Multi-AZ và AZ hiện tại", command: "aws rds describe-db-instances --db-instance-identifier app-db --query \"DBInstances[0].[MultiAZ,AvailabilityZone,SecondaryAvailabilityZone,Endpoint.Address]\" --output text", output: "True\tap-southeast-1a\tap-southeast-1b\tapp-db.c9x8y7z6.ap-southeast-1.rds.amazonaws.com" },
+    { comment: "Giả lập sự cố: ép failover (chỉ với Multi-AZ)", command: "aws rds reboot-db-instance --db-instance-identifier app-db --force-failover --query DBInstance.DBInstanceStatus --output text", output: "rebooting" },
+    { comment: "Vài phút sau: primary đã chuyển AZ, endpoint giữ nguyên", command: "aws rds describe-db-instances --db-instance-identifier app-db --query \"DBInstances[0].[AvailabilityZone,SecondaryAvailabilityZone]\" --output text", output: "ap-southeast-1b\tap-southeast-1a" },
+    { comment: "Tạo read replica cho báo cáo", command: "aws rds create-db-instance-read-replica --db-instance-identifier app-db-reports --source-db-instance-identifier app-db --db-instance-class db.t4g.small" },
+    { comment: "Snapshot trước khi chạy migration", command: "aws rds create-db-snapshot --db-instance-identifier app-db --db-snapshot-identifier app-db-before-v42" },
+    { comment: "Xoá nhầm dữ liệu? Restore theo thời điểm ra instance MỚI", command: "aws rds restore-db-instance-to-point-in-time --source-db-instance-identifier app-db --target-db-instance-identifier app-db-restored --restore-time 2026-09-14T03:04:00Z --db-subnet-group-name app-db-subnets --no-publicly-accessible" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**"Có Multi-AZ rồi nên không cần backup."** Standby chép **đồng bộ** mọi thứ — kể cả `DROP TABLE orders;`. Multi-AZ chống AZ sập, không chống người/app làm hỏng dữ liệu. Luôn bật automated backup và thử restore thật.
+
+</Callout>
+
+<Callout type="warning">
+
+App cache DNS quá lâu (JVM mặc định có thể cache vĩnh viễn trong một số cấu hình) sẽ tiếp tục gọi IP primary cũ sau failover. Đặt DNS TTL thấp cho client và luôn có **retry khi mất kết nối**.
+
+</Callout>
+
+<Callout type="cost">
+
+Multi-AZ gần như **gấp đôi** tiền instance và storage; mỗi read replica là một instance tính tiền riêng; RDS chạy theo giờ kể cả khi không ai dùng. Môi trường dev có thể dùng Single-AZ và **stop** khi không học (RDS tự start lại sau tối đa 7 ngày — kiểm tra tài liệu mới nhất).
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Multi-AZ", meaning: "Standby đồng bộ ở AZ khác, failover tự động giữ nguyên endpoint." },
+    { term: "Read replica", meaning: "Bản sao bất đồng bộ, đọc được, endpoint riêng, promote thủ công." },
+    { term: "Replica lag", meaning: "Độ trễ giữa lúc ghi ở primary và lúc dữ liệu có trên replica." },
+    { term: "PITR", meaning: "Point-in-time restore — khôi phục DB về một thời điểm trong retention." },
+    { term: "Parameter group", meaning: "Bộ cấu hình engine áp cho DB instance; static param cần reboot." },
+    { term: "DB subnet group", meaning: "Tập subnet (≥ 2 AZ) nơi RDS được đặt." },
+    { term: "Aurora reader endpoint", meaning: "Endpoint cân bằng kết nối đọc giữa các Aurora Replica." },
+  ]}
+/>
+
+<QuickCheck
+  question="Công ty cần DB ở region Singapore có bản sao đọc được ở Tokyo, và nếu Singapore sập thì Tokyo có thể trở thành DB chính. Chọn gì?"
+  options={[
+    "Multi-AZ ở Singapore",
+    "Automated backup retention 35 ngày",
+    "Parameter group riêng cho Tokyo",
+    "Cross-region read replica ở Tokyo, promote khi cần",
+  ]}
+  answerIndex={3}
+  explanation="Multi-AZ chỉ trong một region. 'Thư ký chép sổ' đặt ở Tokyo (cross-region read replica) vừa phục vụ đọc, vừa có thể được bổ nhiệm lên thay khi Singapore sập."
+/>

@@ -1,0 +1,112 @@
+import { StorageTypesComparisonDiagram } from "../diagrams/storage-types-comparison-diagram";
+
+<Eli5 title="EBS, EFS, S3 giống như ổ cứng laptop, ổ mạng công ty và kho hàng" emoji="📦">
+
+**EBS** giống **ổ cứng gắn trong laptop**: rất nhanh, nhưng chỉ laptop đó dùng, và bạn không thể cắm nó vào laptop ở toà nhà khác (AZ khác).
+
+**EFS** giống **ổ mạng chung của công ty**: nhân viên ở tầng 3 và tầng 7 cùng mở một thư mục `\\share\ketoan`, ai lưu file thì người khác thấy ngay.
+
+**S3** giống **kho hàng khổng lồ ngoài khu công nghiệp**: bạn gửi kiện hàng kèm mã (key), lấy kiện ở quầy bằng mã đó. Bạn không vào kho để sửa một góc thùng — muốn đổi thì gửi thùng mới thay thùng cũ.
+
+</Eli5>
+
+Chọn sai loại lưu trữ là lỗi rất đắt: dùng EBS cho file upload thì không scale ra nhiều máy được; dùng EFS cho database thì chậm và tốn; dùng S3 như file system thì app ghi file liên tục sẽ khổ. Đây cũng là dạng câu hỏi xuất hiện rất nhiều trong đề AWS SAA.
+
+<StorageTypesComparisonDiagram />
+
+<Technical>
+
+### Ba mô hình lưu trữ
+
+| | EBS | EFS | S3 |
+|---|---|---|---|
+| Kiểu | Block storage | File storage (NFS v4.1) | Object storage |
+| Truy cập | Mount như ổ đĩa trên 1 EC2 | Mount đồng thời từ nhiều EC2/container | HTTPS API (`GetObject`, `PutObject`) |
+| Phạm vi | 1 AZ | Region (mount target mỗi AZ) | Region (tên bucket duy nhất toàn cầu) |
+| Dung lượng | Bạn chọn size, trả theo GB đã cấp | Tự co giãn, trả theo GB dùng | Gần như vô hạn, trả theo GB dùng + request |
+| Hợp cho | Ổ root, database tự quản, ứng dụng cần IOPS thấp trễ | Thư mục dùng chung, CMS, home directory | Upload người dùng, backup, log, static web, data lake |
+
+### EBS: ổ đĩa của một máy
+
+- Loại phổ biến: **gp3** (SSD đa dụng, chỉnh IOPS/throughput độc lập với dung lượng), **io2** (IOPS cao, database quan trọng), **st1/sc1** (HDD, throughput tuần tự, không dùng làm ổ boot).
+- Volume nằm trong **một AZ**. Muốn chuyển sang AZ/region khác: tạo **snapshot** (incremental, lưu bền do AWS quản lý) rồi tạo volume mới từ snapshot.
+- Mặc định mỗi volume gắn vào một instance. Multi-Attach chỉ có ở io1/io2, cùng AZ, và app phải tự xử lý ghi đồng thời.
+- **Instance store** khác EBS: ổ vật lý gắn host, rất nhanh nhưng **mất dữ liệu khi stop/terminate**.
+
+### EFS: file system dùng chung
+
+- Giao thức NFS, dành cho Linux. Security group của mount target phải mở **port 2049** từ SG của client.
+- Có lớp lưu trữ Standard / Infrequent Access / Archive và lifecycle management để tự chuyển file ít dùng.
+- Cần file share cho Windows (SMB) → **FSx for Windows File Server**; HPC → **FSx for Lustre**.
+
+### S3: object storage
+
+- Mỗi object = key + dữ liệu + metadata, tối đa 5 TB/object; upload lớn nên dùng multipart.
+- Độ bền được thiết kế 99.999999999% (11 số 9); các lớp thông thường lưu qua nhiều AZ.
+- Nhất quán mạnh read-after-write cho PUT/DELETE.
+- Không "sửa một phần file": ghi lại cả object.
+
+```bash title="Gắn EBS mới vào EC2 (chạy trên instance)"
+lsblk                                  # tìm device mới, vd nvme1n1
+sudo mkfs -t xfs /dev/nvme1n1          # CHỈ làm với volume mới, lệnh này xoá dữ liệu
+sudo mkdir -p /data && sudo mount /dev/nvme1n1 /data
+echo "UUID=$(sudo blkid -s UUID -o value /dev/nvme1n1) /data xfs defaults,nofail 0 2" | sudo tee -a /etc/fstab
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo volume gp3 20 GiB ở đúng AZ của instance", command: "aws ec2 create-volume --availability-zone ap-southeast-1a --size 20 --volume-type gp3 --tag-specifications \"ResourceType=volume,Tags=[{Key=Name,Value=data-vol}]\" --query VolumeId --output text", output: "vol-0a1b2c3d4e5f67890" },
+    { command: "aws ec2 attach-volume --volume-id vol-0a1b2c3d4e5f67890 --instance-id i-0123456789abcdef0 --device /dev/sdf --query State --output text", output: "attaching" },
+    { comment: "Snapshot để backup hoặc chuyển sang AZ khác", command: "aws ec2 create-snapshot --volume-id vol-0a1b2c3d4e5f67890 --description \"data-vol before upgrade\" --query SnapshotId --output text", output: "snap-0fedcba9876543210" },
+    { comment: "Mount EFS trên Linux (cần gói amazon-efs-utils)", command: "sudo mount -t efs -o tls fs-0123abcd:/ /mnt/shared" },
+    { command: "df -h /mnt/shared", output: "Filesystem      Size  Used Avail Use% Mounted on\n127.0.0.1:/     8.0E     0  8.0E   0% /mnt/shared" },
+    { comment: "S3: tạo bucket và upload qua API", command: "aws s3 mb s3://shop-backups-123456789012 --region ap-southeast-1", output: "make_bucket: shop-backups-123456789012" },
+    { command: "aws s3 cp ./db-dump.sql.gz s3://shop-backups-123456789012/2026-09-14/", output: "upload: ./db-dump.sql.gz to s3://shop-backups-123456789012/2026-09-14/db-dump.sql.gz" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Lưu file upload của user trên EBS của web server.** Khi ASG scale ra 3 máy, ảnh upload ở máy 1 không có ở máy 2; khi instance bị thay thế, ảnh biến mất theo. File người dùng thuộc về **S3** (hoặc EFS nếu app bắt buộc cần file system).
+
+</Callout>
+
+<Callout type="cost">
+
+EBS tính tiền theo **dung lượng đã cấp**, kể cả khi volume không gắn vào máy nào. Sau khi terminate instance, kiểm tra volume trạng thái `available` và snapshot cũ: `aws ec2 describe-volumes --filters Name=status,Values=available`. Nhớ chuyển gp2 cũ sang gp3 — thường rẻ hơn mà hiệu năng nền không kém.
+
+</Callout>
+
+<Callout type="tip">
+
+Nhớ nhanh cho đề thi: **"1 máy, 1 AZ, cần ổ đĩa" → EBS · "nhiều máy Linux cùng thư mục" → EFS · "file qua HTTP, backup, dung lượng không đoán trước" → S3.**
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Block storage (EBS)", meaning: "Ổ đĩa ảo gắn vào một EC2, format và mount như ổ cứng thật." },
+    { term: "File storage (EFS)", meaning: "File system mạng NFS, nhiều máy mount cùng lúc." },
+    { term: "Object storage (S3)", meaning: "Lưu object theo key, truy cập qua HTTPS API." },
+    { term: "Snapshot", meaning: "Bản sao incremental của EBS volume, dùng để backup hoặc tạo volume ở AZ khác." },
+    { term: "gp3", meaning: "Loại EBS SSD đa dụng, chỉnh IOPS và throughput tách khỏi dung lượng." },
+    { term: "Instance store", meaning: "Ổ tạm gắn host vật lý, mất dữ liệu khi instance stop/terminate." },
+    { term: "Mount target", meaning: "Điểm truy cập EFS trong một subnet/AZ, có security group riêng." },
+  ]}
+/>
+
+<QuickCheck
+  question="EC2 ở AZ a hỏng hẳn. Bạn muốn dựng lại máy ở AZ b với dữ liệu từ EBS volume cũ. Cách đúng là gì?"
+  options={[
+    "Detach volume rồi attach sang instance ở AZ b",
+    "Tạo snapshot từ volume (hoặc dùng snapshot gần nhất) rồi tạo volume mới ở AZ b",
+    "Copy volume sang S3 bằng aws s3 cp",
+    "EBS tự nhân bản sang mọi AZ nên chỉ cần attach",
+  ]}
+  answerIndex={1}
+  explanation="EBS là 'ổ cứng gắn trong laptop' ở một toà nhà (AZ). Muốn mang sang toà khác phải chụp snapshot rồi tạo volume mới ở AZ đích."
+/>

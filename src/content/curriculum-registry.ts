@@ -6,6 +6,7 @@ import { m04DockerContainersModule } from "./modules/m04-docker-containers/modul
 import { m05CicdGithubActionsModule } from "./modules/m05-cicd-github-actions/module-meta";
 import { m06AwsCoreIamModule } from "./modules/m06-aws-core-iam/module-meta";
 import { m07AwsNetworkingComputeModule } from "./modules/m07-aws-networking-compute/module-meta";
+import { m08AwsStorageDatabaseServerlessModule } from "./modules/m08-aws-storage-database-serverless/module-meta";
 
 /** All modules in learning order. Add new modules here after they pass `pnpm validate:module`. */
 export const curriculumModules: ModuleDefinition[] = [
@@ -16,4 +17,5 @@ export const curriculumModules: ModuleDefinition[] = [
   m05CicdGithubActionsModule,
   m06AwsCoreIamModule,
   m07AwsNetworkingComputeModule,
+  m08AwsStorageDatabaseServerlessModule,
 ];

@@ -1,0 +1,133 @@
+import { EventDrivenMessagingPatternsDiagram } from "../diagrams/event-driven-messaging-patterns-diagram";
+
+<Eli5 title="Serverless giống như bưu điện và đội nhân viên thời vụ" emoji="📮">
+
+**Lambda** giống **nhân viên thời vụ gọi là có**: không có việc thì không ai ngồi chờ (không trả lương), có kiện hàng thì một người xuất hiện xử lý, 100 kiện cùng lúc thì 100 người. Mỗi ca làm tối đa 15 phút. Người mới tới lần đầu phải thay đồng phục (**cold start**) nên hơi chậm.
+
+**API Gateway** là **quầy lễ tân**: nhận yêu cầu từ khách qua HTTP, kiểm tra vé, rồi gọi nhân viên phù hợp.
+
+Còn giao việc giữa các phòng ban thì có ba kiểu: **SQS** là **hộp thư chờ** (thư nằm đó tới khi một người lấy xử lý), **SNS** là **loa phát thanh** (mọi người đăng ký đều nghe), **EventBridge** là **tổng đài phân loại** (đọc nội dung thư rồi chuyển đúng phòng).
+
+</Eli5>
+
+Event-driven giúp tách các phần của hệ thống: API không phải chờ gửi email, dịch vụ hoá đơn chết không làm mất đơn hàng, thêm tính năng mới chỉ cần đăng ký nhận event. Với DevOps, Lambda còn là "keo dán" tự động hoá: xử lý file S3, dọn resource theo lịch, phản ứng với CloudWatch alarm.
+
+<EventDrivenMessagingPatternsDiagram />
+
+<Technical>
+
+### Lambda cơ bản
+
+- Bạn cung cấp code (zip hoặc container image) + **handler** + **execution role** (IAM role quyết định hàm được gọi dịch vụ nào).
+- Cấu hình: memory 128 MB → 10 GB (CPU tăng theo memory), **timeout tối đa 15 phút**, `/tmp` tạm thời.
+- **Concurrency**: mỗi request đồng thời cần một execution environment. Account có quota concurrency theo region; *reserved concurrency* giới hạn/đặt trước cho một hàm, *provisioned concurrency* giữ sẵn môi trường ấm để giảm cold start.
+- Code ngoài handler (kết nối DB, SDK client) chạy một lần mỗi môi trường và được tái sử dụng giữa các lần gọi.
+- Lambda cần vào RDS trong private subnet → gắn hàm vào VPC (subnet + SG); nhiều kết nối → **RDS Proxy**.
+
+### Ba kiểu gọi Lambda
+
+| Kiểu | Ví dụ nguồn | Retry & lỗi |
+|---|---|---|
+| Đồng bộ | API Gateway, ALB, `aws lambda invoke` | Người gọi nhận lỗi và tự quyết định retry |
+| Bất đồng bộ | S3 event, SNS, EventBridge | Lambda tự retry; cấu hình on-failure destination/DLQ |
+| Event source mapping (poll) | SQS, Kinesis, DynamoDB Streams | Lambda poll theo batch; SQS lỗi → message hiện lại, quá số lần → DLQ |
+
+### API Gateway
+
+- **HTTP API**: đơn giản, rẻ hơn, hỗ trợ JWT authorizer — đủ cho đa số API proxy tới Lambda.
+- **REST API**: nhiều tính năng hơn (API keys, usage plans, request validation, WAF...).
+- Có giới hạn thời gian tích hợp (mặc định khoảng 29 giây) → việc lâu phải chuyển sang bất đồng bộ (SQS + worker).
+
+### SQS vs SNS vs EventBridge
+
+| | SQS | SNS | EventBridge |
+|---|---|---|---|
+| Mô hình | Queue (pull) | Pub/sub (push) | Event bus + rule |
+| Mỗi message tới | Một consumer | Mọi subscriber | Mọi target có rule khớp |
+| Lưu message | Có (retention tới 14 ngày) | Không | Không (có archive/replay tuỳ chọn) |
+| Dùng khi | Hàng đợi công việc, chống quá tải | Fan-out, thông báo | Định tuyến theo nội dung, event AWS/SaaS, lịch |
+
+- **Visibility timeout** SQS nên lớn hơn thời gian xử lý (với Lambda: thường ≥ 6 lần timeout của hàm theo khuyến nghị AWS).
+- Consumer phải **idempotent**: SQS Standard giao *at-least-once*, một message có thể tới hai lần.
+
+### S3 → Lambda resize ảnh
+
+```json title="notification.json"
+{
+  "LambdaFunctionConfigurations": [
+    {
+      "LambdaFunctionArn": "arn:aws:lambda:ap-southeast-1:123456789012:function:resize-image",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": { "Key": { "FilterRules": [{ "Name": "prefix", "Value": "uploads/" }] } }
+    }
+  ]
+}
+```
+
+```python title="app.py"
+import urllib.parse
+
+def handler(event, context):
+    for record in event["Records"]:
+        bucket = record["s3"]["bucket"]["name"]
+        key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+        # tải ảnh, resize, ghi sang bucket shop-thumbnails (KHÔNG ghi lại vào uploads/)
+        print(f"resizing s3://{bucket}/{key}")
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo hàm từ file zip", command: "aws lambda create-function --function-name resize-image --runtime python3.12 --handler app.handler --role arn:aws:iam::123456789012:role/resize-image-role --zip-file fileb://function.zip --timeout 30 --memory-size 512 --query State --output text", output: "Pending" },
+    { comment: "Cho phép S3 bucket gọi hàm", command: "aws lambda add-permission --function-name resize-image --statement-id s3-invoke --action lambda:InvokeFunction --principal s3.amazonaws.com --source-arn arn:aws:s3:::shop-uploads-123456789012 --source-account 123456789012" },
+    { command: "aws s3api put-bucket-notification-configuration --bucket shop-uploads-123456789012 --notification-configuration file://notification.json" },
+    { comment: "Upload thử và theo dõi log", command: "aws s3 cp cat.jpg s3://shop-uploads-123456789012/uploads/cat.jpg && aws logs tail /aws/lambda/resize-image --since 5m", output: "2026-09-14T08:12:03 START RequestId: 5f1e... Version: $LATEST\n2026-09-14T08:12:04 resizing s3://shop-uploads-123456789012/uploads/cat.jpg\n2026-09-14T08:12:04 END RequestId: 5f1e...\n2026-09-14T08:12:04 REPORT RequestId: 5f1e... Duration: 812.4 ms Billed Duration: 813 ms Memory Size: 512 MB Max Memory Used: 96 MB Init Duration: 402.7 ms" },
+    { comment: "Gửi việc vào hàng đợi", command: "aws sqs send-message --queue-url https://sqs.ap-southeast-1.amazonaws.com/123456789012/invoice-jobs --message-body '{\"orderId\":\"o-1001\"}'", output: "{\n    \"MD5OfMessageBody\": \"3c6e0b8a9c15224a8228b9a98ca1531d\",\n    \"MessageId\": \"a1b2c3d4-5678-90ab-cdef-EXAMPLE11111\"\n}" },
+    { comment: "Phát thông báo tới mọi subscriber", command: "aws sns publish --topic-arn arn:aws:sns:ap-southeast-1:123456789012:order-placed --message '{\"orderId\":\"o-1001\",\"total\":5000000}' --query MessageId --output text", output: "95df01b4-ee98-5cb9-9903-4c221d41eb5e" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Lambda ghi ảnh đã resize vào chính bucket/prefix đang kích hoạt nó.** Mỗi ảnh mới lại sinh event mới → vòng lặp vô hạn, hoá đơn tăng vọt. Ghi sang bucket khác hoặc prefix không nằm trong filter (Lambda có cơ chế phát hiện một số vòng lặp, nhưng đừng dựa vào nó).
+
+</Callout>
+
+<Callout type="warning">
+
+Không có DLQ/on-failure destination thì event bất đồng bộ lỗi sau vài lần retry sẽ **bị bỏ đi âm thầm**. Luôn cấu hình DLQ và alarm trên số message trong DLQ.
+
+</Callout>
+
+<Callout type="cost">
+
+Lambda tính theo số request và **GB-giây** (memory × thời gian chạy). Tăng memory đôi khi lại **rẻ hơn** vì hàm chạy nhanh hơn — đo bằng dòng `REPORT` trong log. Log group `/aws/lambda/...` mặc định giữ **vĩnh viễn** → đặt retention.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Execution role", meaning: "IAM role Lambda đảm nhận khi chạy, quyết định hàm được gọi dịch vụ nào." },
+    { term: "Cold start", meaning: "Độ trễ khi Lambda phải tạo môi trường chạy mới." },
+    { term: "Event source mapping", meaning: "Lambda tự poll SQS/Kinesis/DynamoDB Streams và gọi hàm theo batch." },
+    { term: "Visibility timeout", meaning: "Khoảng thời gian message SQS bị ẩn sau khi một consumer nhận." },
+    { term: "DLQ", meaning: "Dead-letter queue — nơi chứa message/event xử lý thất bại nhiều lần." },
+    { term: "Fan-out", meaning: "Một message SNS được giao tới nhiều subscriber cùng lúc." },
+    { term: "Event pattern", meaning: "Điều kiện JSON của rule EventBridge để chọn event cần chuyển tới target." },
+  ]}
+/>
+
+<QuickCheck
+  question="Lambda xử lý message từ SQS mất khoảng 2 phút, nhưng visibility timeout của queue là 30 giây. Chuyện gì dễ xảy ra?"
+  options={[
+    "Message hiện lại trong queue khi hàm chưa xong và bị xử lý trùng",
+    "SQS tự kéo dài timeout cho khớp",
+    "Lambda bị chặn không được đọc queue",
+    "Message bị chuyển ngay sang SNS",
+  ]}
+  answerIndex={0}
+  explanation="Thư trong 'hộp thư chờ' chỉ được giấu 30 giây. Người đầu chưa làm xong, thư đã hiện lại và người khác lấy làm tiếp → xử lý trùng. Đặt visibility timeout lớn hơn thời gian xử lý."
+/>
