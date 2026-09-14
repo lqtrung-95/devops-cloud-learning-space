@@ -1,0 +1,183 @@
+import { RolesHandlersNotifyFlowDiagram } from "../diagrams/roles-handlers-notify-flow-diagram";
+
+<Eli5 title="Role giống như một bộ dụng cụ đóng hộp sẵn theo nghề" emoji="🧰">
+
+Thợ sửa nhà không mang lộn xộn từng cái ốc vít ra hiện trường — họ có **hộp dụng cụ theo nghề**: hộp "điện", hộp "nước", hộp "sơn". Cần sửa nhà nào, họ mang đúng hộp cần dùng.
+
+**Role** trong Ansible là hộp dụng cụ đó: một thư mục đóng gói sẵn task, file cấu hình mẫu, biến mặc định cho **một mục đích** (`hardening`, `nginx`, `node_exporter`). Playbook chính chỉ việc "mang" đúng hộp tới đúng nhóm server.
+
+**Handler** giống quy tắc: "nếu vừa thay dây điện thì bật lại cầu dao — nhưng dù thay 5 dây, chỉ bật cầu dao **một lần** ở cuối, không bật tắt liên tục gây chớp đèn". **Vault** là cái két sắt nhỏ trong hộp dụng cụ, khoá riêng các thứ nhạy cảm (mật khẩu wifi, mã momo) mà bạn không muốn để lộ ra ngoài hộp.
+
+</Eli5>
+
+<RolesHandlersNotifyFlowDiagram />
+
+<Technical>
+
+### Cấu trúc thư mục của một role
+
+```text title="roles/hardening/"
+roles/hardening/
+├── tasks/
+│   └── main.yml           # danh sách task chính
+├── handlers/
+│   └── main.yml           # handler: restart ssh, restart fail2ban...
+├── templates/
+│   └── sshd_config.j2     # file cấu hình có biến {{ }}
+├── files/
+│   └── motd.txt           # file tĩnh, copy y nguyên
+├── vars/
+│   └── main.yml           # biến cố định của role
+└── defaults/
+    └── main.yml           # biến mặc định, dễ bị override nhất
+```
+
+`ansible-galaxy init roles/hardening` tạo sẵn khung này.
+
+### Handler: chỉ chạy khi được notify, chỉ chạy 1 lần
+
+```yaml title="roles/hardening/tasks/main.yml"
+- name: Copy sshd_config
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: /etc/ssh/sshd_config
+    mode: "0600"
+  notify: Restart sshd
+
+- name: Đặt PermitRootLogin no
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^PermitRootLogin"
+    line: "PermitRootLogin no"
+  notify: Restart sshd
+```
+
+```yaml title="roles/hardening/handlers/main.yml"
+- name: Restart sshd
+  ansible.builtin.service:
+    name: ssh
+    state: restarted
+```
+
+Cả hai task đều `notify: Restart sshd`, nhưng handler chỉ chạy **một lần**, sau khi mọi task trong play đã chạy xong. Nếu lần chạy sau không task nào `changed`, handler **không chạy** — nginx/sshd không bị restart vô cớ, tránh gây gián đoạn không cần thiết.
+
+### Template với Jinja2
+
+```text title="roles/nginx/templates/nginx.conf.j2"
+server {
+  listen {{ app_port }};
+  server_name {{ server_name | default('_') }};
+
+  location /health {
+    return 200 "ok\n";
+  }
+
+  location / {
+    proxy_pass http://127.0.0.1:{{ upstream_port }};
+  }
+}
+```
+
+```yaml title="roles/nginx/tasks/main.yml"
+- name: Render nginx.conf
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/sites-available/app.conf
+  notify: Restart nginx
+```
+
+Cú pháp `{{ ten_bien }}` là Jinja2 — Ansible thay giá trị thực khi render. `default(...)` cho giá trị dự phòng nếu biến chưa được đặt.
+
+### Vault: mã hoá secret trong Git
+
+```bash
+ansible-vault create group_vars/web/vault.yml
+```
+
+```yaml title="group_vars/web/vault.yml (nội dung sau khi giải mã)"
+vault_db_password: "S3cret!Prod"
+```
+
+```yaml title="group_vars/web/vars.yml"
+db_password: "{{ vault_db_password }}"
+```
+
+File `vault.yml` được **mã hoá AES256** trên đĩa — commit vào Git an toàn. Chạy playbook cần cung cấp mật khẩu vault:
+
+```bash
+ansible-playbook site.yml --ask-vault-pass
+# hoặc, cho CI:
+ansible-playbook site.yml --vault-password-file .vault_pass.txt
+```
+
+`.vault_pass.txt` **không** commit vào Git — trong CI, lấy từ Secrets Manager/GitHub Secrets. Đây là nguyên tắc giống hệt cách bạn tránh commit `terraform.tfstate` hay private key SSH ở các module trước.
+
+### Cấu trúc site.yml gọi nhiều role
+
+```yaml title="site.yml"
+- name: Cấu hình web server
+  hosts: web
+  become: true
+  roles:
+    - hardening
+    - nginx
+    - node_exporter
+```
+
+Thứ tự role trong danh sách là thứ tự chạy — `hardening` (users, ssh, ufw) nên chạy trước để đảm bảo nền tảng an toàn trước khi cài app.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo khung role", command: "ansible-galaxy init roles/hardening", output: "- Role roles/hardening was created successfully" },
+    { comment: "Mã hoá file chứa mật khẩu", command: "ansible-vault create group_vars/web/vault.yml", output: "New Vault password: \nConfirm New Vault password: " },
+    { comment: "Xem nội dung đã mã hoá (không đọc được)", command: "cat group_vars/web/vault.yml | head -1", output: "$ANSIBLE_VAULT;1.1;AES256" },
+    { comment: "Sửa nội dung khi cần (tự động giải mã, sửa, mã hoá lại)", command: "ansible-vault edit group_vars/web/vault.yml" },
+    { comment: "Chạy playbook với vault", command: "ansible-playbook site.yml -i inventory.ini --vault-password-file .vault_pass.txt", output: "PLAY RECAP *************************************************************\nweb-1  : ok=9  changed=3  unreachable=0  failed=0\nweb-2  : ok=9  changed=3  unreachable=0  failed=0" },
+    { comment: "Chạy lại: chỉ sshd_config đổi 1 dòng, handler Restart sshd vẫn chỉ chạy 1 lần", command: "ansible-playbook site.yml -i inventory.ini --vault-password-file .vault_pass.txt", output: "TASK [hardening : Đặt PermitRootLogin no] *****\nchanged: [web-1]\n\nRUNNING HANDLER [hardening : Restart sshd] *****\nchanged: [web-1]\n\nPLAY RECAP *************************************************************\nweb-1  : ok=9  changed=1  unreachable=0  failed=0" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Đặt `service: state: restarted` trực tiếp trong task thay vì dùng handler.** Task chạy mỗi lần playbook thực thi, kể cả khi cấu hình không đổi — làm service bị restart không cần thiết, gây gián đoạn nhỏ mỗi lần deploy. Handler đảm bảo restart chỉ khi thật sự có thay đổi.
+
+</Callout>
+
+<Callout type="warning" title="Commit nhầm .vault_pass.txt hoặc vault chưa mã hoá">
+
+Trước khi `git add`, chạy `ansible-vault view group_vars/web/vault.yml` để chắc chắn file **đã** mã hoá (bắt đầu bằng `$ANSIBLE_VAULT`). Thêm `.vault_pass.txt` vào `.gitignore` ngay từ đầu — không đợi tới lúc lỡ commit.
+
+</Callout>
+
+<Callout type="cost">
+
+`ansible-galaxy` cũng cài được role/collection cộng đồng (`geerlingguy.nginx`, `amazon.aws`…) — tiết kiệm thời gian viết lại role phổ biến, nhưng hãy đọc qua task bên trong trước khi chạy trên fleet thật, đặc biệt role đụng tới firewall hay user.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Role", meaning: "Thư mục đóng gói task, template, handler, biến cho một mục đích cụ thể, tái sử dụng được." },
+    { term: "Handler", meaning: "Task đặc biệt chỉ chạy khi được notify, và chạy đúng 1 lần ở cuối play." },
+    { term: "notify", meaning: "Từ khoá trong task báo hiệu 'nếu changed thì gọi handler này'." },
+    { term: "Jinja2 template", meaning: "Cú pháp {{ bien }} dùng để render file cấu hình có giá trị động." },
+    { term: "Ansible Vault", meaning: "Công cụ mã hoá AES256 cho file chứa secret, an toàn để commit vào Git." },
+    { term: "defaults vs vars", meaning: "defaults dễ bị override nhất (ưu tiên thấp), vars có ưu tiên cao hơn trong role." },
+  ]}
+/>
+
+<QuickCheck
+  question="Playbook có 4 task cùng `template` 4 file cấu hình khác nhau của Nginx, cả 4 đều `notify: Restart nginx`. Lần chạy này cả 4 file đều thay đổi. Nginx bị restart bao nhiêu lần?"
+  options={[
+    "4 lần, mỗi lần một task changed",
+    "0 lần vì template không kích hoạt được handler",
+    "Đúng 1 lần, sau khi toàn bộ task trong play đã chạy xong",
+    "2 lần, vì Ansible gộp mỗi 2 notify thành 1"
+  ]}
+  answerIndex={2}
+  explanation="Giống quy tắc bật cầu dao: dù thay bao nhiêu dây điện trong lượt sửa này, cầu dao chỉ bật lại một lần ở cuối. Ansible dedupe notify trong cùng một play, handler chạy đúng 1 lần."
+/>

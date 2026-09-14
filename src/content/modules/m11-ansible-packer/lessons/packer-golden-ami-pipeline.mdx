@@ -1,0 +1,203 @@
+import { PackerGoldenAmiPipelineDiagram } from "../diagrams/packer-golden-ami-pipeline-diagram";
+
+<Eli5 title="Packer giống như nướng một mẻ bánh mẫu để nhân bản" emoji="🥐">
+
+Bạn muốn mở 10 chi nhánh bánh mì giống hệt nhau. Thay vì dạy 10 đầu bếp cùng làm tay (dễ mỗi người nêm khác nhau — mutable), bạn **nướng một ổ bánh mẫu hoàn chỉnh**, chụp công thức thành khuôn đúc, rồi mỗi chi nhánh chỉ việc **đúc lại từ khuôn** đó. Ổ nào ra cũng giống hệt ổ nào.
+
+Packer là cái "máy đúc khuôn": nó **thuê tạm 1 máy** (EC2 tạm), nhờ Ansible "nướng bánh" (cài đặt, hardening) lên máy đó, rồi **chụp lại thành khuôn** (AMI) và **trả máy tạm về**. Từ đó, mỗi lần cần server web mới, bạn đúc thẳng từ khuôn — không cần nướng lại từ đầu.
+
+</Eli5>
+
+Đây là bước hoàn thiện vòng lặp immutable đã học ở bài 1: Ansible không còn chạy trên fleet đang phục vụ khách hàng nữa — nó chạy **một lần duy nhất** trên máy tạm, lúc build image.
+
+<PackerGoldenAmiPipelineDiagram />
+
+<Technical>
+
+### Packer template (HCL — cú pháp giống Terraform)
+
+```hcl title="web.pkr.hcl"
+packer {
+  required_plugins {
+    amazon = {
+      version = ">= 1.3.0"
+      source  = "github.com/hashicorp/amazon"
+    }
+  }
+}
+
+variable "ami_prefix" {
+  type    = string
+  default = "web-golden"
+}
+
+source "amazon-ebs" "web" {
+  region        = "ap-southeast-1"
+  instance_type = "t3.micro"
+  ssh_username  = "ubuntu"
+
+  source_ami_filter {
+    filters = {
+      name                = "ubuntu/images/*ubuntu-jammy-22.04-amd64-server-*"
+      virtualization-type = "hvm"
+      root-device-type    = "ebs"
+    }
+    owners      = ["099720109477"] # Canonical — kiểm tra ID mới nhất trên tài liệu AWS
+    most_recent = true
+  }
+
+  ami_name = "${var.ami_prefix}-${formatdate("YYYY-MM-DD-hhmm", timestamp())}"
+
+  tags = {
+    ManagedBy = "packer"
+    Pipeline  = "web"
+  }
+}
+
+build {
+  sources = ["source.amazon-ebs.web"]
+
+  provisioner "ansible" {
+    playbook_file = "./ansible/site.yml"
+    extra_arguments = [
+      "--extra-vars", "env=golden"
+    ]
+  }
+
+  provisioner "shell" {
+    inline = ["sudo cloud-init clean", "sudo rm -f /etc/machine-id"]
+  }
+}
+```
+
+Cấu trúc rất giống Terraform: `source` khai báo "lấy nguyên liệu ở đâu" (AMI gốc), `build` khai báo "làm gì với nguyên liệu đó" (provisioner). Bước `cloud-init clean` đảm bảo mỗi instance đúc từ AMI này sẽ tự sinh `machine-id`/hostname riêng thay vì trùng nhau.
+
+### Provisioner ansible dùng lại đúng playbook đã viết
+
+```yaml title="ansible/site.yml"
+- name: Build golden image
+  hosts: all
+  become: true
+  roles:
+    - hardening
+    - nginx
+    - node_exporter
+```
+
+Packer tự tạo inventory tạm chỉ chứa 1 host (máy build), nên `hosts: all` là đủ — không cần sửa lại các role đã viết ở bài trước.
+
+### Build và lấy AMI ID
+
+```bash
+packer init web.pkr.hcl
+packer validate web.pkr.hcl
+packer build web.pkr.hcl
+```
+
+Packer in AMI ID cuối cùng dạng `ap-southeast-1: ami-0abc123def456789a`. Trong CI, lệnh này thường kèm `-machine-readable` để parse ID tự động, hoặc dùng `manifest` post-processor ghi ra file JSON.
+
+### Terraform tiêu thụ AMI mới
+
+```hcl title="modules/alb-asg/main.tf"
+data "aws_ami" "web_golden" {
+  most_recent = true
+  owners      = ["self"]
+
+  filter {
+    name   = "name"
+    values = ["web-golden-*"]
+  }
+
+  filter {
+    name   = "tag:Pipeline"
+    values = ["web"]
+  }
+}
+
+resource "aws_launch_template" "web" {
+  name_prefix   = "web-"
+  image_id      = data.aws_ami.web_golden.id
+  instance_type = var.instance_type
+
+  # create_before_destroy tránh downtime khi launch template bị thay thế
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_autoscaling_group" "web" {
+  # ...
+  launch_template {
+    id      = aws_launch_template.web.id
+    version = "$Latest"
+  }
+
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 90
+    }
+  }
+}
+```
+
+`instance_refresh` (bạn đã thấy khái niệm ASG ở M07) khiến ASG **tự thay dần** từng instance cũ sang AMI mới, theo dõi health check, dừng lại nếu tỉ lệ instance khoẻ mạnh tụt dưới ngưỡng.
+
+### CI pipeline hoàn chỉnh
+
+```text
+1. PR sửa role Ansible hoặc web.pkr.hcl
+2. CI: packer validate → packer build → AMI mới (tag Pipeline=web, CommitSha=...)
+3. CI: cập nhật launch template qua Terraform apply (OIDC, giống M10) → chỉ vào bản mới nhất bằng data source hoặc pin AMI ID qua biến
+4. ASG instance refresh rollout dần; rollback = trỏ launch template về AMI cũ
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { command: "packer init web.pkr.hcl", output: "Installed plugin github.com/hashicorp/amazon v1.3.3" },
+    { command: "packer validate web.pkr.hcl", output: "The configuration is valid." },
+    { command: "packer build web.pkr.hcl", output: "amazon-ebs.web: Prevalidating any provided VPC information\namazon-ebs.web: Creating temporary keypair: packer_...\namazon-ebs.web: Launching a source AWS instance...\namazon-ebs.web: Instance ID: i-0a1b2c3d4e5f60003\n==> amazon-ebs.web: Provisioning with Ansible...\n    amazon-ebs.web: PLAY RECAP *********************************************************\n    amazon-ebs.web: default  : ok=9  changed=6  unreachable=0  failed=0\n==> amazon-ebs.web: Stopping the source instance...\n==> amazon-ebs.web: Creating AMI web-golden-2026-09-14-0931 from instance i-0a1b2c3d4e5f60003\n==> amazon-ebs.web: Terminating the source AWS instance...\nBuild 'amazon-ebs.web' finished.\n\n==> Builds finished. The artifacts of successful builds are:\n--> amazon-ebs.web: AMIs were created:\nap-southeast-1: ami-0abc123def456789a" },
+    { comment: "Terraform nhặt đúng AMI mới nhất qua data source", command: "cd ../infra/envs/dev && terraform plan", output: "  # aws_launch_template.web must be replaced\n-/+ resource \"aws_launch_template\" \"web\" {\n      ~ image_id = \"ami-0old111...\" -> \"ami-0abc123def456789a\" # forces replacement\n\nPlan: 1 to add, 0 to change, 1 to destroy." },
+    { command: "terraform apply -auto-approve", output: "aws_autoscaling_group.web: Modifying...\naws_autoscaling_group.web: Still modifying... [Instance refresh in progress]\nApply complete! Resources: 1 added, 1 changed, 1 destroyed." },
+    { comment: "Theo dõi rollout", command: "aws autoscaling describe-instance-refreshes --auto-scaling-group-name web --query 'InstanceRefreshes[0].[Status,PercentageComplete]' --output text", output: "InProgress    60" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Để lại `authorized_keys` của Packer hoặc `machine-id` trùng nhau trong AMI.** Packer tự dọn keypair tạm, nhưng `cloud-init clean` và xoá `/etc/machine-id` là bước bạn phải tự thêm — thiếu nó có thể gây trùng DHCP lease hoặc log lẫn lộn giữa các instance đúc từ cùng AMI.
+
+</Callout>
+
+<Callout type="warning" title="AMI cũ vẫn tính phí lưu trữ EBS snapshot">
+
+Mỗi lần build tạo AMI mới, AMI cũ không tự xoá. Đặt vòng đời dọn dẹp (giữ N bản mới nhất, ví dụ qua `aws ec2 deregister-image` + xoá snapshot liên quan) để tránh chi phí lưu trữ tăng dần.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Packer", meaning: "Công cụ HashiCorp build image (AMI, Docker...) tự động từ một cấu hình khai báo." },
+    { term: "source (Packer)", meaning: "Khai báo image gốc và loại máy tạm dùng để build." },
+    { term: "provisioner", meaning: "Bước cấu hình chạy trên máy tạm trong lúc build — có thể gọi Ansible, shell script." },
+    { term: "golden AMI", meaning: "Image đã cài đặt, hardening sẵn, dùng làm khuôn cho mọi instance mới." },
+    { term: "instance refresh", meaning: "Cơ chế ASG tự thay dần instance cũ bằng instance từ launch template mới." },
+    { term: "create_before_destroy", meaning: "Lifecycle rule tạo bản mới trước khi xoá bản cũ, tránh gián đoạn khi thay launch template." },
+  ]}
+/>
+
+<QuickCheck
+  question="Sau khi Packer build xong AMI mới và Terraform apply cập nhật launch template, một vài request tới ALB trả lỗi 502 trong vài phút rồi hết. Nguyên nhân nhiều khả năng nhất là gì?"
+  options={[
+    "Ansible Vault sai mật khẩu",
+    "AMI mới bị lỗi cú pháp Packer HCL",
+    "ASG đang instance refresh: instance cũ bị rút dần trong khi instance mới chưa pass health check xong — bình thường nếu tự hết sau khi rollout hoàn tất",
+    "Terraform state bị khoá bởi người khác"
+  ]}
+  answerIndex={2}
+  explanation="instance_refresh thay dần từng instance; trong lúc rollout, ALB có thể tạm thời có ít capacity hơn hoặc route tới instance vừa khởi động chưa healthy. Đây là hành vi mong đợi nếu ngắn hạn và tự hết — khác với lỗi build hay lock state."
+/>

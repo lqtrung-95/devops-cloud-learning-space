@@ -1,0 +1,115 @@
+import { ConfigToolDecisionDiagram } from "../diagrams/config-tool-decision-diagram";
+
+<Eli5 title="Ba cách giao việc cho một nhân viên mới" emoji="🧭">
+
+Cách 1: nhân viên đã làm việc lâu năm (server đang chạy), bạn **gọi điện dặn thêm việc** bất cứ lúc nào — đó là Ansible qua SSH.
+
+Cách 2: nhân viên **mới vào ngày đầu tiên** được đưa một tờ hướng dẫn ngắn để tự đọc rồi bắt tay vào việc, không ai theo sát sau đó — đó là EC2 user data, chỉ chạy một lần lúc "sinh ra".
+
+Cách 3: bạn **không tuyển và đào tạo nữa** — bạn thuê hẳn một đội đã được training bài bản y hệt nhau từ trước (golden image/container), đội nào cũng làm việc giống hệt đội kia. Muốn đổi quy trình, bạn đào tạo lại **cả đội mới** thay vì huấn luyện lại đội cũ.
+
+Không có cách nào "luôn đúng" — công ty thật dùng cả ba tuỳ vị trí công việc.
+
+</Eli5>
+
+<ConfigToolDecisionDiagram />
+
+<Technical>
+
+### Ba lựa chọn và khi nào dùng
+
+**1. Ansible qua SSH (mutable, đã học ở bài 2–3)**
+
+- Phù hợp: server sống lâu, ít instance (bastion host, CI self-hosted runner, một vài server nền tảng), cần đổi cấu hình thường xuyên mà không muốn rebuild image mỗi lần.
+- Rủi ro: nếu không kỷ luật (luôn chạy qua playbook, không SSH tay sửa trực tiếp), dễ quay lại configuration drift đã học ở bài 1.
+
+**2. EC2 user data (chạy 1 lần lúc boot)**
+
+```bash title="user_data.sh"
+#!/bin/bash
+set -euo pipefail
+echo "ECS_CLUSTER=shop-prod" >> /etc/ecs/ecs.config
+/usr/bin/aws ssm get-parameter --name /shop/api-token --with-decryption \
+  --query Parameter.Value --output text > /etc/app/token
+systemctl restart app-agent
+```
+
+- Chạy **một lần duy nhất** khi instance khởi động, log ở `/var/log/cloud-init-output.log`.
+- Phù hợp: vài dòng bootstrap đơn giản — set hostname, join ECS cluster, tải 1 file config từ SSM.
+- Không phù hợp: logic phức tạp, cần idempotency chặt chẽ, hoặc phải áp dụng lại cho instance **đang chạy** (user data không tự chạy lại khi bạn sửa nó, trừ khi thay instance).
+
+**3. Golden image / container (immutable, bài 4)**
+
+- Phù hợp: fleet lớn cần nhất quán tuyệt đối, muốn rollback tức thì, production app chạy dài hạn trên ASG.
+- Đánh đổi: vòng lặp thay đổi chậm hơn (phải build + rollout) so với SSH sửa tại chỗ.
+
+### Ma trận quyết định nhanh
+
+| Tình huống | Chọn |
+|---|---|
+| Vá bảo mật khẩn cấp trên fleet 50 server đang chạy, không kịp build lại image | Ansible ad-hoc (`ansible web -m apt -a "name=openssl state=latest"`) — rồi vẫn nên đưa fix vào golden image cho lần build tới |
+| App production chạy trên ASG, cần scale nhanh và consistency | Golden image (Packer) hoặc container image |
+| Set 3 biến môi trường + tải 1 binary lúc EC2 khởi động | User data |
+| Cấu hình bastion host dùng nhiều năm, ít khi đổi | Ansible, chạy định kỳ hoặc mỗi khi có thay đổi |
+| Microservice chạy trên container orchestrator (K8s — học ở M12) | Container image, không dùng Ansible/user data cho app logic |
+
+### Kết hợp cả ba trong một hệ thống thật
+
+```text
+1. Packer + Ansible role "hardening" + "node_exporter"  → golden AMI dùng chung cho MỌI server
+2. Terraform launch template dùng golden AMI              → mỗi ASG (web, worker) kế thừa nền tảng đã hardening
+3. User data ngắn trên launch template                    → chỉ set biến riêng cho từng ASG (APP_ROLE=web)
+4. Ansible ad-hoc                                          → dùng khi cần vá khẩn cấp giữa hai lần build AMI
+```
+
+Nền tảng (OS, security baseline, monitoring agent) đi qua golden image; cấu hình đặc thù từng lần scale đi qua user data ngắn; và Ansible vẫn giữ vai trò công cụ vận hành/khẩn cấp.
+
+### Container: khi nào KHÔNG cần Ansible/Packer nữa
+
+Nếu app của bạn đã đóng gói bằng `Dockerfile` (M04) và chạy trên ECS/Kubernetes, bạn thường **không cần Ansible cho chính app đó** — image Docker đã đóng vai trò golden image ở tầng ứng dụng. Ansible/Packer khi đó lùi về vai trò chuẩn bị **node nền tảng** (worker node của cluster, bastion, CI runner) — nội dung sẽ gặp lại ở M12–M13 khi build node group cho EKS.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Ad-hoc command: vá khẩn cấp không cần viết playbook", command: "ansible web -i inventory.aws_ec2.yml -m apt -a \"name=openssl state=latest\" --become", output: "web-1 | CHANGED => {\"changed\": true}\nweb-2 | CHANGED => {\"changed\": true}\nweb-3 | CHANGED => {\"changed\": true}" },
+    { comment: "Xem log user data đã chạy gì lúc boot", command: "ssh web-1 'sudo cat /var/log/cloud-init-output.log | tail -5'", output: "Cloud-init v. 23.4 running 'modules:final' at ...\n+ echo ECS_CLUSTER=shop-prod\n+ systemctl restart app-agent\nCloud-init v. 23.4 finished." },
+    { comment: "Kiểm tra AMI nào đang chạy trên fleet hiện tại", command: "aws ec2 describe-instances --filters Name=tag:Role,Values=web --query 'Reservations[].Instances[].[InstanceId,ImageId]' --output table" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Dùng Ansible ad-hoc để vá lỗi khẩn cấp rồi quên đưa fix vào golden image.** Lần build AMI tiếp theo sẽ "quên" bản vá đó, và instance mới tạo ra sẽ lại thiếu fix. Luôn cập nhật role Ansible tương ứng ngay sau khi vá khẩn cấp.
+
+</Callout>
+
+<Callout type="info" title="Ôn thi Terraform Associate">
+
+Nội dung M10–M11 cũng là nền tảng tốt nếu bạn định ôn **HashiCorp Certified: Terraform Associate** — kiểm tra mã đề và nội dung thi hiện hành trên trang HashiCorp trước khi đăng ký.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "User data", meaning: "Script chạy đúng 1 lần khi EC2 khởi động, không tự chạy lại sau đó." },
+    { term: "Ad-hoc command", meaning: "Lệnh Ansible một dòng (không cần playbook) cho việc nhanh, một lần." },
+    { term: "Configuration drift", meaning: "Rủi ro chính khi lạm dụng Ansible/SSH sửa tay mà không kỷ luật." },
+    { term: "Golden image", meaning: "Image chuẩn hoá dùng cho mọi instance mới, đối lập với sửa tại chỗ." },
+    { term: "cloud-init", meaning: "Dịch vụ trên Linux xử lý user data lúc boot, log tại /var/log/cloud-init-output.log." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một lỗ hổng OpenSSL nghiêm trọng vừa công bố, cần vá NGAY trên 40 server web đang chạy production, trong khi pipeline build golden AMI mới mất khoảng 30 phút để chạy xong và review. Team nên làm gì trước tiên?"
+  options={[
+    "Đợi merge PR sửa role Ansible, build AMI mới rồi mới vá",
+    "Chạy Ansible ad-hoc vá ngay trên fleet đang chạy, đồng thời mở PR cập nhật role hardening để lần build AMI tới có sẵn bản vá",
+    "Sửa user data của launch template và đợi ASG tự thay hết instance",
+    "Không làm gì vì container/golden image đã là immutable, không cần vá",
+  ]}
+  answerIndex={1}
+  explanation="Tình huống khẩn cấp trên fleet đang chạy là đúng chỗ dùng Ansible (mutable, nhanh). Nhưng phải nhớ đưa fix vào golden image ngay sau đó, nếu không AMI lần sau lại thiếu bản vá. User data không áp dụng lại cho instance đang chạy."
+/>

@@ -1,0 +1,155 @@
+import { AnsibleArchitectureIdempotencyDiagram } from "../diagrams/ansible-architecture-idempotency-diagram";
+
+<Eli5 title="Ansible giống như một quản lý đi kiểm tra từng cửa hàng theo checklist" emoji="📋">
+
+Bạn quản lý chuỗi 3 cửa hàng. Thay vì thuê 1 nhân viên thường trực ở mỗi cửa hàng (agent), bạn cầm **một cuốn checklist** (playbook) và **danh sách địa chỉ** (inventory), rồi đích thân **ghé từng cửa hàng** (SSH) kiểm tra.
+
+Checklist ghi: "đèn biển hiệu phải bật — nếu đang tắt thì bật lên". Đến cửa hàng đầu, đèn tắt → bạn bật (**changed**). Đến cửa hàng đã có ai bật sẵn → bạn không làm gì (**ok**). Không bao giờ bạn "bật thêm một đèn nữa cho chắc" — mỗi mục trong checklist là "phải đạt trạng thái X", không phải "làm hành động Y".
+
+Tuần sau bạn cầm checklist y hệt đi lại — nếu mọi cửa hàng đã đúng, chuyến đi báo cáo toàn "ok", không đổi gì. Đó chính là **idempotency**.
+
+</Eli5>
+
+<AnsibleArchitectureIdempotencyDiagram />
+
+<Technical>
+
+### Kiến trúc agentless
+
+Control node (máy bạn chạy `ansible-playbook`) kết nối tới host đích qua **SSH** (giống bài SSH ở M01), đẩy một **module Python** nhỏ lên chạy, đọc kết quả JSON trả về, rồi xoá module đó đi. Không có tiến trình nào chạy nền trên host khi không ai gọi Ansible — khác với Chef/Puppet cần agent thường trực.
+
+Yêu cầu tối thiểu trên host đích: có Python 3 và cho phép SSH key-based (không cần cài Ansible trên đó).
+
+### Inventory: khai báo host nào, nhóm nào
+
+```ini title="inventory.ini"
+[web]
+web-1 ansible_host=10.0.1.11
+web-2 ansible_host=10.0.1.12
+web-3 ansible_host=10.0.1.13
+
+[db]
+db-1 ansible_host=10.0.2.10
+
+[web:vars]
+ansible_user=ubuntu
+ansible_ssh_private_key_file=~/.ssh/lab_ed25519
+
+[all:children]
+web
+db
+```
+
+`[web:vars]` gán biến cho cả nhóm `web`. `[all:children]` gom nhóm để `ansible all` chạy trên mọi host.
+
+Với AWS, dùng **dynamic inventory** thay vì gõ tay IP — plugin `amazon.aws.aws_ec2` tự truy vấn EC2 theo tag:
+
+```yaml title="inventory.aws_ec2.yml"
+plugin: amazon.aws.aws_ec2
+regions:
+  - ap-southeast-1
+filters:
+  tag:Role: web
+  instance-state-name: running
+keyed_groups:
+  - key: tags.Environment
+    prefix: env
+```
+
+```bash
+ansible-inventory -i inventory.aws_ec2.yml --graph
+```
+
+Dynamic inventory quan trọng vì ASG liên tục thay instance — IP tĩnh trong file `.ini` sẽ lỗi thời ngay.
+
+### Playbook, play, task
+
+```yaml title="site.yml"
+---
+- name: Cấu hình web server
+  hosts: web
+  become: true
+  vars:
+    app_port: 8080
+
+  tasks:
+    - name: Cài Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+
+    - name: Đảm bảo Nginx đang chạy và bật cùng hệ thống
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Tạo thư mục app
+      ansible.builtin.file:
+        path: /opt/app
+        state: directory
+        owner: ubuntu
+        mode: "0755"
+```
+
+- **Playbook** = file YAML chứa 1+ **play**.
+- **Play** = ánh xạ một nhóm host (`hosts: web`) với một danh sách task.
+- **Task** = gọi 1 **module** (`apt`, `service`, `file`, `copy`, `template`, `user`…) với tham số mô tả **trạng thái mong muốn**, không phải hành động.
+- `become: true` = chạy bằng `sudo` (giống `sudo` ở M01).
+
+### Idempotency: sao mà tự biết "đã đúng chưa"?
+
+Mỗi module tự kiểm tra trước khi hành động: `apt` hỏi dpkg xem package đã cài chưa; `service` hỏi systemd xem đã `enabled` + `started` chưa; `file` so `mode`/`owner` hiện tại với giá trị khai báo. Nếu đã khớp → trạng thái `ok`, không có lệnh hệ thống nào thực sự chạy. Nếu chưa khớp → `changed`, module thực hiện đúng phần chênh lệch.
+
+Ba trạng thái Ansible trả về mỗi task: `ok` (đã đúng), `changed` (vừa sửa), `failed` (lỗi) — rất giống cách đọc `+ ~ -` của Terraform plan mà bạn đã quen ở M10.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra cú pháp trước khi chạy thật", command: "ansible-playbook site.yml -i inventory.ini --syntax-check", output: "playbook: site.yml" },
+    { comment: "Chạy thử, không đổi gì thật (dry-run)", command: "ansible-playbook site.yml -i inventory.ini --check --diff" },
+    { comment: "Chạy thật lần đầu", command: "ansible-playbook site.yml -i inventory.ini", output: "PLAY [Cấu hình web server] ****************************************\n\nTASK [Cài Nginx] ****************************************************\nchanged: [web-1]\nchanged: [web-2]\nchanged: [web-3]\n\nTASK [Đảm bảo Nginx đang chạy và bật cùng hệ thống] ******************\nchanged: [web-1]\nchanged: [web-2]\nchanged: [web-3]\n\nPLAY RECAP *************************************************************\nweb-1  : ok=3  changed=2  unreachable=0  failed=0\nweb-2  : ok=3  changed=2  unreachable=0  failed=0\nweb-3  : ok=3  changed=2  unreachable=0  failed=0" },
+    { comment: "Chạy lại y hệt — minh chứng idempotency", command: "ansible-playbook site.yml -i inventory.ini", output: "PLAY RECAP *************************************************************\nweb-1  : ok=3  changed=0  unreachable=0  failed=0\nweb-2  : ok=3  changed=0  unreachable=0  failed=0\nweb-3  : ok=3  changed=0  unreachable=0  failed=0" },
+    { comment: "Chỉ chạy trên 1 host để debug nhanh", command: "ansible-playbook site.yml -i inventory.ini --limit web-2 -vv" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Dùng module `command`/`shell` cho việc đã có module chuyên dụng.** `command: apt-get install -y nginx` chạy lại lần nào cũng báo `changed` (Ansible không biết cách kiểm tra trạng thái của lệnh tuỳ ý) — mất tính idempotent. Luôn ưu tiên module có sẵn (`apt`, `service`, `copy`, `template`, `user`…); chỉ dùng `command`/`shell` khi thật sự không có module, và cân nhắc thêm `creates:`/`changed_when:` để kiểm soát.
+
+</Callout>
+
+<Callout type="tip" title="--check --diff trước khi chạy thật trên prod">
+
+`--check` mô phỏng thay đổi mà không thực thi (giống `terraform plan`). Thêm `--diff` để xem nội dung file trước/sau khi `template`/`copy` sẽ đổi.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Control node", meaning: "Máy chạy ansible-playbook, kết nối tới host đích qua SSH." },
+    { term: "Inventory", meaning: "Danh sách host và nhóm host — tĩnh (.ini/.yml) hoặc động (plugin AWS)." },
+    { term: "Playbook", meaning: "File YAML gồm một hoặc nhiều play mô tả trạng thái mong muốn." },
+    { term: "Module", meaning: "Đơn vị thực thi (apt, service, template…) tự kiểm tra rồi mới hành động." },
+    { term: "Idempotent", meaning: "Chạy nhiều lần cho cùng kết quả; lần sau không đổi gì báo changed=0." },
+    { term: "become", meaning: "Chạy task bằng quyền cao hơn (thường là sudo)." },
+    { term: "--check / --diff", meaning: "Cờ mô phỏng thay đổi (dry-run) và hiển thị nội dung file sẽ đổi." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một task dùng `ansible.builtin.command: systemctl restart nginx` và báo `changed` ở MỌI lần chạy, kể cả khi không có gì thay đổi. Vì sao, và nên sửa thế nào?"
+  options={[
+    "Vì nginx bị lỗi liên tục — cần xem log nginx",
+    "Vì module command không tự kiểm tra trạng thái trước khi chạy lệnh — nên đổi sang module service với state: restarted chỉ khi cần, hoặc dùng handler notify",
+    "Vì thiếu become: true nên lệnh luôn thất bại rồi tự retry",
+    "Vì inventory chưa khai báo ansible_user",
+  ]}
+  answerIndex={1}
+  explanation="command/shell luôn báo changed vì Ansible không biết cách 'hỏi trạng thái hiện tại' của một lệnh tuỳ ý — như quản lý chỉ được dặn 'bật đèn' mà không có checklist để so sánh. Module chuyên dụng (service) hoặc handler chỉ restart khi có notify mới giữ được idempotency."
+/>

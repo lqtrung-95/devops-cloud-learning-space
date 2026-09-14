@@ -1,0 +1,100 @@
+import { MutableVsImmutableInfrastructureDiagram } from "../diagrams/mutable-vs-immutable-infrastructure-diagram";
+
+<Eli5 title="Sửa nhà tại chỗ vs đập đi xây căn mới" emoji="🏚️">
+
+Nhà bạn cũ, bạn muốn thêm 1 phòng. Cách 1: gọi thợ tới, đục tường, xây thêm, sơn lại — nhà cũ **được sửa dần** qua từng lần thợ ghé. Vài năm sau, không ai nhớ hết những gì đã sửa: ống nước chỗ này thợ A làm, ổ điện chỗ kia thợ B thêm. Đây là **mutable infrastructure**.
+
+Cách 2: bạn có **bản thiết kế nhà mẫu** đã tính đủ phòng. Muốn đổi thiết kế, bạn không sửa nhà cũ — bạn **xây một căn mới đúng bản thiết kế mới**, chuyển đồ qua, rồi phá căn cũ. Đây là **immutable infrastructure**: server không bao giờ bị "sửa tại chỗ", chỉ bị **thay thế** bằng server mới từ image đã build sẵn.
+
+Ở M01 bạn đã viết `backup.sh` chạy tay trên 1 VM — sửa cấu hình bằng SSH là bình thường. Module này học cách làm điều đó **có hệ thống, lặp lại được** cho hàng chục server (Ansible), và cách tiến thêm một bước để **không sửa tại chỗ nữa** (Packer + immutable).
+
+</Eli5>
+
+Ở M10 bạn đã học Terraform **tạo** VPC, EC2, RDS — đó là **provisioning**. Nhưng Terraform không biết cách cài Nginx, tạo user Linux, hay đẩy file cấu hình vào bên trong một server đang chạy. Đó là việc của **configuration management**.
+
+<MutableVsImmutableInfrastructureDiagram />
+
+<Technical>
+
+### Provisioning vs configuration management
+
+| | Provisioning (Terraform) | Configuration management (Ansible) |
+|---|---|---|
+| Câu hỏi trả lời | "Tài nguyên nào tồn tại?" (VPC, EC2, RDS) | "Bên trong server có gì?" (package, user, file config) |
+| Đơn vị quản lý | Tài nguyên cloud (qua API) | Trạng thái hệ điều hành (qua SSH/agent) |
+| Trạng thái | State file | Không bắt buộc (mỗi lần chạy tự kiểm tra thực tế) |
+| Ví dụ | `aws_instance.web` | `apt: name=nginx state=present` |
+
+Hai công cụ **bổ sung** cho nhau: Terraform tạo ra cái EC2 trống, Ansible cài đặt bên trong nó, Packer đóng gói kết quả đó thành image để tái sử dụng.
+
+### Mutable vs immutable infrastructure
+
+**Mutable**: server sống lâu (tuần, tháng, năm), được cập nhật tại chỗ nhiều lần bằng Ansible/SSH. Ưu điểm: đổi nhanh, không cần rebuild. Nhược điểm: theo thời gian mỗi server "lệch" nhau một chút — gọi là **configuration drift** hay **snowflake server** (server tuyết — không cái nào giống cái nào, và khi tan chảy thì không ai dựng lại y hệt được).
+
+**Immutable**: không bao giờ sửa server đang chạy. Muốn đổi gì (bản vá, thư viện mới), bạn build **image mới** (AMI qua Packer), rồi thay thế toàn bộ server bằng bản mới từ image đó (Terraform + Auto Scaling instance refresh). Server cũ bị xoá, không ai "vá" nó.
+
+| Tiêu chí | Mutable | Immutable |
+|---|---|---|
+| Rollback | Chạy lại playbook cũ (nếu còn), không đảm bảo | Trỏ lại AMI cũ — nhanh, chắc chắn |
+| Consistency giữa các server | Dễ lệch (config drift) | Mọi server giống hệt vì cùng image |
+| Tốc độ thay đổi nhỏ | Nhanh (patch tại chỗ) | Chậm hơn (phải build + rollout) |
+| Debug "chạy máy này lỗi máy kia không" | Thường xuyên gặp | Hiếm khi xảy ra |
+
+### Vị trí của Ansible và Packer trong toolchain
+
+```text
+Terraform (provisioning)  →  tạo VPC, EC2 rỗng, RDS, ASG
+Ansible (configuration)   →  cài đặt, cấu hình BÊN TRONG server đang chạy
+Packer (image building)   →  đóng gói kết quả cấu hình thành AMI để tái dùng
+```
+
+Một pipeline phổ biến: **Packer gọi Ansible** để build golden AMI (bài 4), rồi **Terraform dùng AMI đó** làm launch template cho ASG — kết hợp cả ba công cụ, nghiêng về immutable.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài Ansible trên máy điều khiển (macOS)", command: "brew install ansible" },
+    { command: "ansible --version", output: "ansible [core 2.18.3]\n  config file = None\n  python version = 3.12.4" },
+    { comment: "Ansible không cần server đích cài gì thêm — chỉ cần Python + SSH", command: "ssh lab \"python3 --version\"", output: "Python 3.12.3" },
+    { comment: "Kiểm tra kết nối agentless bằng module ping (không phải ICMP)", command: "ansible lab -i lab, -m ping", output: "lab | SUCCESS => {\n    \"ansible_facts\": {\n        \"discovered_interpreter_python\": \"/usr/bin/python3\"\n    },\n    \"changed\": false,\n    \"ping\": \"pong\"\n}" },
+  ]}
+/>
+
+<Callout type="info" title="Vì sao gọi là 'agentless'?">
+
+Chef và Puppet (hai công cụ configuration management khác) cần cài **agent** chạy nền trên mỗi server, định kỳ tự kéo cấu hình về. Ansible chỉ cần **SSH + Python có sẵn** trên server đích — không có tiến trình nền nào chạy khi không có ai gọi `ansible-playbook`.
+
+</Callout>
+
+<Callout type="mistake">
+
+**Coi immutable là "luôn tốt hơn" nên bắt buộc dùng cho mọi thứ.** Với bastion host hay CI runner ít thay đổi, SSH sửa tay/Ansible định kỳ vẫn hợp lý và đỡ phức tạp hơn nhiều so với dựng cả pipeline build AMI. Bài 5 sẽ bàn kỹ khi nào chọn cách nào.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Provisioning", meaning: "Tạo/xoá tài nguyên cloud (VPC, EC2, RDS) — việc của Terraform." },
+    { term: "Configuration management", meaning: "Cài đặt, cấu hình trạng thái bên trong một server đang chạy — việc của Ansible." },
+    { term: "Mutable infrastructure", meaning: "Server sống lâu, được cập nhật tại chỗ nhiều lần." },
+    { term: "Immutable infrastructure", meaning: "Không sửa server đang chạy; đổi = build image mới rồi thay thế." },
+    { term: "Configuration drift", meaning: "Các server dần lệch nhau do bị sửa tay/không đồng bộ theo thời gian." },
+    { term: "Snowflake server", meaning: "Server độc nhất vô nhị do bị sửa tay nhiều lần, không tái tạo lại được." },
+    { term: "Golden image", meaning: "Image (AMI, container) đã cài đặt và hardening sẵn, dùng làm khuôn cho mọi instance mới." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team bạn phát hiện 3 server web trong cùng ASG trả kết quả khác nhau cho cùng một request — hoá ra một server từng được SSH vào sửa tay `nginx.conf` để debug rồi quên đổi lại. Đây là ví dụ của hiện tượng gì, và cách nào giúp tránh lặp lại?"
+  options={[
+    "Đây là idempotency — dùng thêm biến môi trường để né",
+    "Đây là configuration drift — nên chuyển sang immutable (Packer + AMI) hoặc quản lý mọi thay đổi qua Ansible, không SSH sửa tay",
+    "Đây là lỗi DNS — cần thêm health check cho ALB",
+    "Đây là vấn đề của Terraform state — cần import lại 3 server",
+  ]}
+  answerIndex={1}
+  explanation="3 server 'tuyết' khác nhau vì bị sửa tay không đồng bộ — đúng định nghĩa configuration drift. Idempotency là tính chất của một lần chạy Ansible, không liên quan; DNS/state không phải nguyên nhân ở đây."
+/>
