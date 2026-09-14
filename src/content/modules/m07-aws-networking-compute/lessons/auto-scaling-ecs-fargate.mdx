@@ -1,0 +1,117 @@
+import { AsgScaleOutFlowDiagram } from "../diagrams/asg-scale-out-flow-diagram";
+
+<Eli5 title="Auto Scaling giống như quán phở mở thêm bàn giờ cao điểm" emoji="🍲">
+  Quán phở có **công thức chuẩn** cho mỗi bàn phục vụ: bao nhiêu nồi, bao nhiêu bát, ai đứng bếp — đó là **launch template**.
+
+  Chủ quán đặt quy tắc: "luôn có **ít nhất 2 bàn**, tối đa **6 bàn**, và cố gắng để mỗi bàn **không quá bận**". Đó là **min / max** và **target tracking policy** của **Auto Scaling Group**.
+
+  Giờ trưa khách đổ về, **quản lý nhìn đồng hồ** (CloudWatch) thấy bàn nào cũng kín → **mở thêm bàn** theo đúng công thức (scale-out). Bàn nào có người phục vụ ngất xỉu thì dẹp và dựng bàn mới (thay instance unhealthy). Chiều vắng khách thì **từ từ dẹp bớt** bàn (scale-in) — nhưng không bao giờ ít hơn 2.
+
+  **ECS Fargate** thì giống **thuê suất ăn từ bếp trung tâm**: bạn chỉ nói "cần 4 suất theo công thức này", không phải lo bàn ghế, bếp ga (EC2) bên dưới. Ví dụ lệch ở chỗ: mở thêm bàn thật mất vài giây, còn instance mới cần vài phút để boot và qua health check — nên đừng chờ tới lúc quá tải mới scale.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+ASG đem lại hai thứ: **tự phục hồi** (instance chết → thay mới, kể cả khi mất cả AZ) và **co giãn theo tải** (trả tiền theo nhu cầu). Tiêu chí đạt của M07 — "terminate instances ở 1 AZ mà app vẫn phục vụ" — dựa hoàn toàn vào ASG + ALB. Còn ECS Fargate là bước đệm để so sánh với Kubernetes/EKS ở Phase 3.
+
+<AsgScaleOutFlowDiagram />
+
+<Technical>
+
+### Launch template
+
+Bản mô tả instance có version: AMI, instance type, SG, instance profile, user data, IMDSv2, tag, EBS. ASG luôn tạo instance từ một version của launch template (launch configuration là cơ chế cũ, không dùng cho hệ thống mới).
+
+### Auto Scaling Group
+
+| Thiết lập | Ý nghĩa |
+|---|---|
+| `MinSize` / `MaxSize` / `DesiredCapacity` | Sàn, trần, và số instance mong muốn hiện tại |
+| `VPCZoneIdentifier` | Danh sách subnet (nên thuộc ≥2 AZ) — ASG cố cân bằng số instance giữa các AZ |
+| `TargetGroupARNs` | Tự đăng ký/huỷ instance vào target group của ALB |
+| `HealthCheckType` | `EC2` (mặc định: chỉ status check của máy) hoặc **`ELB`** (thêm health check của target group) |
+| `HealthCheckGracePeriod` | Thời gian cho instance mới khởi động trước khi bị đánh giá health |
+
+Luôn dùng `HealthCheckType=ELB` khi đứng sau ALB: app treo nhưng máy vẫn sống thì chỉ ELB health check mới phát hiện được.
+
+### Scaling policies
+
+| Loại | Cách hoạt động | Khi nào dùng |
+|---|---|---|
+| **Target tracking** | Giữ một metric quanh giá trị mục tiêu (CPU 50%, `ALBRequestCountPerTarget` 1000) — tự tạo CloudWatch alarm | Mặc định nên chọn |
+| **Step scaling** | Bậc thang theo mức vượt ngưỡng alarm (vượt 20% → +1, vượt 40% → +3) | Cần kiểm soát chi tiết |
+| **Scheduled** | Theo lịch (8h sáng đặt desired = 6) | Tải có quy luật |
+| **Predictive** | Dự đoán từ lịch sử để scale trước | Tải lặp lại theo chu kỳ |
+
+Scale-out nên nhanh, scale-in nên thận trọng. **Instance warmup** / **default instance warmup** giúp metric của instance mới chưa ổn định không làm policy phản ứng quá đà. Deploy AMI mới cho cả nhóm: **instance refresh**.
+
+### ECS & Fargate (tổng quan)
+
+| Khái niệm ECS | Tương đương gần đúng |
+|---|---|
+| **ECR** | Registry chứa image (như Docker Hub riêng) |
+| **Task definition** | "docker-compose" cho một task: image, CPU/RAM, port, env, log, IAM role |
+| **Task** | Một lần chạy task definition (một hoặc vài container) |
+| **Service** | Giữ N task luôn chạy, gắn vào target group ALB, rolling deploy |
+| **Cluster** | Nhóm logic chứa service/task |
+| **Launch type** | **EC2** (bạn quản lý instance) hoặc **Fargate** (serverless, không thấy instance) |
+
+Mỗi task Fargate có ENI riêng (`awsvpc`), SG riêng. Hai role cần phân biệt: **task execution role** (ECS kéo image từ ECR, ghi log) và **task role** (code trong container gọi AWS API). Service scale bằng **Application Auto Scaling** (target tracking theo CPU/memory/request count) — cùng tư duy với ASG.
+
+| | EC2 + ASG | ECS Fargate | EKS (Phase 3) |
+|---|---|---|---|
+| Đơn vị deploy | AMI / instance | Container task | Pod |
+| Quản lý máy | Bạn | AWS | Bạn (node) hoặc Fargate/Auto Mode |
+| Độ phức tạp | Trung bình | Thấp | Cao, nhưng mạnh và phổ biến |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo launch template (file JSON gồm ImageId, InstanceType, SG, IamInstanceProfile, UserData base64)", command: "aws ec2 create-launch-template --launch-template-name web-lt --launch-template-data file://lt-data.json --query 'LaunchTemplate.[LaunchTemplateId,LatestVersionNumber]' --output text", output: "lt-0a1b2c3d4e5f67890     1" },
+    { comment: "ASG trải 2 private subnet, gắn target group, dùng ELB health check", command: "aws autoscaling create-auto-scaling-group --auto-scaling-group-name web-asg --launch-template LaunchTemplateName=web-lt,Version='$Latest' --min-size 2 --max-size 6 --desired-capacity 2 --vpc-zone-identifier \"$PRIV_A,$PRIV_B\" --target-group-arns $TG_ARN --health-check-type ELB --health-check-grace-period 120" },
+    { comment: "Target tracking: giữ CPU trung bình quanh 50%", command: "aws autoscaling put-scaling-policy --auto-scaling-group-name web-asg --policy-name cpu-50 --policy-type TargetTrackingScaling --target-tracking-configuration '{\"PredefinedMetricSpecification\":{\"PredefinedMetricType\":\"ASGAverageCPUUtilization\"},\"TargetValue\":50.0}'" },
+    { comment: "Load test qua ALB bằng hey (200 kết nối đồng thời, 10 phút)", command: "hey -z 10m -c 200 https://app.example.com/" },
+    { comment: "Quan sát hoạt động scaling", command: "aws autoscaling describe-scaling-activities --auto-scaling-group-name web-asg --max-items 2 --query 'Activities[].[StartTime,Description]' --output text", output: "2026-09-14T03:12:40Z  Launching a new EC2 instance: i-0aa11bb22cc33dd44\n2026-09-14T03:12:40Z  Launching a new EC2 instance: i-0ee55ff66aa77bb88" },
+    { comment: "Giả lập mất AZ a: terminate instance ở AZ a, ASG sẽ tạo lại", command: "aws ec2 terminate-instances --instance-ids i-0123456789abcdef0 i-0aa11bb22cc33dd44" },
+    { command: "aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names web-asg --query 'AutoScalingGroups[0].Instances[].[InstanceId,AvailabilityZone,LifecycleState,HealthStatus]' --output text", output: "i-0ee55ff66aa77bb88   ap-southeast-1b InService       Healthy\ni-0fedcba9876543210   ap-southeast-1b InService       Healthy\ni-0cc99dd00ee11ff22   ap-southeast-1a Pending         Healthy" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Để `HealthCheckType=EC2` sau ALB.** App bị treo (process sống nhưng không trả lời) → ALB đánh dấu unhealthy và ngừng gửi traffic, nhưng ASG vẫn thấy máy "khoẻ" nên **không thay**. Kết quả: capacity giảm dần mà không ai tự sửa.
+</Callout>
+
+<Callout type="warning">
+  `MaxSize` là **phanh chi phí**. Một vòng lặp bug hoặc tấn công DDoS lớp 7 có thể đẩy CPU lên liên tục; không đặt trần hợp lý thì hoá đơn scale theo. Kết hợp với AWS Budgets từ M06.
+</Callout>
+
+<Callout type="tip">
+  Scale theo `ALBRequestCountPerTarget` thường phản ánh tải web tốt hơn CPU. Dù chọn metric nào, hãy load test để xác định "một instance chịu được bao nhiêu" trước khi đặt giá trị mục tiêu.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Launch template", meaning: "Mẫu cấu hình có version để tạo instance: AMI, type, SG, role, user data." },
+    { term: "Auto Scaling Group", meaning: "Nhóm instance tự giữ số lượng desired trong khoảng min–max và tự thay máy hỏng." },
+    { term: "Target tracking", meaning: "Policy tự điều chỉnh desired để giữ metric quanh giá trị mục tiêu." },
+    { term: "Health check grace period", meaning: "Thời gian cho instance mới khởi động trước khi bị đánh giá health." },
+    { term: "Instance refresh", meaning: "Thay dần instance trong ASG theo launch template version mới." },
+    { term: "ECS service", meaning: "Giữ N task container chạy liên tục, gắn với load balancer." },
+    { term: "Fargate", meaning: "Chạy container không cần quản lý EC2 bên dưới." },
+  ]}
+/>
+
+<QuickCheck
+  question="ASG min 2 / max 6 trải 2 AZ, dùng ELB health check. Bạn terminate cả 2 instance đang chạy ở AZ a. Điều gì xảy ra?"
+  options={[
+    "App sập cho tới khi bạn tạo instance thủ công",
+    "ASG giảm desired xuống 0 ở AZ a",
+    "ALB tự tạo instance mới",
+    "ALB chuyển toàn bộ traffic sang instance ở AZ b; ASG tạo instance mới để về lại desired, cố cân bằng AZ",
+  ]}
+  answerIndex={3}
+  explanation="Như quán có hai dãy bàn: dãy A dẹp thì chị điều phối (ALB) dẫn khách sang dãy B, còn quản lý (ASG) dựng bàn mới theo công thức. ALB không tự tạo máy — đó là việc của ASG."
+/>

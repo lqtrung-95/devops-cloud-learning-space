@@ -1,0 +1,110 @@
+import { VpcRouteTableReachabilityDiagram } from "../diagrams/vpc-route-table-reachability-diagram";
+
+<Eli5 title="VPC giống như một khu đô thị có cổng riêng" emoji="🏘️">
+  **VPC** là một khu đô thị bạn thuê trọn trên cloud: có tường rào, có quy hoạch địa chỉ riêng (`10.0.0.0/16`). Không ai đi vào được nếu bạn không mở đường.
+
+  Khu đô thị chia thành các **dãy phố** (subnet). **Dãy mặt tiền** (public subnet) có đường nối thẳng ra **cổng chính** (Internet Gateway) — hợp để đặt cửa hàng đón khách như load balancer. **Dãy phía trong** (private subnet) không có đường ra cổng chính — nơi đặt app server, database.
+
+  Người ở dãy trong muốn **đi chợ** (tải package, gọi API bên ngoài) thì nhờ **dịch vụ shipper** đặt ở dãy mặt tiền (NAT Gateway): shipper đi ra ngoài giúp, nhưng người lạ **không thể theo shipper đi ngược vào nhà**.
+
+  **Bảng chỉ đường** ở đầu mỗi dãy phố chính là **route table**. Ví dụ lệch ở chỗ: "public" hay "private" không phải là biển tên dãy phố — nó chỉ phụ thuộc bảng chỉ đường ghi gì.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+Mọi thứ trên AWS (EC2, RDS, EKS, Lambda trong VPC) đều nằm trong một VPC. Lỗi "không kết nối được" phổ biến nhất trên AWS là **route table sai**, **thiếu NAT** hoặc **quên public IP**. Lab chính của M07 là dựng VPC 2 AZ theo bảng subnet bạn đã tính ở M02 — và ghi lại từng bước để viết lại bằng Terraform ở M10.
+
+<VpcRouteTableReachabilityDiagram />
+
+<Technical>
+
+### Thành phần của VPC
+
+| Thành phần | Phạm vi | Vai trò |
+|---|---|---|
+| **VPC** | Region | Dải IP riêng (CIDR, từ /16 tới /28), ví dụ `10.0.0.0/16` |
+| **Subnet** | **Một AZ** | Một phần CIDR của VPC; AWS giữ lại 5 IP mỗi subnet (4 đầu + 1 cuối) |
+| **Route table** | Gắn vào subnet | Quy tắc "gói tin tới đích X thì đi qua đâu" |
+| **Internet Gateway (IGW)** | VPC | Cửa ra/vào Internet, scale tự động, không tính phí giờ |
+| **NAT Gateway** | **Một AZ** (nằm trong public subnet) | Cho private subnet đi RA Internet, chặn kết nối từ ngoài vào |
+| **Elastic IP** | Region | IPv4 public cố định gắn cho NAT GW / instance |
+
+### Public vs private subnet
+
+Một subnet là **public** khi route table của nó có route `0.0.0.0/0 → igw-...`. Instance trong đó còn cần **public IPv4** (hoặc Elastic IP) mới nói chuyện với Internet được.
+
+```text title="Route table: rt-public"
+Destination     Target
+10.0.0.0/16     local          # luôn có, không xoá được: mọi subnet trong VPC thấy nhau
+0.0.0.0/0       igw-0abc1234
+```
+
+```text title="Route table: rt-private-a"
+Destination     Target
+10.0.0.0/16     local
+0.0.0.0/0       nat-0def5678   # NAT Gateway ở public subnet CÙNG AZ a
+```
+
+Router chọn route **cụ thể nhất** (longest prefix match): gói tới `10.0.2.15` khớp `10.0.0.0/16` (local) chứ không phải `0.0.0.0/0`.
+
+### Thiết kế 2 AZ chuẩn cho lab
+
+| Subnet | AZ | CIDR | Route 0.0.0.0/0 |
+|---|---|---|---|
+| public-a | ap-southeast-1a | `10.0.1.0/24` | IGW |
+| public-b | ap-southeast-1b | `10.0.2.0/24` | IGW |
+| private-a | ap-southeast-1a | `10.0.11.0/24` | NAT GW ở public-a |
+| private-b | ap-southeast-1b | `10.0.12.0/24` | NAT GW ở public-b (hoặc dùng chung 1 NAT để tiết kiệm khi lab) |
+
+NAT Gateway là tài nguyên **zonal**: nếu mọi private subnet dùng chung 1 NAT ở AZ a, mất AZ a thì private-b cũng mất đường ra Internet. Production thường đặt **1 NAT mỗi AZ**; lab có thể dùng 1 NAT để giảm chi phí và chấp nhận rủi ro đó.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo VPC và bật DNS hostname", command: "VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=lab-vpc}]' --query Vpc.VpcId --output text) && aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames '{\"Value\":true}'" },
+    { comment: "Subnet public ở AZ a (lặp lại cho public-b, private-a, private-b)", command: "PUB_A=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 --availability-zone ap-southeast-1a --query Subnet.SubnetId --output text)" },
+    { comment: "Tạo và gắn Internet Gateway", command: "IGW_ID=$(aws ec2 create-internet-gateway --query InternetGateway.InternetGatewayId --output text) && aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID" },
+    { comment: "Route table public: 0.0.0.0/0 → IGW, gắn vào subnet public", command: "RT_PUB=$(aws ec2 create-route-table --vpc-id $VPC_ID --query RouteTable.RouteTableId --output text) && aws ec2 create-route --route-table-id $RT_PUB --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID && aws ec2 associate-route-table --route-table-id $RT_PUB --subnet-id $PUB_A", output: "{\n    \"Return\": true\n}\n{\n    \"AssociationId\": \"rtbassoc-0a1b2c3d4e5f67890\"\n}" },
+    { comment: "NAT Gateway cần Elastic IP và nằm trong public subnet", command: "EIP=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text) && NAT_ID=$(aws ec2 create-nat-gateway --subnet-id $PUB_A --allocation-id $EIP --query NatGateway.NatGatewayId --output text) && aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT_ID" },
+    { comment: "Kiểm tra route của một route table", command: "aws ec2 describe-route-tables --route-table-ids $RT_PUB --query 'RouteTables[0].Routes[].[DestinationCidrBlock,GatewayId]' --output text", output: "10.0.0.0/16     local\n0.0.0.0/0       igw-0abc1234" },
+  ]}
+/>
+
+<Callout type="cost" title="NAT Gateway & public IPv4 — hai khoản hay “ăn” tiền lab">
+  **NAT Gateway** tính phí theo **giờ tồn tại** và theo **GB dữ liệu đi qua** — kể cả khi không ai dùng. **Public IPv4** (gồm Elastic IP, kể cả EIP chưa gắn) cũng tính phí theo giờ. Học xong thì **xoá NAT Gateway và release Elastic IP**. Muốn private subnet truy cập S3/DynamoDB mà không qua NAT, dùng **gateway VPC endpoint** (bài sau). Xem trang pricing mới nhất để biết mức giá cụ thể.
+</Callout>
+
+<Callout type="mistake">
+  **Đặt NAT Gateway trong private subnet.** NAT phải nằm ở subnet có route tới IGW, rồi route table của private subnet mới trỏ `0.0.0.0/0` về NAT. Đặt sai chỗ thì NAT tồn tại (và tính tiền) nhưng không ai ra được Internet.
+</Callout>
+
+<Callout type="tip">
+  Chừa chỗ khi chia CIDR: VPC `/16`, subnet `/24` hoặc `/20`. EKS, Lambda trong VPC và các ENI của load balancer tiêu IP nhanh hơn bạn nghĩ — mở rộng CIDR về sau rất phiền.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "VPC", meaning: "Mạng riêng ảo trong một region, có dải IP (CIDR) riêng." },
+    { term: "Subnet", meaning: "Một phần dải IP của VPC, luôn nằm trong đúng một AZ." },
+    { term: "Route table", meaning: "Bảng quy tắc chọn đường cho gói tin rời subnet." },
+    { term: "Internet Gateway", meaning: "Cửa nối VPC với Internet cho cả hai chiều." },
+    { term: "NAT Gateway", meaning: "Cho instance private đi ra Internet, chặn kết nối mở từ ngoài vào." },
+    { term: "Public subnet", meaning: "Subnet có route 0.0.0.0/0 tới Internet Gateway." },
+    { term: "Elastic IP", meaning: "Địa chỉ IPv4 public cố định, có tính phí theo giờ." },
+  ]}
+/>
+
+<QuickCheck
+  question="EC2 trong private subnet chạy `dnf update` bị treo. Route table private có 0.0.0.0/0 → NAT Gateway. NAT nằm trong public subnet. Kiểm tra gì tiếp theo?"
+  options={[
+    "Gắn Elastic IP trực tiếp cho EC2 private",
+    "Route table của subnet chứa NAT có route 0.0.0.0/0 → Internet Gateway hay chưa",
+    "Đổi route private thành 0.0.0.0/0 → IGW",
+    "Tăng instance type",
+  ]}
+  answerIndex={1}
+  explanation="Shipper (NAT) phải đứng ở dãy mặt tiền có đường ra cổng chính. Nếu subnet của NAT không có route tới IGW, gói tin tới NAT rồi cũng kẹt lại."
+/>

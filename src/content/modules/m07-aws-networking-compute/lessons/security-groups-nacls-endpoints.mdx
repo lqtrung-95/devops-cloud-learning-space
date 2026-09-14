@@ -1,0 +1,104 @@
+import { SgNaclStatefulFlowDiagram } from "../diagrams/sg-nacl-stateful-flow-diagram";
+
+<Eli5 title="NACL là bảo vệ cổng khu phố, Security Group là lễ tân từng căn hộ" emoji="🛂">
+  **NACL** là **bảo vệ ở cổng dãy phố** (subnet). Bác cầm một tờ danh sách đánh số, đọc từ trên xuống, dòng đầu tiên khớp là quyết định. Bác **không nhớ mặt ai**: người vừa đi vào 5 phút trước, lúc đi ra vẫn bị kiểm tra lại từ đầu — gọi là **stateless**.
+
+  **Security Group** là **lễ tân của từng căn hộ** (từng instance/ENI). Lễ tân chỉ có danh sách **"được phép"**, không có danh sách cấm. Và lễ tân **nhớ khách**: ai đã được mời vào thì lúc về cứ thế đi ra — gọi là **stateful**.
+
+  Muốn vào được căn hộ, khách phải qua **cả hai**. Ví dụ lệch một chút: bảo vệ ngoài đời không kiểm tra người đi ra, còn NACL kiểm tra cả chiều ra — đây chính là chỗ nhiều người vấp.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+Security Group là "firewall" bạn chỉnh nhiều nhất trên AWS: ALB nhận 443 từ Internet, app chỉ nhận traffic từ SG của ALB, DB chỉ nhận từ SG của app. Còn NACL, VPC endpoint, peering, Transit Gateway là những câu hỏi thiết kế mạng rất hay gặp trong phỏng vấn và kỳ thi AWS.
+
+<SgNaclStatefulFlowDiagram />
+
+<Technical>
+
+### Security Group vs NACL
+
+| | Security Group | Network ACL |
+|---|---|---|
+| Gắn vào | ENI (instance, ALB, RDS, Lambda trong VPC…) | Subnet |
+| Trạng thái | **Stateful** — response tự được cho qua | **Stateless** — phải mở cả hai chiều |
+| Loại rule | Chỉ **Allow** | **Allow** và **Deny** |
+| Thứ tự | Xét tất cả rule | Theo số rule tăng dần, khớp đầu tiên thắng |
+| Mặc định | SG mới: chặn mọi inbound, cho mọi outbound | NACL mặc định của VPC: cho tất cả; NACL tự tạo: chặn tất cả |
+| Tham chiếu SG khác | **Có** (`source = sg-alb`) | Không, chỉ CIDR |
+
+### Mẫu Security Group 3 tầng
+
+| SG | Inbound | Nguồn |
+|---|---|---|
+| `sg-alb` | TCP 443 | `0.0.0.0/0` |
+| `sg-app` | TCP 80 | `sg-alb` (tham chiếu SG, không phải IP) |
+| `sg-db` | TCP 5432 | `sg-app` |
+
+Tham chiếu SG thay vì CIDR giúp rule đúng mãi dù instance đổi IP khi ASG scale.
+
+### Ephemeral ports & NACL
+
+Client mở kết nối từ một **cổng tạm** (ephemeral port). Mỗi hệ điều hành dùng dải khác nhau (Linux thường 32768–60999, Windows 49152–65535), nên AWS khuyến nghị NACL outbound mở **1024–65535** cho response. Với SG thì không cần nghĩ tới chuyện này.
+
+Dùng NACL khi cần **chặn tường minh** một dải IP ở cấp subnet (ví dụ IP đang tấn công). Phần lớn thời gian: để NACL mặc định, làm việc với SG.
+
+### VPC endpoints: gọi dịch vụ AWS không qua Internet
+
+| Loại | Dịch vụ | Cách hoạt động | Chi phí |
+|---|---|---|---|
+| **Gateway endpoint** | S3, DynamoDB | Thêm route vào route table (prefix list → `vpce-...`) | Không tính phí endpoint |
+| **Interface endpoint** (PrivateLink) | Hầu hết dịch vụ khác: SSM, ECR, Secrets Manager, STS… | Tạo ENI có IP private trong subnet, DNS private | Tính theo giờ mỗi AZ + theo GB |
+
+Private subnet kéo image từ ECR hay đọc S3 qua NAT Gateway sẽ trả phí xử lý dữ liệu của NAT; gateway endpoint cho S3 là cách tiết kiệm kinh điển.
+
+### Kết nối nhiều VPC (khái niệm)
+
+- **VPC peering**: nối trực tiếp 2 VPC (khác account/region được). **Không bắc cầu** (A–B, B–C không có nghĩa A–C) và CIDR không được trùng.
+- **Transit Gateway**: "bến xe trung tâm" nối nhiều VPC và mạng on-premises theo mô hình hub-and-spoke, có route table riêng. Dùng khi số VPC nhiều.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "SG cho ALB: nhận HTTPS từ Internet", command: "SG_ALB=$(aws ec2 create-security-group --group-name sg-alb --description 'ALB public' --vpc-id $VPC_ID --query GroupId --output text) && aws ec2 authorize-security-group-ingress --group-id $SG_ALB --protocol tcp --port 443 --cidr 0.0.0.0/0" },
+    { comment: "SG cho app: chỉ nhận HTTP 80 từ SG của ALB", command: "SG_APP=$(aws ec2 create-security-group --group-name sg-app --description 'App private' --vpc-id $VPC_ID --query GroupId --output text) && aws ec2 authorize-security-group-ingress --group-id $SG_APP --protocol tcp --port 80 --source-group $SG_ALB" },
+    { comment: "Xem inbound rule của SG app", command: "aws ec2 describe-security-group-rules --filters Name=group-id,Values=$SG_APP --query 'SecurityGroupRules[?!IsEgress].[IpProtocol,FromPort,ReferencedGroupInfo.GroupId]' --output text", output: "tcp     80      sg-0a1b2c3d4e5f67890" },
+    { comment: "Gateway endpoint cho S3 gắn vào route table private", command: "aws ec2 create-vpc-endpoint --vpc-id $VPC_ID --vpc-endpoint-type Gateway --service-name com.amazonaws.ap-southeast-1.s3 --route-table-ids $RT_PRIV_A $RT_PRIV_B --query 'VpcEndpoint.[VpcEndpointId,State]' --output text", output: "vpce-0123456789abcdef0   available" },
+    { comment: "Tìm SG nào đang mở SSH ra toàn Internet", command: "aws ec2 describe-security-groups --filters Name=ip-permission.from-port,Values=22 Name=ip-permission.cidr,Values=0.0.0.0/0 --query 'SecurityGroups[].[GroupId,GroupName]' --output text", output: "sg-0badbadbadbad0001   launch-wizard-1" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Mở `0.0.0.0/0` cổng 22 "để debug".** Bot quét Internet sẽ thử đăng nhập trong vài phút. Ở M07 bạn vào instance bằng **SSM Session Manager** — SG của app không cần bất kỳ rule SSH nào.
+</Callout>
+
+<Callout type="warning" title="Sửa NACL tuỳ chỉnh">
+  Tự tạo NACL mới cho subnet mà chỉ thêm rule inbound 443 → mọi response bị chặn (như sơ đồ ở trên), và cả việc instance tải package cũng hỏng vì response từ Internet đi vào qua ephemeral ports. Luôn nghĩ **hai chiều × hai hướng** khi viết NACL.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Security Group", meaning: "Firewall stateful gắn vào ENI, chỉ có rule Allow." },
+    { term: "Network ACL", meaning: "Firewall stateless ở cấp subnet, có Allow/Deny, xét theo số thứ tự." },
+    { term: "Stateful / stateless", meaning: "Có nhớ kết nối để tự cho response qua / phải có rule cho cả chiều về." },
+    { term: "Ephemeral port", meaning: "Cổng nguồn tạm thời phía client, dùng cho chiều trả lời." },
+    { term: "Gateway endpoint", meaning: "Route tới S3/DynamoDB không qua Internet, không tính phí endpoint." },
+    { term: "Interface endpoint", meaning: "ENI private (PrivateLink) để gọi dịch vụ AWS trong VPC." },
+    { term: "VPC peering / Transit Gateway", meaning: "Nối 2 VPC trực tiếp (không bắc cầu) / hub nối nhiều VPC." },
+  ]}
+/>
+
+<QuickCheck
+  question="DB RDS chỉ nên nhận kết nối từ các EC2 app trong ASG (IP thay đổi liên tục). Rule inbound nào hợp lý nhất cho SG của DB?"
+  options={[
+    "TCP 5432 từ 0.0.0.0/0",
+    "TCP 5432 từ CIDR của cả VPC",
+    "NACL deny mọi IP trừ IP hiện tại của EC2",
+    "TCP 5432 với nguồn là Security Group của app",
+  ]}
+  answerIndex={3}
+  explanation="Như lễ tân dặn: 'ai đeo thẻ nhân viên công ty app thì cho lên'. Tham chiếu SG tự áp dụng cho mọi instance mới trong ASG, không phụ thuộc IP."
+/>

@@ -1,0 +1,123 @@
+import { CloudfrontRequestPathDiagram } from "../diagrams/cloudfront-request-path-diagram";
+
+<Eli5 title="Route 53, ACM, CloudFront giống như danh bạ, giấy phép và chuỗi cửa hàng tiện lợi" emoji="🗺️">
+  **Route 53** là **danh bạ điện thoại**: khách nhớ tên "app.example.com", danh bạ cho biết gọi tới số nào. Danh bạ còn thông minh: có thể trả số của chi nhánh **gần khách nhất**, hoặc **chi nhánh dự phòng** khi chi nhánh chính đóng cửa (routing policy + health check).
+
+  **ACM** là **phòng cấp giấy phép kinh doanh**: cấp chứng chỉ HTTPS miễn phí và **tự gia hạn** trước khi hết hạn — không còn cảnh website "chết" vì quên gia hạn cert.
+
+  **CloudFront** là **chuỗi cửa hàng tiện lợi** đặt ở khắp nơi (edge location): hàng bán chạy (ảnh, CSS, JS, trang cache được) có sẵn ngay đầu ngõ. Chỉ khi cửa hàng hết hàng mới gọi về **kho tổng** (origin: ALB hoặc S3).
+
+  Ví dụ lệch ở chỗ: cửa hàng tiện lợi có thể bán "hàng cũ" nếu bạn đặt thời hạn (TTL) quá dài — deploy xong mà người dùng vẫn thấy bản cũ là chuyện rất hay gặp.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+Lab M07 yêu cầu ALB chạy **HTTPS bằng ACM** với tên miền thật. Trong thực tế, gần như mọi web production đều đi qua chuỗi DNS → CDN → load balancer. Hiểu từng mắt xích giúp debug "vì sao cert lỗi", "vì sao deploy rồi mà vẫn thấy bản cũ", và thiết kế failover giữa các region.
+
+<CloudfrontRequestPathDiagram />
+
+<Technical>
+
+### Route 53
+
+- **Hosted zone**: vùng DNS của một domain. **Public** (Internet thấy) hoặc **private** (chỉ trong VPC được gắn).
+- Record thường dùng: `A`/`AAAA` (IP), `CNAME` (trỏ tên sang tên khác — **không dùng được ở zone apex** `example.com`), `TXT`, `MX`.
+- **Alias record** (riêng của Route 53): trỏ `A`/`AAAA` tới tài nguyên AWS như ALB, CloudFront, S3 website — **dùng được ở zone apex**, tự theo IP thay đổi của ALB, và truy vấn alias tới tài nguyên AWS không tính phí truy vấn.
+
+| Routing policy | Hành vi | Ví dụ |
+|---|---|---|
+| Simple | Một bộ giá trị | Site nhỏ |
+| Weighted | Chia theo trọng số | Canary 90/10 giữa 2 phiên bản |
+| Latency | Trả region có độ trễ thấp nhất tới người dùng | App multi-region |
+| Failover | Primary/secondary theo health check | DR sang region dự phòng |
+| Geolocation | Theo quốc gia/châu lục của người dùng | Nội dung/tuân thủ theo vùng |
+| Geoproximity | Theo khoảng cách, chỉnh được "bias" | Dời tải giữa các region |
+| Multivalue answer | Trả nhiều IP healthy (tối đa 8) | Phân tải DNS đơn giản |
+| IP-based | Theo dải IP nguồn của người dùng | Tối ưu theo nhà mạng |
+
+### ACM (AWS Certificate Manager)
+
+- Certificate **public** cho dịch vụ tích hợp (ALB, NLB, CloudFront, API Gateway) — miễn phí, **tự gia hạn** khi validation còn hợp lệ.
+- **DNS validation** (khuyên dùng): tạo một CNAME trong hosted zone; giữ nguyên CNAME đó để tự gia hạn. Email validation là cách cũ hơn.
+- Certificate là **regional**: cho ALB ở `ap-southeast-1` thì tạo ở `ap-southeast-1`; cho **CloudFront thì bắt buộc ở `us-east-1`**.
+- Mặc định bạn không lấy được private key của cert public ACM để cài lên EC2/nginx — cert được dùng qua dịch vụ tích hợp (AWS có bổ sung tuỳ chọn cert exportable có phí; kiểm tra tài liệu mới nhất).
+
+### CloudFront
+
+- **Distribution** gồm: **origin** (S3, ALB, bất kỳ HTTP server), **cache behavior** theo path (`/static/*` cache lâu, `/api/*` không cache), **cache policy** (TTL, key cache theo header/cookie/query), alternate domain name + cert ACM `us-east-1`.
+- Với origin S3: dùng **Origin Access Control (OAC)** để bucket vẫn private, chỉ CloudFront đọc được.
+- Với origin ALB: có thể giới hạn ALB chỉ nhận traffic từ CloudFront (managed prefix list trong SG + header bí mật hoặc VPC origin — xem tài liệu hiện hành).
+- **Invalidation** xoá cache trước hạn; cách tốt hơn cho asset tĩnh là đặt tên file có hash (`app.3f9a1c.js`) để khỏi cần invalidate.
+- Lợi ích phụ: giảm tải origin, TLS kết thúc gần người dùng, tích hợp AWS WAF và Shield.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xin cert cho ALB (cùng region với ALB), xác thực qua DNS", command: "CERT_ARN=$(aws acm request-certificate --domain-name app.example.com --validation-method DNS --region ap-southeast-1 --query CertificateArn --output text)" },
+    { comment: "Lấy bản ghi CNAME cần tạo để xác thực", command: "aws acm describe-certificate --certificate-arn $CERT_ARN --region ap-southeast-1 --query 'Certificate.DomainValidationOptions[0].ResourceRecord'", output: "{\n    \"Name\": \"_3f2a9c1b7e.app.example.com.\",\n    \"Type\": \"CNAME\",\n    \"Value\": \"_8d7c6b5a4f.xlfgrmvvlj.acm-validations.aws.\"\n}" },
+    { comment: "Tạo Alias record app.example.com → ALB (file JSON chứa DNSName và CanonicalHostedZoneId của ALB)", command: "aws route53 change-resource-record-sets --hosted-zone-id Z0123456789ABCDEFGHIJ --change-batch file://alias-to-alb.json", output: "{\n    \"ChangeInfo\": {\n        \"Id\": \"/change/C0987654321ZYXWVUTSRQ\",\n        \"Status\": \"PENDING\"\n    }\n}" },
+    { comment: "Kiểm tra DNS đã trỏ đúng", command: "dig +short app.example.com", output: "13.250.10.21\n52.74.33.108" },
+    { comment: "Qua CloudFront: lần đầu MISS, lần sau HIT", command: "curl -sI https://www.example.com/static/logo.png | grep -i x-cache", output: "x-cache: Hit from cloudfront" },
+    { comment: "Xoá cache sau khi deploy file không có hash trong tên", command: "aws cloudfront create-invalidation --distribution-id E1ABCDEF2GHIJK --paths '/index.html'", output: "{\n    \"Location\": \"https://cloudfront.amazonaws.com/2020-05-31/distribution/E1ABCDEF2GHIJK/invalidation/I2J3K4L5M6N7O8\",\n    \"Invalidation\": {\n        \"Status\": \"InProgress\"\n    }\n}" },
+  ]}
+/>
+
+```json title="alias-to-alb.json"
+{
+  "Changes": [
+    {
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "app.example.com",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "Z1LMS91P8CMLE5",
+          "DNSName": "dualstack.app-alb-1234567890.ap-southeast-1.elb.amazonaws.com",
+          "EvaluateTargetHealth": true
+        }
+      }
+    }
+  ]
+}
+```
+
+`HostedZoneId` trong `AliasTarget` là **hosted zone ID của chính ALB** (lấy từ `aws elbv2 describe-load-balancers --query 'LoadBalancers[0].CanonicalHostedZoneId'`), không phải ID hosted zone của domain bạn.
+
+<Callout type="mistake" title="Tạo cert cho CloudFront ở sai region">
+  Cert ACM tạo ở `ap-southeast-1` sẽ **không xuất hiện** trong danh sách chọn của CloudFront. CloudFront chỉ dùng cert ở `us-east-1`. Một hệ thống dùng cả CloudFront và ALB thường có **hai** certificate ở hai region.
+</Callout>
+
+<Callout type="warning">
+  Xoá bản ghi CNAME validation của ACM "cho gọn" → cert **không tự gia hạn** được và sẽ hết hạn sau vài tháng. Giữ nguyên CNAME đó trong hosted zone.
+</Callout>
+
+<Callout type="cost">
+  Hosted zone tính phí theo tháng, truy vấn DNS thường tính theo số lượng (alias tới tài nguyên AWS được miễn), CloudFront tính theo dữ liệu truyền ra và số request, invalidation vượt hạn mức miễn phí có phí. Domain đăng ký qua Route 53 tính phí theo năm. Xem pricing hiện hành.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Hosted zone", meaning: "Tập bản ghi DNS của một domain trong Route 53, public hoặc private." },
+    { term: "Alias record", meaning: "Bản ghi A/AAAA trỏ tới tài nguyên AWS, dùng được ở zone apex." },
+    { term: "Routing policy", meaning: "Cách Route 53 chọn câu trả lời: weighted, latency, failover…" },
+    { term: "ACM", meaning: "Dịch vụ cấp và tự gia hạn certificate TLS cho dịch vụ AWS." },
+    { term: "DNS validation", meaning: "Chứng minh sở hữu domain bằng một bản ghi CNAME." },
+    { term: "CloudFront distribution", meaning: "Cấu hình CDN: origin, cache behavior, domain, certificate." },
+    { term: "Cache invalidation", meaning: "Yêu cầu edge xoá object khỏi cache trước khi hết TTL." },
+  ]}
+/>
+
+<QuickCheck
+  question="Công ty chạy app ở ap-southeast-1 (chính) và us-west-2 (dự phòng). Muốn DNS tự chuyển sang us-west-2 khi region chính không khoẻ. Routing policy nào phù hợp?"
+  options={[
+    "Simple routing với 2 IP",
+    "Weighted 50/50",
+    "Geolocation theo quốc gia",
+    "Failover routing kèm Route 53 health check cho bản ghi primary",
+  ]}
+  answerIndex={3}
+  explanation="Như danh bạ ghi 'chi nhánh chính đóng cửa thì gọi chi nhánh dự phòng': failover routing dựa vào health check để trả bản ghi secondary khi primary unhealthy."
+/>

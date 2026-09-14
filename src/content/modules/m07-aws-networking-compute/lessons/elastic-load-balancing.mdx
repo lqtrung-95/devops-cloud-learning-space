@@ -1,0 +1,107 @@
+import { AlbTargetHealthDiagram } from "../diagrams/alb-target-health-diagram";
+
+<Eli5 title="Load balancer giống như chị điều phối ở quầy khám bệnh" emoji="🏥">
+  Bệnh viện có nhiều phòng khám giống nhau. Ở sảnh có **chị điều phối** (load balancer): bệnh nhân tới, chị chỉ vào phòng đang rảnh. Không ai phải tự đi gõ cửa từng phòng.
+
+  Cứ vài chục giây, chị lại **gõ cửa hỏi thăm** từng phòng: "Còn khám được không?" (**health check**). Phòng nào không trả lời vài lần liên tiếp thì chị **ngừng chỉ bệnh nhân vào** — cho tới khi phòng đó trả lời bình thường trở lại.
+
+  Có hai kiểu điều phối. **Chị ALB** đọc giấy khám: "khám mắt thì tầng 2, khám răng thì tầng 3" (định tuyến theo nội dung HTTP). **Anh NLB** thì không đọc giấy, chỉ chuyển người cực nhanh theo số cửa (TCP/UDP) — hợp khi lượng người khổng lồ.
+
+  Ví dụ lệch ở chỗ: nếu **mọi** phòng đều không trả lời, ALB không đuổi khách về mà vẫn thử gửi vào tất cả ("fail open") — khách sẽ gặp lỗi 502/503.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+Load balancer là "mặt tiền" của gần như mọi hệ thống production: nhận HTTPS, phân tải qua nhiều AZ, loại instance hỏng, cho phép deploy không downtime. Health check cấu hình sai là nguyên nhân kinh điển của sự cố "app vẫn chạy mà ALB trả 503".
+
+<AlbTargetHealthDiagram />
+
+<Technical>
+
+### ALB vs NLB (và GWLB)
+
+| | Application Load Balancer | Network Load Balancer |
+|---|---|---|
+| Tầng OSI | 7 — HTTP, HTTPS, gRPC, WebSocket | 4 — TCP, UDP, TLS |
+| Định tuyến | Theo host, path, header, query, method | Theo port/protocol |
+| IP | DNS name, IP thay đổi | Có **IP tĩnh mỗi AZ** (gắn được Elastic IP) |
+| Target | Instance, IP, Lambda | Instance, IP, ALB |
+| Nguồn client | Header `X-Forwarded-For` | Giữ nguyên source IP (tuỳ cấu hình target) |
+| Dùng khi | Web app, API, microservice | Hiệu năng cực cao, giao thức không phải HTTP, cần IP tĩnh |
+
+**Gateway Load Balancer** dùng để chèn thiết bị bảo mật (firewall appliance) — chỉ cần biết tên. **Classic Load Balancer** là thế hệ cũ, không dùng cho hệ thống mới.
+
+### Listener → rule → target group
+
+```text
+ALB app-alb (public subnet a, b)
+├── Listener :80   → redirect sang HTTPS :443
+└── Listener :443  (certificate ACM)
+    ├── Rule: path /api/*        → target group api-tg  (port 8080)
+    ├── Rule: host admin.example.com → target group admin-tg
+    └── Default                  → target group web-tg  (port 80)
+```
+
+- ALB phải đặt ở **ít nhất 2 subnet thuộc 2 AZ**. Public ALB ở public subnet; target thường ở private subnet.
+- **Cross-zone load balancing**: ALB bật mặc định; NLB tắt mặc định (kiểm tra tài liệu hiện hành khi thiết kế).
+- **Deregistration delay** (connection draining): khi gỡ target, ALB chờ các request đang chạy hoàn tất rồi mới ngắt.
+
+### Health check
+
+| Tham số | Ý nghĩa | Ví dụ |
+|---|---|---|
+| Path | Endpoint kiểm tra | `/health` |
+| Interval | Bao lâu kiểm tra một lần | 30 giây |
+| Timeout | Chờ tối đa | 5 giây |
+| Healthy threshold | Số lần OK liên tiếp để coi là healthy | 3 |
+| Unhealthy threshold | Số lần fail liên tiếp để coi là unhealthy | 2 |
+| Matcher | Mã HTTP được coi là OK | `200` hoặc `200-299` |
+
+Endpoint `/health` nên **nhẹ và nhanh**. Cẩn thận khi cho nó kiểm tra DB: DB chập chờn một chút là **mọi** target cùng unhealthy.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Target group cho app, health check /health", command: "TG_ARN=$(aws elbv2 create-target-group --name web-tg --protocol HTTP --port 80 --vpc-id $VPC_ID --target-type instance --health-check-path /health --health-check-interval-seconds 30 --healthy-threshold-count 3 --unhealthy-threshold-count 2 --query 'TargetGroups[0].TargetGroupArn' --output text)" },
+    { comment: "ALB ở 2 public subnet, dùng SG của ALB", command: "ALB_ARN=$(aws elbv2 create-load-balancer --name app-alb --type application --scheme internet-facing --subnets $PUB_A $PUB_B --security-groups $SG_ALB --query 'LoadBalancers[0].LoadBalancerArn' --output text)" },
+    { comment: "Listener HTTPS với certificate ACM (bài Route 53 & ACM)", command: "aws elbv2 create-listener --load-balancer-arn $ALB_ARN --protocol HTTPS --port 443 --certificates CertificateArn=$CERT_ARN --default-actions Type=forward,TargetGroupArn=$TG_ARN" },
+    { comment: "Listener HTTP chỉ để redirect sang HTTPS", command: "aws elbv2 create-listener --load-balancer-arn $ALB_ARN --protocol HTTP --port 80 --default-actions 'Type=redirect,RedirectConfig={Protocol=HTTPS,Port=443,StatusCode=HTTP_301}'" },
+    { comment: "Xem sức khoẻ từng target", command: "aws elbv2 describe-target-health --target-group-arn $TG_ARN --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason]' --output text", output: "i-0123456789abcdef0   healthy None\ni-0fedcba9876543210   unhealthy       Target.ResponseCodeMismatch" },
+    { comment: "Gọi thử qua DNS name của ALB", command: "curl -sI https://app.example.com | head -n 1", output: "HTTP/2 200" },
+  ]}
+/>
+
+<Callout type="mistake" title="Target unhealthy dù app vẫn chạy">
+  Kiểm tra theo thứ tự: (1) **SG của target** có cho phép traffic từ **SG của ALB** trên đúng port (cả port health check)? (2) path health check có thật không, trả đúng mã trong matcher không (`Target.ResponseCodeMismatch`)? (3) app có lắng nghe trên `0.0.0.0` hay chỉ `127.0.0.1`? (4) app khởi động chậm hơn thời gian threshold × interval?
+</Callout>
+
+<Callout type="cost">
+  ALB và NLB **tính phí theo giờ tồn tại** cộng phí theo mức sử dụng (LCU/NLCU) — một ALB để quên không có traffic vẫn tốn tiền hằng tháng. Mỗi ALB internet-facing cũng dùng public IPv4 ở từng AZ. Xoá load balancer khi kết thúc lab.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "ALB", meaning: "Load balancer tầng 7, định tuyến theo host/path/header." },
+    { term: "NLB", meaning: "Load balancer tầng 4 cho TCP/UDP/TLS, IP tĩnh, hiệu năng cao." },
+    { term: "Listener", meaning: "Cổng + protocol mà load balancer lắng nghe, kèm các rule." },
+    { term: "Target group", meaning: "Nhóm đích (instance/IP/Lambda) nhận traffic và được health check." },
+    { term: "Health check", meaning: "Kiểm tra định kỳ để quyết định target healthy hay unhealthy." },
+    { term: "Cross-zone load balancing", meaning: "Phân tải đều cho target ở mọi AZ, không chỉ AZ của node LB." },
+    { term: "Deregistration delay", meaning: "Thời gian chờ request đang chạy xong trước khi gỡ target." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một ứng dụng game dùng giao thức UDP, cần địa chỉ IP tĩnh để khách hàng đưa vào whitelist. Chọn load balancer nào?"
+  options={[
+    "Network Load Balancer",
+    "Application Load Balancer",
+    "Classic Load Balancer",
+    "Không cần load balancer, dùng Route 53 weighted",
+  ]}
+  answerIndex={0}
+  explanation="Anh NLB chuyển người theo số cửa (TCP/UDP) và có IP tĩnh mỗi AZ. ALB chỉ hiểu HTTP/HTTPS/gRPC và không có IP tĩnh."
+/>

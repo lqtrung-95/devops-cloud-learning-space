@@ -1,0 +1,121 @@
+import { Ec2LaunchToSsmSessionDiagram } from "../diagrams/ec2-launch-to-ssm-session-diagram";
+
+<Eli5 title="EC2 giống như thuê xe tự lái theo giờ" emoji="🚗">
+  **EC2** là dịch vụ **thuê xe tự lái**: chọn dòng xe (instance type — xe 4 chỗ, xe tải, xe đua), lấy xe ra khỏi bãi, trả xe là thôi tính tiền.
+
+  **AMI** là **mẫu xe xuất xưởng**: đã có sẵn động cơ, ghế, radio (OS + phần mềm). Muốn 10 xe giống hệt nhau thì đúc từ cùng một mẫu. **User data** là **tờ ghi chú dán trên vô-lăng** cho lần lái đầu tiên: "chỉnh ghế, cài app bản đồ, đổ đầy xăng".
+
+  **EBS** là **cốp xe tháo rời được**: đồ đạc vẫn còn dù đổi xe (nhưng cốp chỉ lắp vừa xe ở cùng bãi — cùng AZ). **Instance profile** là **thẻ thu phí không dừng** gắn trên xe: qua trạm (gọi API AWS) tự trừ tiền, không cần mang tiền mặt (access key).
+
+  Còn **SSM Session Manager**? Là **tổng đài hỗ trợ từ xa** qua kết nối xe tự gọi về hãng — bạn điều khiển được xe mà không cần mở cửa xe (port 22) cho ai.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+Dù sau này bạn chạy container trên ECS/EKS, bên dưới vẫn là EC2 (hoặc Fargate). Hiểu AMI, user data, instance profile là nền tảng cho launch template, Auto Scaling Group và "immutable infrastructure". Còn Session Manager giúp bỏ hẳn bastion host và SSH key — tiêu chí bắt buộc của lab M07.
+
+<Ec2LaunchToSsmSessionDiagram />
+
+<Technical>
+
+### Instance type
+
+Đọc tên `m7g.large`: **m** = họ (general purpose), **7** = thế hệ, **g** = CPU Graviton (ARM), **large** = kích cỡ.
+
+| Họ | Dùng cho | Ví dụ |
+|---|---|---|
+| **t** | Burstable: tải thấp, thỉnh thoảng tăng vọt (dùng CPU credit) | `t3.micro`, `t4g.small` |
+| **m** | Cân bằng CPU/RAM — web app, backend | `m7i.large`, `m7g.large` |
+| **c** | Nặng CPU — encode, batch, API tải cao | `c7g.xlarge` |
+| **r** | Nặng RAM — cache, database in-memory | `r7i.large` |
+| **g/p** | GPU | `g5.xlarge` |
+
+Graviton (ARM) thường rẻ hơn cho cùng hiệu năng, nhưng image/binary phải build cho `arm64`.
+
+### AMI & user data
+
+- AMI là **regional**; muốn dùng ở region khác phải copy. Có thể tự build "golden AMI" (Packer, EC2 Image Builder).
+- User data chạy bởi **cloud-init**, quyền root, mặc định **chỉ ở lần boot đầu tiên**. Tối đa 16 KB (trước khi mã hoá base64).
+
+```bash title="user-data.sh"
+#!/bin/bash
+set -euo pipefail
+dnf install -y nginx
+echo "<h1>Hello from $(hostname -f)</h1>" > /usr/share/nginx/html/index.html
+systemctl enable --now nginx
+```
+
+### EBS vs instance store
+
+| | EBS | Instance store |
+|---|---|---|
+| Bản chất | Ổ đĩa mạng, gắn vào instance | Ổ vật lý trên máy chủ host |
+| Stop/terminate | Còn dữ liệu (root volume mặc định bị xoá khi terminate) | **Mất dữ liệu** khi stop/terminate |
+| Phạm vi | Một AZ; snapshot lưu ở S3 (regional) | Gắn chết với instance |
+| Loại phổ biến | `gp3` (SSD đa dụng), `io2` (IOPS cao) | Cache, buffer tạm |
+
+### Instance profile & IMDSv2
+
+App trên EC2 lấy credential tạm của role qua **Instance Metadata Service** tại `169.254.169.254`. Bật **IMDSv2** (`HttpTokens=required`): mọi request metadata phải có token lấy bằng `PUT` trước — giảm rủi ro SSRF đánh cắp credential.
+
+### SSM Session Manager thay SSH/bastion
+
+| | SSH qua bastion | Session Manager |
+|---|---|---|
+| Port inbound | 22 trên bastion (và app) | **Không cần** |
+| Credential | SSH key phải phân phối/xoay | IAM (có thể bắt MFA qua SSO) |
+| Audit | Tự cấu hình | Log phiên ra CloudWatch Logs/S3, CloudTrail ghi ai mở phiên |
+| Yêu cầu | Public IP/bastion | SSM Agent + role `AmazonSSMManagedInstanceCore` + đường ra HTTPS tới endpoint SSM (NAT hoặc interface endpoint `ssm`, `ssmmessages`, và `ec2messages` theo tài liệu hiện hành) |
+
+Trên laptop cần cài **Session Manager plugin** cho AWS CLI.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Lấy AMI Amazon Linux 2023 mới nhất từ SSM Parameter Store", command: "AMI_ID=$(aws ssm get-parameters --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query 'Parameters[0].Value' --output text) && echo $AMI_ID", output: "ami-0a1b2c3d4e5f67890" },
+    { comment: "Chạy instance trong private subnet, có instance profile, user data và IMDSv2", command: "aws ec2 run-instances --image-id $AMI_ID --instance-type t3.small --subnet-id $PRIV_A --security-group-ids $SG_APP --iam-instance-profile Name=app-ssm-profile --user-data file://user-data.sh --metadata-options HttpTokens=required,HttpEndpoint=enabled --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=web-1}]' --query 'Instances[0].InstanceId' --output text", output: "i-0123456789abcdef0" },
+    { comment: "Instance đã đăng ký với Systems Manager chưa?", command: "aws ssm describe-instance-information --query 'InstanceInformationList[].[InstanceId,PingStatus,PlatformName]' --output text", output: "i-0123456789abcdef0   Online  Amazon Linux" },
+    { comment: "Mở shell không cần SSH (cần Session Manager plugin)", command: "aws ssm start-session --target i-0123456789abcdef0", output: "Starting session with SessionId: trung-0a1b2c3d4e5f6\nsh-5.2$" },
+    { comment: "Bên trong phiên: xem user data đã chạy chưa", command: "sudo tail -n 3 /var/log/cloud-init-output.log", output: "Created symlink /etc/systemd/system/multi-user.target.wants/nginx.service.\nCloud-init v. 22.2.2 finished at Sun, 14 Sep 2026 02:14:07 +0000. Up 41.20 seconds" },
+    { comment: "Lấy credential của role qua IMDSv2 (chỉ để hiểu cơ chế)", command: "TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600') && curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/iam/security-credentials/", output: "app-ssm-role" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Instance không hiện trong Session Manager.** Kiểm tra theo thứ tự: (1) role có `AmazonSSMManagedInstanceCore`? (2) instance có đường ra HTTPS 443 — NAT Gateway hoặc interface endpoints? (3) SG outbound có bị chặn? (4) AMI có SSM Agent? Không phải lỗi "port 22 đóng" — Session Manager không dùng port 22.
+</Callout>
+
+<Callout type="cost">
+  Instance **stopped** không tính phí compute nhưng **EBS volume và Elastic IP vẫn tính phí**. Instance có **public IPv4** cũng tính phí địa chỉ theo giờ. Dọn lab: terminate instance, xoá volume/snapshot thừa, release EIP.
+</Callout>
+
+<Callout type="tip">
+  Coi EC2 là **gia súc, không phải thú cưng**: đừng SSH vào sửa tay. Mọi thay đổi đi qua AMI/user data/launch template, instance hỏng thì thay bằng cái mới. Session Manager chỉ để debug.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Instance type", meaning: "Cấu hình CPU/RAM/mạng của EC2, ví dụ t3.small, m7g.large." },
+    { term: "AMI", meaning: "Mẫu ảnh máy (OS + phần mềm) để tạo instance, phạm vi region." },
+    { term: "User data", meaning: "Script cloud-init chạy khi instance boot lần đầu." },
+    { term: "EBS", meaning: "Ổ đĩa block qua mạng, tồn tại độc lập với instance, trong một AZ." },
+    { term: "Instance profile", meaning: "Vỏ bọc gắn IAM role vào EC2." },
+    { term: "IMDSv2", meaning: "Metadata service bắt buộc token, chống đánh cắp credential qua SSRF." },
+    { term: "SSM Session Manager", meaning: "Mở shell vào instance qua IAM, không cần port inbound hay SSH key." },
+  ]}
+/>
+
+<QuickCheck
+  question="Yêu cầu bảo mật: không instance nào có public IP, không mở port 22, mọi phiên truy cập phải có log. Giải pháp nào đáp ứng?"
+  options={[
+    "Bastion host trong public subnet với SSH key dùng chung",
+    "Mở port 22 chỉ cho IP văn phòng",
+    "SSM Session Manager với role AmazonSSMManagedInstanceCore và đường ra HTTPS tới endpoint SSM",
+    "EC2 Instance Connect qua public IP",
+  ]}
+  answerIndex={2}
+  explanation="Như tổng đài hỗ trợ từ xa qua kết nối xe tự gọi về hãng: agent đi RA, không cần cửa vào. Quyền do IAM kiểm soát, phiên được ghi log."
+/>
