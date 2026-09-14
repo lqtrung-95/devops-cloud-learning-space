@@ -1,0 +1,166 @@
+import { ArgoRolloutsCanaryDiagram } from "../diagrams/argo-rollouts-canary-diagram";
+
+<Eli5 title="Canary release là nếm thử món mới với 20% khách trước khi đổi hẳn thực đơn" emoji="🐤">
+
+Rolling update (M12) đổi **toàn bộ** thực đơn cùng lúc, chỉ khác là đổi từ từ để bếp không đóng cửa. Nhưng nếu công thức mới **có vấn đề** (dị ứng, nấu sai), bạn vẫn phát hiện ra sau khi đã phục vụ cho **rất nhiều khách**.
+
+**Canary release** thận trọng hơn: bạn phục vụ món mới cho **20% khách** trước, đặt một "giám sát viên" (**AnalysisTemplate**) đứng theo dõi khách đó có phản ứng gì lạ không (tỉ lệ trả món, tỉ lệ khách đau bụng — tức **error rate**). Nếu ổn, tăng dần lên 50%, rồi 100%. Nếu có vấn đề, giám sát viên **báo động ngay** và bếp **rút món mới về, phục vụ lại món cũ cho tất cả** — chỉ 20% khách bị ảnh hưởng, không phải toàn bộ nhà hàng.
+
+Tên "canary" đến từ **chim hoàng yến trong hầm mỏ**: thợ mỏ mang theo chim để phát hiện khí độc sớm — chim chết trước, thợ mỏ kịp rút lui.
+
+</Eli5>
+
+## Vì sao DevOps cần progressive delivery?
+
+Rolling update trả lời "làm sao đổi version mà không downtime". Canary trả lời câu hỏi khó hơn: "làm sao đổi version mà **giảm thiệt hại nếu bug lọt qua test**". Đây là tầng bảo vệ cuối cùng trước khi một lỗi chạm tới 100% người dùng thật.
+
+<ArgoRolloutsCanaryDiagram />
+
+<Technical>
+
+### Từ Deployment sang Rollout
+
+Argo Rollouts thay thế `Deployment` bằng CRD `Rollout` có cùng `spec.template`, nhưng thêm `strategy.canary`:
+
+```yaml title="shop-api-rollout.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: shop-api
+  namespace: shop
+spec:
+  replicas: 5
+  strategy:
+    canary:
+      canaryService: shop-api-canary
+      stableService: shop-api-stable
+      trafficRouting:
+        alb:                              # dùng chung ALB Controller đã cài ở M13
+          ingress: shop-ingress
+          servicePort: 80
+      steps:
+        - setWeight: 20
+        - pause: { duration: 2m }
+        - analysis:
+            templates:
+              - templateName: error-rate-check
+        - setWeight: 50
+        - pause: { duration: 2m }
+        - setWeight: 80
+        - pause: { duration: 1m }
+  selector:
+    matchLabels:
+      app: shop-api
+  template:
+    metadata:
+      labels:
+        app: shop-api
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/acme/shop-api:v2
+```
+
+`trafficRouting` nối Rollout với hạ tầng traffic thật (ALB Controller, Gateway API, hoặc Service mesh) — đây là điểm khác biệt cốt lõi so với chỉ scale số pod: **traffic thật** được chia theo tỉ lệ, không phải suy ra từ tỉ lệ pod.
+
+### AnalysisTemplate — "giám sát viên" tự động
+
+```yaml title="error-rate-analysistemplate.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: error-rate-check
+  namespace: shop
+spec:
+  metrics:
+    - name: error-rate
+      interval: 30s
+      successCondition: result[0] < 2      # dưới 2% coi là OK
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            100 * sum(rate(http_requests_total{job="shop-api",status=~"5.."}[2m]))
+            /
+            sum(rate(http_requests_total{job="shop-api"}[2m]))
+```
+
+`AnalysisTemplate` chạy song song với các bước `setWeight`, dùng Prometheus (M15) hoặc bất kỳ metric provider nào. `failureLimit: 3` nghĩa là cho phép 3 lần đo tệ trước khi coi là thất bại hẳn — tránh false positive do nhiễu.
+
+### Khi phân tích thất bại
+
+```
+setWeight: 20 → analysis (fail) → Rollout status: Degraded
+                                → tự động setWeight về 0 (rollback)
+                                → ReplicaSet v2 scale về 0
+```
+
+Không cần con người bấm nút — đây là khác biệt với "manual canary" nơi ai đó phải theo dõi dashboard rồi tự quyết định rollback.
+
+### Canary vs Blue-Green
+
+| | Canary | Blue-Green |
+|---|---|---|
+| Traffic chuyển | Tăng dần theo % (20 → 50 → 100) | Chuyển toàn bộ một lần sau khi test xong ở "green" |
+| Rủi ro khi có bug | Giới hạn ở % traffic đang canary | Toàn bộ traffic bị ảnh hưởng ngay khi switch |
+| Cần trafficRouting | Có (ALB/Gateway API/mesh) | Không bắt buộc — chỉ đổi Service selector |
+| Tài nguyên cần | Ít hơn (canary chỉ vài pod) | Gấp đôi tạm thời (cả 2 version chạy full scale) |
+
+Cả hai đều nằm trong khái niệm **progressive delivery**: triển khai an toàn hơn dựa trên tín hiệu thật, thay vì "được ăn cả, ngã về không" như Recreate.
+
+### Flux CD + Flagger (so sánh)
+
+Hệ sinh thái Flux dùng **Flagger** để làm progressive delivery, với cơ chế tương tự (traffic splitting + metric analysis) nhưng cấu hình qua CRD `Canary` riêng của Flagger thay vì `Rollout`. Nguyên lý cốt lõi giống nhau: tăng traffic dần + tự rollback theo metric.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài Argo Rollouts controller + plugin kubectl", command: "kubectl create namespace argo-rollouts && kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml" },
+    { command: "kubectl apply -f error-rate-analysistemplate.yaml && kubectl apply -f shop-api-rollout.yaml" },
+    { comment: "Trigger canary bằng cách đổi image (giống kubectl set image)", command: "kubectl argo rollouts set image shop-api api=ghcr.io/acme/shop-api:v2 -n shop" },
+    { comment: "Theo dõi trực quan trong terminal — biểu đồ traffic split theo thời gian thực", command: "kubectl argo rollouts get rollout shop-api -n shop --watch", output: "Name:            shop-api\nStatus:           ॥ Paused\nStrategy:         Canary\nStep:             2/7\nSetWeight:        20\nActualWeight:     20" },
+    { comment: "Xem AnalysisRun đang chạy", command: "kubectl get analysisrun -n shop", output: "NAME                        STATUS       AGE\nshop-api-6d9f8b-2-error-rate   Running     45s" },
+    { comment: "Kịch bản v2 lỗi: xem Rollout tự Degraded và rollback", command: "kubectl argo rollouts get rollout shop-api -n shop", output: "Status:           ✖ Degraded\nMessage:          RolloutAborted: Rollout aborted due to failed analysis run\nSetWeight:        0" },
+    { comment: "Rollback tay nếu cần can thiệp ngay lập tức", command: "kubectl argo rollouts abort shop-api -n shop && kubectl argo rollouts undo shop-api -n shop" },
+    { comment: "Promote thủ công qua bước tiếp theo (bỏ qua pause nếu tự tin)", command: "kubectl argo rollouts promote shop-api -n shop" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Đặt `successCondition` quá lỏng (ví dụ error rate dưới 50%) "cho chắc không bị fail nhầm".** Lúc đó AnalysisTemplate gần như luôn pass, canary mất hết ý nghĩa bảo vệ — bug production vẫn lọt tới 100% người dùng, chỉ chậm hơn vài phút. Ngưỡng phải phản ánh đúng baseline bình thường của hệ thống (thường 1–2% trên nhiều dịch vụ thực tế).
+
+</Callout>
+
+<Callout type="tip" title="Canary cần đủ traffic mới có ý nghĩa thống kê">
+
+Với dịch vụ có traffic rất thấp, 20% có thể chỉ là vài request/phút — không đủ dữ liệu để AnalysisTemplate kết luận đáng tin cậy. Cân nhắc `pause` dài hơn hoặc weight bước đầu cao hơn cho dịch vụ traffic thấp.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Rollout", meaning: "CRD của Argo Rollouts thay thế Deployment, hỗ trợ chiến lược canary/blue-green." },
+    { term: "canary release", meaning: "Đưa traffic thật dần dần sang bản mới, theo dõi metric trước khi tăng tiếp." },
+    { term: "AnalysisTemplate", meaning: "Định nghĩa metric và ngưỡng thành công để tự động quyết định tiếp tục hay abort." },
+    { term: "trafficRouting", meaning: "Cấu hình nối Rollout với hạ tầng chia traffic thật (ALB, Gateway API, mesh)." },
+    { term: "progressive delivery", meaning: "Triển khai dựa trên tín hiệu thật tăng dần, thay vì chuyển đổi toàn bộ một lần." },
+    { term: "blue-green deployment", meaning: "Chạy song song 2 phiên bản đầy đủ, chuyển toàn bộ traffic một lần sau khi xác nhận ổn." },
+  ]}
+/>
+
+<QuickCheck
+  question="Rollout đang ở bước `setWeight: 50` thì AnalysisTemplate báo fail 3 lần liên tiếp (đạt `failureLimit`). Hành vi mặc định của Argo Rollouts là gì?"
+  options={[
+    "Tiếp tục tăng lên 80% để xem có cải thiện không",
+    "Đánh dấu Rollout Degraded, dừng tăng traffic và tự rollback traffic về bản stable cũ",
+    "Gửi cảnh báo rồi giữ nguyên ở 50% chờ người quyết định",
+    "Xoá Rollout khỏi cluster",
+  ]}
+  answerIndex={1}
+  explanation="Đây chính là giá trị của progressive delivery: phát hiện xấu ở 50% (không phải 100%) và tự động rút lui ngay lập tức, giảm thời gian và phạm vi người dùng bị ảnh hưởng bởi bug."
+/>

@@ -12,6 +12,7 @@ import { m10TerraformModule } from "./modules/m10-terraform/module-meta";
 import { m11AnsiblePackerModule } from "./modules/m11-ansible-packer/module-meta";
 import { m12KubernetesCoreModule } from "./modules/m12-kubernetes-core/module-meta";
 import { m13KubernetesProductionEksModule } from "./modules/m13-kubernetes-production-eks/module-meta";
+import { m14GitopsArgocdModule } from "./modules/m14-gitops-argocd/module-meta";
 import { m15ObservabilityModule } from "./modules/m15-observability/module-meta";
 
 /** All modules in learning order. Add new modules here after they pass `pnpm validate:module`. */
@@ -29,5 +30,6 @@ export const curriculumModules: ModuleDefinition[] = [
   m11AnsiblePackerModule,
   m12KubernetesCoreModule,
   m13KubernetesProductionEksModule,
+  m14GitopsArgocdModule,
   m15ObservabilityModule,
 ];

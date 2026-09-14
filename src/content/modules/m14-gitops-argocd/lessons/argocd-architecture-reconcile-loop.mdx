@@ -1,0 +1,144 @@
+import { ArgocdReconcileDriftSelfhealDiagram } from "../diagrams/argocd-reconcile-drift-selfheal-diagram";
+
+<Eli5 title="Argo CD là nhân viên kho luôn cầm sổ đối chiếu" emoji="🔍">
+
+Argo CD là **nhân viên kho** thực thi nguyên tắc GitOps ở bài trước. Mỗi vài phút (hoặc ngay khi có tin báo), nhân viên này **mở sổ** (đọc Git repo), **đi một vòng kho** (đọc trạng thái cluster qua API server), rồi so sánh: "sổ ghi 5 thùng, kho có 3 thùng — lệch rồi!".
+
+Nếu bạn bật **selfHeal** (tự sửa), nhân viên không chờ ai duyệt — thấy lệch là **tự sắp lại ngay theo sổ**. Nếu tắt, nhân viên chỉ **treo biển cảnh báo "OutOfSync"** và chờ bạn bấm nút đồng ý.
+
+Ngoài "khớp sổ hay không" (**Sync status**), nhân viên còn báo cáo riêng "hàng có còn tốt không" (**Health status**) — thùng đúng vị trí (Synced) nhưng bên trong hỏng (Degraded) là hai chuyện khác nhau.
+
+</Eli5>
+
+## Vì sao DevOps cần hiểu rõ Argo CD?
+
+Đây là công cụ bạn sẽ nhìn vào mỗi ngày để biết "đang chạy đúng version nào", "sync có OK không", "vì sao rollback không như mong đợi". Hiểu đúng Sync vs Health giúp bạn không hoảng khi thấy `Degraded` mà thật ra chỉ là readinessProbe (M12) đang chờ.
+
+<ArgocdReconcileDriftSelfhealDiagram />
+
+<Technical>
+
+### Kiến trúc Argo CD
+
+| Thành phần | Vai trò |
+|---|---|
+| `argocd-server` | API + UI, nơi bạn tương tác (CLI/web) |
+| `argocd-repo-server` | Clone Git repo, render manifest (chạy `helm template`/`kustomize build`) |
+| `argocd-application-controller` | Vòng lặp reconcile chính: so sánh desired (Git) vs live (cluster), thực hiện sync |
+| `argocd-applicationset-controller` | Sinh nhiều Application tự động từ một template (bài sau) |
+| `argocd-dex-server` (tuỳ chọn) | SSO qua OIDC/SAML/LDAP |
+
+### Application — object trung tâm
+
+```yaml title="shop-api-dev-application.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: shop-api-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/acme/shop-config.git
+    targetRevision: main
+    path: overlays/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: shop-dev
+  syncPolicy:
+    automated:
+      prune: true       # xoá resource không còn trong Git
+      selfHeal: true     # tự sửa khi có drift
+    syncOptions:
+      - CreateNamespace=true
+```
+
+- `source.path` trỏ tới thư mục Kustomize/Helm trong config repo (bài sau sẽ tổ chức repo này).
+- `destination.server: https://kubernetes.default.svc` = cùng cluster Argo CD đang chạy; có thể trỏ cluster khác cho multi-cluster.
+- `prune: true` là dao hai lưỡi: xoá đúng resource bị gỡ khỏi Git, nhưng cũng nghĩa là **xoá nhầm nếu bạn gỡ path sai**.
+
+### Sync status vs Health status — hai trục độc lập
+
+| | Sync status | Health status |
+|---|---|---|
+| Trả lời câu hỏi | Cluster có khớp Git không? | Resource đó có đang chạy tốt không? |
+| Giá trị | `Synced` / `OutOfSync` | `Healthy` / `Progressing` / `Degraded` / `Missing` / `Unknown` |
+| Ai tính | So sánh diff YAML | Health check riêng theo loại resource (Deployment nhìn `availableReplicas`, Ingress nhìn có `LoadBalancer` chưa…) |
+
+`Synced` + `Degraded` là tình huống rất thường gặp: bạn apply đúng file, nhưng image sai tag khiến pod CrashLoopBackOff (M12) — Argo CD apply đúng, còn app tự nó không khoẻ.
+
+### Sync policy
+
+```yaml
+syncPolicy:
+  automated:
+    prune: true
+    selfHeal: true
+    allowEmpty: false      # chặn sync nếu Git trả về 0 resource (bug thường gặp)
+  retry:
+    limit: 5
+    backoff:
+      duration: 5s
+      factor: 2
+      maxDuration: 3m
+```
+
+Không bật `automated` = **manual sync**: Argo CD chỉ báo OutOfSync, bạn tự bấm "Sync" (UI) hoặc `argocd app sync` khi sẵn sàng — phù hợp cho môi trường cần người duyệt trước khi deploy (ví dụ prod ở tổ chức lớn).
+
+### Rollback
+
+Argo CD lưu lịch sử mỗi lần sync. Rollback là tạo lại đúng manifest của một revision Git cũ — **không** phải "quay lại commit trước trong Git" (Git repo không đổi, chỉ cluster được apply lại theo bản cũ tạm thời, cho tới lần sync tiếp theo).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Lấy mật khẩu admin ban đầu", command: "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d" },
+    { comment: "Đăng nhập CLI", command: "argocd login localhost:8080 --username admin" },
+    { command: "argocd app create -f shop-api-dev-application.yaml && argocd app get shop-api-dev", output: "Name:               argocd/shop-api-dev\nProject:             default\nSync Status:         Synced to main (a1b2c3d)\nHealth Status:        Healthy" },
+    { comment: "Mô phỏng đổi Git rồi chờ Argo CD tự phát hiện", command: "git -C shop-config commit -am 'replicas 3 -> 5' && git -C shop-config push" },
+    { command: "argocd app get shop-api-dev", output: "Sync Status:         OutOfSync from main (f7e8d9c)\nHealth Status:        Healthy" },
+    { comment: "Sync ngay thay vì chờ chu kỳ poll", command: "argocd app sync shop-api-dev" },
+    { comment: "Mô phỏng drift: sửa tay trên cluster", command: "kubectl scale deployment shop-api -n shop-dev --replicas=10" },
+    { command: "argocd app get shop-api-dev", output: "Sync Status:         OutOfSync from main (f7e8d9c)\n# vài giây sau, nếu selfHeal bật:\nSync Status:         Synced to main (f7e8d9c)" },
+    { comment: "Xem lịch sử và rollback nếu cần", command: "argocd app history shop-api-dev", output: "ID  DATE                           REVISION\n0   2026-09-14 09:00:00 +0700 ICT   a1b2c3d\n1   2026-09-14 09:15:00 +0700 ICT   f7e8d9c" },
+    { command: "argocd app rollback shop-api-dev 0" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Bật `prune: true` trên một Application trỏ nhầm `source.path` (ví dụ trỏ vào thư mục gốc thay vì overlay cụ thể).** Argo CD sẽ coi mọi resource khác trong cluster namespace đó là "không còn trong Git" và **xoá sạch**. Luôn kiểm tra `argocd app diff` trước khi bật `prune` lần đầu trên một Application mới.
+
+</Callout>
+
+<Callout type="tip" title="Degraded không phải lúc nào cũng đáng lo">
+
+Một Deployment mới đang rolling update thường hiện `Progressing` vài chục giây trước khi vào `Healthy` — đây là hành vi bình thường (M12), không phải sự cố.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Application", meaning: "Object của Argo CD mô tả: lấy manifest từ đâu (Git), áp vào đâu (cluster + namespace)." },
+    { term: "Sync status", meaning: "Cluster có khớp với Git tại revision hiện tại không." },
+    { term: "Health status", meaning: "Resource đã apply có đang hoạt động đúng không (Healthy/Degraded/Progressing)." },
+    { term: "selfHeal", meaning: "Tự động apply lại khi phát hiện drift, không cần người bấm sync." },
+    { term: "prune", meaning: "Tự xoá resource trên cluster không còn tồn tại trong Git." },
+    { term: "argocd-repo-server", meaning: "Thành phần clone Git và render manifest (Helm/Kustomize) trước khi so sánh." },
+  ]}
+/>
+
+<QuickCheck
+  question="Application hiện `Synced` + `Degraded`. Bạn nên làm gì đầu tiên?"
+  options={[
+    "Chạy argocd app sync ngay vì đang OutOfSync",
+    "Xoá Application và tạo lại",
+    "Kiểm tra chính resource đó (ví dụ kubectl describe pod) — vấn đề nằm ở việc app không khoẻ, không phải do cluster lệch khỏi Git",
+    "Bật thêm prune: true",
+  ]}
+  answerIndex={2}
+  explanation="Synced nghĩa là Argo CD đã apply đúng theo Git — sync lại sẽ không thay đổi gì. Degraded là vấn đề của chính resource (ví dụ CrashLoopBackOff), cần debug theo quy trình Kubernetes ở M12, không phải vấn đề GitOps."
+/>

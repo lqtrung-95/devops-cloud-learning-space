@@ -1,0 +1,169 @@
+import { PromotionPipelineDiagram } from "../diagrams/promotion-pipeline-diagram";
+
+<Eli5 title="App repo là công thức nấu ăn, config repo là lịch bếp hôm nay nấu gì" emoji="📋">
+
+**App repo** (`shop-api`) là **công thức nấu ăn**: mã nguồn, Dockerfile, test. Nó gần như không đổi cấu trúc, chỉ đổi nội dung món ăn.
+
+**Config repo** (`shop-config`) là **lịch bếp**: "hôm nay bếp dev nấu món phiên bản nào, bếp staging nấu món nào, bếp khách VIP (prod) nấu món nào". Lịch này đổi liên tục và **mỗi dòng lịch = một quyết định deploy** cần được duyệt.
+
+**Promotion** là quy trình: món nấu thử ở bếp dev ngon → **chép y nguyên công thức đó** (cùng image tag) sang lịch bếp staging → rồi sang lịch bếp khách VIP. Không nấu lại từ đầu ở mỗi bếp — bạn test đúng cái sẽ chạy ở prod, không phải một bản build khác "tương tự".
+
+</Eli5>
+
+## Vì sao DevOps cần tách hai repo này?
+
+Tách app repo khỏi config repo cho phép: đội phát triển và đội vận hành có tốc độ thay đổi khác nhau (code đổi theo sprint, config đổi theo mỗi lần deploy); audit trail rõ ràng ("ai duyệt deploy prod lúc mấy giờ" nằm gọn trong lịch sử PR của 1 repo); và quan trọng nhất — **cùng một artifact đã test được promote nguyên vẹn**, loại bỏ rủi ro "chạy tốt ở staging nhưng prod build khác đi".
+
+<PromotionPipelineDiagram />
+
+<Technical>
+
+### Cấu trúc config repo điển hình
+
+```
+shop-config/
+├── base/
+│   ├── kustomization.yaml
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── hpa.yaml
+├── overlays/
+│   ├── dev/
+│   │   ├── kustomization.yaml      # newTag: <commit sha mới nhất>
+│   │   └── replica-patch.yaml       # replicas: 1
+│   ├── staging/
+│   │   ├── kustomization.yaml
+│   │   └── replica-patch.yaml       # replicas: 2
+│   └── prod/
+│       ├── kustomization.yaml
+│       └── replica-patch.yaml       # replicas: 5
+└── argocd/
+    ├── shop-api-dev-application.yaml
+    ├── shop-api-staging-application.yaml
+    └── shop-api-prod-application.yaml
+```
+
+Đây chính là cấu trúc Kustomize base/overlays đã học ở M13 — GitOps chỉ thêm lớp Argo CD Application phía trên để tự sync mỗi overlay.
+
+### App-of-apps — quản lý nhiều Application bằng một Application
+
+Thay vì tạo tay từng Application, dùng một Application "cha" trỏ vào thư mục `argocd/`:
+
+```yaml title="root-application.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: shop-apps-root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/acme/shop-config.git
+    targetRevision: main
+    path: argocd
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+```
+
+Thêm một Application mới = thêm một file YAML vào `argocd/` rồi commit — root Application tự tạo nó.
+
+### ApplicationSet — sinh Application hàng loạt theo template
+
+Khi số môi trường/cluster nhiều, viết tay từng Application không mở rộng được. `ApplicationSet` dùng **generator** để sinh tự động:
+
+```yaml title="shop-api-applicationset.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: shop-api
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - env: dev
+            replicas: "1"
+          - env: staging
+            replicas: "2"
+          - env: prod
+            replicas: "5"
+  template:
+    metadata:
+      name: "shop-api-{{env}}"
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/acme/shop-config.git
+        targetRevision: main
+        path: "overlays/{{env}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "shop-{{env}}"
+      syncPolicy:
+        automated: { prune: true, selfHeal: true }
+```
+
+Generator khác thường dùng: `git` (quét thư mục `overlays/*` tự động, không cần liệt kê tay), `cluster` (một Application cho mỗi cluster đã đăng ký — hữu ích khi có nhiều cluster theo region).
+
+### Promotion — commit là quyết định deploy
+
+Luồng promotion tiêu chuẩn:
+
+1. CI của app repo build, test, push image `shop-api:<sha>`.
+2. Bước cuối CI **tự động** commit `overlays/dev/kustomization.yaml` với tag mới (không phải deploy trực tiếp — chỉ ghi vào "lịch bếp dev").
+3. Từ dev, tạo PR promote sang staging (nhiều team tự động hoá bước này bằng bot khi dev pass smoke test).
+4. Review + merge PR staging → prod tương tự, thường thêm `CODEOWNERS` yêu cầu người có quyền duyệt.
+
+```yaml title=".github/CODEOWNERS (trong config repo)"
+/overlays/prod/  @platform-team @tech-lead
+```
+
+<Callout type="tip" title="Đừng để CI tự động promote thẳng lên prod">
+Auto-sync từ dev lên staging là hợp lý (rủi ro thấp). Nhưng bước staging → prod nên qua PR có người duyệt thật — đây là "gate" quan trọng nhất trong toàn bộ pipeline.
+</Callout>
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "CI (trong app repo) build xong, tự động cập nhật config repo", command: "cd shop-config && yq -i '.images[0].newTag = \"a1b2c3d\"' overlays/dev/kustomization.yaml && git commit -am 'shop-api dev -> a1b2c3d' && git push" },
+    { comment: "Argo CD tự sync dev trong vài phút, kiểm tra", command: "argocd app get shop-api-dev -o json | jq -r '.status.sync.revision'", output: "a1b2c3d" },
+    { comment: "Tạo PR promote dev -> staging bằng gh CLI", command: "gh pr create --base main --head promote-staging --title 'Promote a1b2c3d to staging' --body 'Tested in dev, ready for staging'" },
+    { comment: "Sau khi merge, Argo CD staging tự sync — kiểm tra revision khớp", command: "argocd app get shop-api-staging -o json | jq -r '.status.sync.revision'", output: "a1b2c3d" },
+    { comment: "Xem tất cả Application do ApplicationSet quản lý", command: "kubectl get applications -n argocd -l argocd.argoproj.io/application-set-name=shop-api", output: "NAME                SYNC STATUS   HEALTH STATUS\nshop-api-dev        Synced        Healthy\nshop-api-staging     Synced        Healthy\nshop-api-prod        Synced        Healthy" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Build image riêng cho từng môi trường (build lại ở bước deploy prod).** Nếu prod build từ source khác dev/staging dù cùng commit, bạn không còn "test đúng cái sẽ chạy" — dependency có thể resolve khác, base image có thể đổi version. Build **một lần**, cùng một image digest chạy qua mọi môi trường.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "app repo", meaning: "Repo chứa mã nguồn, Dockerfile, test — CI build ra image từ đây." },
+    { term: "config repo", meaning: "Repo chứa manifest deploy (Kustomize/Helm) cho từng môi trường." },
+    { term: "app-of-apps", meaning: "Một Application cha quản lý nhiều Application con qua thư mục chứa YAML của chúng." },
+    { term: "ApplicationSet", meaning: "Sinh nhiều Application tự động từ một template + generator." },
+    { term: "promotion", meaning: "Đẩy cùng một image tag đã test qua các môi trường bằng commit/PR, không build lại." },
+    { term: "CODEOWNERS", meaning: "Quy định ai bắt buộc phải duyệt PR cho một đường dẫn cụ thể." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team dùng chung một config repo cho 8 microservice, mỗi service có overlays dev/staging/prod. Cách quản lý Application nào mở rộng tốt nhất?"
+  options={[
+    "Viết tay 24 Application YAML và commit thủ công mỗi khi thêm service mới",
+    "Một ApplicationSet với generator quét thư mục overlays/* để tự sinh Application, thêm service mới chỉ cần thêm thư mục",
+    "Dùng một Application duy nhất trỏ toàn bộ repo gốc",
+    "Không dùng Argo CD, quay lại kubectl apply thủ công",
+  ]}
+  answerIndex={1}
+  explanation="ApplicationSet với generator tự động hoá đúng phần lặp lại: thêm service/môi trường mới chỉ cần thêm thư mục, không phải sửa tay danh sách Application. Một Application duy nhất cho cả repo làm mất khả năng theo dõi Sync/Health riêng từng service."
+/>

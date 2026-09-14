@@ -1,0 +1,100 @@
+import { PushVsPullDeployToggleDiagram } from "../diagrams/push-vs-pull-deploy-toggle-diagram";
+
+<Eli5 title="GitOps là kho hàng có một cuốn sổ chung và một nhân viên luôn túc trực" emoji="📖">
+
+Cách deploy "truyền thống" giống bạn **tự lái xe tải đồ tới kho** mỗi khi có hàng mới (CI chạy `kubectl apply` từ bên ngoài). Xe tải đó phải có **chìa khoá vào kho** — nếu xe tải bị cướp, kẻ cướp có chìa khoá vào thẳng kho của bạn.
+
+**GitOps** thì khác: bạn **không tự vào kho**. Bạn chỉ **viết vào một cuốn sổ chung** (Git repo): "kho nên có đúng những thứ này". Một **nhân viên kho luôn túc trực bên trong** (Argo CD, chạy trong cluster) liên tục đọc sổ và tự sắp xếp hàng cho khớp. Muốn đổi hàng trong kho? Chỉ cần sửa sổ — nhân viên tự làm phần còn lại.
+
+Điểm hay nhất: nếu có ai **lén vào sắp sai đồ** trong kho (`kubectl edit` tay), nhân viên vẫn đọc sổ định kỳ và **tự sắp lại đúng** như sổ ghi — không cần ai phát hiện và sửa tay.
+
+</Eli5>
+
+## Vì sao DevOps chuyển sang GitOps?
+
+Sau M12-M13, bạn đã biết cách deploy bằng `kubectl`/Helm từ máy mình hoặc CI. GitOps giải quyết 3 vấn đề còn lại: **ai đang deploy gì lên prod** (audit qua Git history), **CI có cần quyền truy cập cluster không** (bảo mật), và **drift bị phát hiện thế nào** (một service bị sửa tay lúc nửa đêm rồi quên mất).
+
+<PushVsPullDeployToggleDiagram />
+
+<Technical>
+
+### 4 nguyên tắc GitOps (theo OpenGitOps — CNCF)
+
+| Nguyên tắc | Ý nghĩa |
+|---|---|
+| **Declarative** | Toàn bộ hệ thống được mô tả bằng trạng thái mong muốn (YAML), không phải danh sách lệnh đã chạy |
+| **Versioned & Immutable** | Trạng thái mong muốn lưu trong Git — có lịch sử, review qua PR, revert bằng `git revert` |
+| **Pulled Automatically** | Một agent phần mềm (Argo CD, Flux) trong cluster tự kéo trạng thái mong muốn về, không ai đẩy từ ngoài vào |
+| **Continuously Reconciled** | Agent liên tục so sánh thực tế với Git và tự sửa sai lệch (drift) |
+
+### Push vs Pull — khác nhau ở đâu
+
+```
+Push:  Developer → Git → CI (có credentials cluster) → kubectl apply → Cluster
+Pull:  Developer → Git ← Argo CD (agent TRONG cluster, tự kéo về) → apply nội bộ
+```
+
+| | Push (CI/CD truyền thống) | Pull (GitOps) |
+|---|---|---|
+| Ai cầm credentials cluster | CI runner (thường external, nhiều pipeline dùng chung) | Chỉ agent nội bộ trong cluster |
+| Phát hiện drift | Không — chỉ biết trạng thái lúc pipeline chạy | Có — reconcile liên tục, tự phát hiện lệch |
+| Rollback | Chạy lại pipeline cũ hoặc `kubectl apply` tay | `git revert` hoặc rollback trong UI/CLI của agent |
+| Bề mặt tấn công | CI bị chiếm quyền = cluster bị chiếm quyền | CI bị chiếm quyền chỉ đẩy được commit (chặn bằng review) |
+| Multi-cluster | Pipeline phải biết địa chỉ từng cluster | Mỗi cluster tự kéo Git của mình, không cần "biết" CI |
+
+### Git là nguồn sự thật duy nhất (single source of truth)
+
+Hệ quả quan trọng: **không bao giờ `kubectl apply` tay lên môi trường do GitOps quản lý**. Nếu bạn sửa tay, agent sẽ:
+
+- Với `selfHeal: false` (mặc định một số setup): báo `OutOfSync`, chờ bạn xử lý.
+- Với `selfHeal: true`: tự động ghi đè thay đổi tay của bạn về đúng Git trong lần reconcile kế tiếp.
+
+Muốn thay đổi thật sự? Sửa Git, không sửa cluster.
+
+<Callout type="info" title="GitOps không thay thế CI, nó nối tiếp CI">
+
+CI vẫn build, test, push image như bình thường (M05). GitOps chỉ thay đổi **bước cuối cùng**: thay vì CI tự `kubectl apply`, CI chỉ **commit thay đổi cấu hình** (ví dụ image tag mới) vào config repo — bước deploy thật sự do agent trong cluster đảm nhiệm.
+
+</Callout>
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Mô hình push cũ: CI cần kubeconfig của cluster prod", command: "kubectl config use-context prod && kubectl apply -f deploy/prod/" },
+    { comment: "Mô hình GitOps: CI (hoặc bạn) chỉ commit, không chạm cluster", command: "git commit -am 'bump shop-api to v1.5.0' && git push" },
+    { comment: "Agent trong cluster tự phát hiện thay đổi (Argo CD ví dụ ở bài sau)", command: "argocd app get shop-api-prod", output: "Name:               shop-api-prod\nSync Status:        OutOfSync from HEAD (a1b2c3d)\nHealth Status:       Healthy" },
+    { comment: "Xem lịch sử deploy chính là lịch sử Git — không cần hệ thống audit riêng", command: "git log --oneline -- deploy/prod/kustomization.yaml", output: "a1b2c3d bump shop-api to v1.5.0\n9f8e7d6 bump shop-api to v1.4.0\n5c4b3a2 initial prod config" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Vẫn để CI giữ kubeconfig "phòng khi cần" sau khi chuyển sang GitOps.** Nếu CI vẫn có quyền apply thẳng, bạn chỉ thêm một công cụ (Argo CD) mà không loại bỏ được rủi ro bảo mật cốt lõi — hai đường deploy song song (CI push + Argo CD pull) còn dễ gây xung đột trạng thái hơn.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "GitOps", meaning: "Vận hành hệ thống bằng cách khai báo trạng thái mong muốn trong Git, agent tự kéo về và reconcile." },
+    { term: "single source of truth", meaning: "Git là nơi duy nhất phản ánh trạng thái ĐÚNG của hệ thống." },
+    { term: "push deployment", meaning: "Hệ thống bên ngoài (CI) chủ động ghi vào cluster." },
+    { term: "pull deployment", meaning: "Agent bên trong cluster chủ động kéo cấu hình về và áp dụng." },
+    { term: "drift", meaning: "Sai lệch giữa trạng thái thực tế trên cluster và trạng thái khai báo trong Git." },
+    { term: "reconcile", meaning: "Hành động liên tục so sánh và đưa thực tế về khớp trạng thái mong muốn." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một pipeline CI/CD chạy `kubectl apply -f` trực tiếp lên cluster mỗi khi merge vào main. Đây có phải GitOps không?"
+  options={[
+    "Có, vì manifest vẫn nằm trong Git",
+    "Không — đây vẫn là mô hình push: CI chủ động đẩy vào cluster, không có agent nội bộ tự kéo về và reconcile liên tục",
+    "Có, miễn là dùng YAML thay vì lệnh imperative",
+    "Không, vì CI/CD không liên quan gì tới GitOps",
+  ]}
+  answerIndex={1}
+  explanation="Lưu manifest trong Git là điều kiện cần nhưng chưa đủ. GitOps đòi hỏi mô hình PULL: một agent bên trong cluster tự đọc Git và tự reconcile liên tục — không phải một quy trình bên ngoài chủ động ghi vào."
+/>
