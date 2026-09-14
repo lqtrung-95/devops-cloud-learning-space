@@ -1,5 +1,9 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
+/* Lesson MDX prose can contain bracketed syntax (e.g. Ansible `[web:vars]`) that Tailwind's
+   text-based scanner misreads as an arbitrary-value utility candidate and fails to parse.
+   MDX files never define Tailwind classes directly, so excluding them from scanning is safe. */
+@source not "../content/modules/**/*.mdx";
 
 /* Class-based dark mode so the theme toggle can override system preference. */
 @custom-variant dark (&:where(.dark, .dark *));
