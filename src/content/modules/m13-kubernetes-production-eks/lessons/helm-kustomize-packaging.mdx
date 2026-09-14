@@ -1,0 +1,188 @@
+import { HelmVsKustomizeToggleDiagram } from "../diagrams/helm-vs-kustomize-toggle-diagram";
+
+<Eli5 title="Helm là khuôn bánh có chỗ điền, Kustomize là bản gốc dán giấy sửa" emoji="🎂">
+
+Ở M12 bạn viết YAML tay cho một môi trường. Giờ bạn cần **3 phiên bản** (dev/staging/prod) của gần như cùng một cái bánh, chỉ khác đường kính (`replicas`), vị (`image tag`), và có rắc thêm topping hay không (`ingress`, `hpa`).
+
+**Helm** giống một **khuôn bánh công nghiệp**: bạn viết công thức một lần (`templates/`) với những **chỗ trống** (`{{ .Values.replicaCount }}`), rồi đổ vào các **hũ nguyên liệu khác nhau** (`values-dev.yaml`, `values-prod.yaml`) để ra bánh khác nhau. Ai cũng dùng chung một khuôn.
+
+**Kustomize** giống bạn nướng **một cái bánh gốc thật** (`base/`), rồi với mỗi khách lại **dán thêm giấy ghi chú** lên trên: "đổi vị này", "thêm lớp kem kia" (`overlays/<env>/kustomization.yaml`). Không có công thức trừu tượng — chỉ có bánh thật và các miếng dán vá thêm.
+
+</Eli5>
+
+## Vì sao DevOps cần cả hai?
+
+Bạn sẽ gặp cả hai ở production: Helm để **cài phần mềm của người khác** (ingress controller, cert-manager, Karpenter đều phân phối dưới dạng Helm chart) và để đóng gói app của bạn cho nhiều khách hàng/team dùng lại; Kustomize để **quản lý manifest của chính bạn** qua nhiều môi trường mà không cần học ngôn ngữ template — đây cũng là cách Argo CD (M14) thường tổ chức config repo.
+
+<HelmVsKustomizeToggleDiagram />
+
+<Technical>
+
+### Cấu trúc một Helm chart
+
+```
+shop-api/
+├── Chart.yaml              # tên, version chart, version app
+├── values.yaml              # giá trị mặc định
+├── values-prod.yaml         # đè lên giá trị mặc định
+└── templates/
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── hpa.yaml
+    └── _helpers.tpl          # hàm dùng chung, ví dụ tên chuẩn hoá
+```
+
+```yaml title="values.yaml"
+replicaCount: 2
+image:
+  repository: ghcr.io/acme/shop-api
+  tag: "1.4.0"
+resources:
+  requests: { cpu: 250m, memory: 256Mi }
+hpa:
+  enabled: false
+  maxReplicas: 5
+ingress:
+  host: shop.local
+```
+
+```yaml title="templates/deployment.yaml"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "shop-api.fullname" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "shop-api.fullname" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "shop-api.fullname" . }}
+    spec:
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+```
+
+Cú pháp Helm dùng **Go template**: `{{ .Values.x }}` đọc giá trị, `{{- toYaml … | nindent N }}` đổ nguyên một khối YAML với thụt lề đúng, `{{ if .Values.hpa.enabled }} … {{ end }}` bật/tắt cả một object.
+
+```yaml title="values-prod.yaml"
+replicaCount: 5
+image:
+  tag: "1.4.0"
+resources:
+  requests: { cpu: 500m, memory: 512Mi }
+hpa:
+  enabled: true
+ingress:
+  host: shop.example.com
+```
+
+`helm install shop-api ./shop-api -f values-prod.yaml` gộp `values.yaml` + `values-prod.yaml` (file sau đè file trước) rồi render template thành YAML thật trước khi gửi lên API server.
+
+### Cấu trúc Kustomize
+
+```
+shop-api/
+├── base/
+│   ├── kustomization.yaml
+│   ├── deployment.yaml       # YAML THẬT, không có {{ }}
+│   └── service.yaml
+└── overlays/
+    ├── dev/
+    │   └── kustomization.yaml
+    └── prod/
+        ├── kustomization.yaml
+        ├── replica-patch.yaml
+        └── hpa.yaml
+```
+
+```yaml title="base/kustomization.yaml"
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+```
+
+```yaml title="overlays/prod/kustomization.yaml"
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: prod
+resources:
+  - ../../base
+  - hpa.yaml                     # thêm object base không có
+patches:
+  - path: replica-patch.yaml     # sửa field cụ thể
+images:
+  - name: ghcr.io/acme/shop-api
+    newTag: "1.4.0"
+```
+
+```yaml title="overlays/prod/replica-patch.yaml"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop-api
+spec:
+  replicas: 5
+```
+
+### So sánh nhanh
+
+| | Helm | Kustomize |
+|---|---|---|
+| Cách hoạt động | Template engine + values | Patch strategic-merge lên YAML thật |
+| Học thêm gì | Cú pháp Go template | Không — vẫn là YAML |
+| Đóng gói phân phối | `helm package`, version hoá, đăng registry (OCI) | Không có khái niệm "cài đặt", chỉ là YAML sinh ra |
+| Theo dõi đã cài gì | `helm list`, `helm history`, rollback built-in | Không tự theo dõi — thường để Argo CD/GitOps quản lý |
+| Dùng khi | Phân phối cho nhiều người dùng lại, có tham số phức tạp | Bạn sở hữu YAML, chỉ cần khác biệt nhỏ theo môi trường |
+
+<Callout type="tip" title="Không phải chọn một trong hai">
+`kustomize build` cũng chạy được sau `helm template` (`helm template chart | kustomize` qua `helmCharts` trong kustomization) khi cần patch thêm lên một chart bên thứ ba mà bạn không sửa được template gốc.
+</Callout>
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra chart có lỗi cú pháp/best practice trước khi cài", command: "helm lint ./shop-api" },
+    { comment: "Xem manifest thật sẽ được gửi lên cluster — không tạo gì cả", command: "helm template shop-api ./shop-api -f values-prod.yaml | head -20" },
+    { comment: "Cài (hoặc nâng cấp nếu đã có) — idempotent như terraform apply", command: "helm upgrade --install shop-api ./shop-api -n dev --create-namespace -f values-dev.yaml", output: "Release \"shop-api\" does not exist. Installing it now.\nNAME: shop-api\nSTATUS: deployed\nREVISION: 1" },
+    { comment: "Đổi tag rồi nâng cấp — Helm tự tạo revision mới", command: "helm upgrade shop-api ./shop-api -n dev -f values-dev.yaml --set image.tag=dev-def456" },
+    { command: "helm history shop-api -n dev", output: "REVISION  UPDATED                   STATUS      CHART            APP VERSION\n1         Mon Sep 14 10:00:00 2026  superseded  shop-api-0.1.0   1.4.0\n2         Mon Sep 14 10:05:00 2026  deployed    shop-api-0.1.0   1.4.0" },
+    { comment: "Có sự cố? Quay lại revision trước ngay", command: "helm rollback shop-api 1 -n dev" },
+    { comment: "Xem manifest Kustomize sinh ra, không cần cluster", command: "kubectl kustomize overlays/prod | head -20" },
+    { comment: "Apply thẳng bằng kubectl (đã tích hợp Kustomize)", command: "kubectl apply -k overlays/prod" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Sửa trực tiếp `helm template` output rồi `kubectl apply` tay.** Lần sau `helm upgrade` sẽ ghi đè và bạn mất thay đổi, hoặc Helm nghĩ nó chưa từng deploy field đó nên không dọn khi rollback. Mọi thay đổi phải đi qua `values.yaml`/template, không sửa YAML đã render.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Helm chart", meaning: "Gói template + values.yaml mô tả cách deploy một app." },
+    { term: "values.yaml", meaning: "Giá trị mặc định điền vào chỗ trống của template; file khác đè lên theo thứ tự." },
+    { term: "release / revision", meaning: "Một lần cài đặt Helm trong một namespace / lịch sử các lần upgrade của nó." },
+    { term: "Kustomize base", meaning: "YAML gốc thật, dùng chung cho mọi môi trường." },
+    { term: "overlay", meaning: "Thư mục patch/thêm object lên trên base cho một môi trường cụ thể." },
+    { term: "strategic merge patch", meaning: "Cách Kustomize gộp patch vào YAML gốc theo field, không phải thay cả file." },
+  ]}
+/>
+
+<QuickCheck
+  question="`helm upgrade` xong, app lỗi ngay. Lệnh nào đưa cluster về đúng trạng thái trước đó nhanh nhất?"
+  options={["kubectl rollout restart deployment", "helm uninstall rồi helm install lại từ đầu", "helm rollback <release> <revision-trước>", "Sửa values.yaml rồi chờ reconcile tự động"]}
+  answerIndex={2}
+  explanation="Helm tự lưu lịch sử từng lần upgrade — rollback là quay thẳng về đúng bản manifest trước đó trong vài giây, không cần đoán lại values nào đã đổi."
+/>

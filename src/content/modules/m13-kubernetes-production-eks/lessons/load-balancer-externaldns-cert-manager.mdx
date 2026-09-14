@@ -1,0 +1,163 @@
+import { IngressToHttpsPipelineDiagram } from "../diagrams/ingress-to-https-pipeline-diagram";
+
+<Eli5 title="Ba nhân viên tự động biến một tờ đơn thành cửa hàng có biển hiệu và khoá an toàn" emoji="🏪">
+
+Bạn mở một cửa hàng trong khu phố (cluster) và chỉ viết **một tờ đơn** (Ingress): "tôi muốn có cửa ra phố lớn, tên là `shop.example.com`, và cửa phải có khoá an toàn (HTTPS)".
+
+Ba nhân viên tự động đọc tờ đơn đó và làm phần việc của mình mà không cần bạn nhắc lại:
+
+- **Thợ xây cổng** (AWS Load Balancer Controller) dựng một cái cổng thật ngoài phố (ALB).
+- **Người treo biển tên đường** (ExternalDNS) đăng ký địa chỉ `shop.example.com` trỏ đúng về cổng đó (Route 53).
+- **Thợ khoá** (cert-manager) xin một ổ khoá thật (chứng chỉ TLS) từ Let's Encrypt và lắp vào cổng.
+
+Bạn chỉ viết một tờ đơn — không phải tự vào console AWS bấm từng bước.
+
+</Eli5>
+
+## Vì sao DevOps cần biết cả ba?
+
+Đây là "con đường vàng" (golden path) để expose app production trên EKS an toàn, có tên miền thật, HTTPS tự động gia hạn — không hardcode IP, không tick tay chứng chỉ 90 ngày một lần.
+
+<IngressToHttpsPipelineDiagram />
+
+<Technical>
+
+### AWS Load Balancer Controller
+
+Cài bằng Helm, cần IAM permissions (qua Pod Identity, giống bài trước) để gọi EC2/ELB API.
+
+```yaml title="shop-ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  namespace: shop
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/certificate-arn: "" # để trống nếu dùng cert-manager
+spec:
+  ingressClassName: alb
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+```
+
+`target-type: ip` bắt buộc trên Fargate; với node group, `instance` cũng dùng được nhưng `ip` gọn hơn nhờ VPC CNI. Controller cũng hỗ trợ **Gateway API** (`Gateway` + `HTTPRoute`) thay vì `Ingress` — nên chọn Gateway API cho dự án mới, theo hướng dẫn ở M12.
+
+### ExternalDNS
+
+```yaml title="externaldns-values.yaml (Helm)"
+provider:
+  name: aws
+domainFilters:
+  - example.com
+policy: sync              # sync = tự xoá bản ghi khi Ingress bị xoá; upsert-only = chỉ thêm
+txtOwnerId: shop-lab       # tránh đụng bản ghi do cluster khác tạo trong cùng zone
+serviceAccount:
+  create: true
+  name: external-dns
+```
+
+ExternalDNS cần quyền IAM `route53:ChangeResourceRecordSets` trên đúng hosted zone — gắn qua Pod Identity, không phải access key.
+
+<Callout type="warning" title="policy: sync xoá cả bản ghi bạn tạo tay">
+
+Nếu zone đó có bản ghi tạo thủ công không đến từ Kubernetes, `sync` có thể xoá nhầm. Dùng `txtOwnerId` riêng cho mỗi cluster và cân nhắc `upsert-only` khi chia sẻ zone với hệ thống khác.
+
+</Callout>
+
+### cert-manager
+
+```yaml title="letsencrypt-issuer.yaml"
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: devops@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-key
+    solvers:
+      - dns01:
+          route53:
+            region: ap-southeast-1
+```
+
+Thêm `tls` vào Ingress để cert-manager tự tạo `Certificate`:
+
+```yaml
+spec:
+  tls:
+    - hosts: ["shop.example.com"]
+      secretName: shop-tls
+  ...
+```
+
+- **HTTP-01**: cert-manager tạm tạo một path đặc biệt để Let's Encrypt kiểm tra — cần Ingress nhận traffic HTTP công khai trước.
+- **DNS-01**: cert-manager tự thêm bản ghi TXT qua Route 53 — dùng được cả cho wildcard cert (`*.example.com`) và service nội bộ chưa public.
+
+Chứng chỉ Let's Encrypt hết hạn sau 90 ngày; cert-manager tự gia hạn khoảng 30 ngày trước hạn — không cần cron job thủ công.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài 3 controller bằng Helm (values rút gọn, cần repo add trước)", command: "helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller -n kube-system --set clusterName=shop-lab" },
+    { command: "helm upgrade --install external-dns external-dns/external-dns -n kube-system -f externaldns-values.yaml" },
+    { command: "helm upgrade --install cert-manager jetstack/cert-manager -n cert-manager --create-namespace --set crds.enabled=true" },
+    { command: "kubectl apply -f letsencrypt-issuer.yaml && kubectl apply -f shop-ingress.yaml" },
+    { comment: "Theo dõi ALB được tạo (mất 1-2 phút)", command: "kubectl get ingress shop -n shop -w", output: "NAME   CLASS   HOSTS                ADDRESS                                            PORTS   AGE\nshop   alb     shop.example.com     shop-lab-alb-123.ap-southeast-1.elb.amazonaws.com   80      90s" },
+    { comment: "Kiểm tra chứng chỉ đã Ready chưa", command: "kubectl get certificate shop-tls -n shop", output: "NAME       READY   SECRET     AGE\nshop-tls   True    shop-tls   3m" },
+    { comment: "Xác nhận DNS đã trỏ đúng", command: "dig +short shop.example.com", output: "shop-lab-alb-123.ap-southeast-1.elb.amazonaws.com.\n52.74.10.201" },
+    { command: "curl -I https://shop.example.com", output: "HTTP/2 200\nserver: awselb/2.0" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Quên subnet tag `kubernetes.io/role/elb`.** AWS Load Balancer Controller không tự đoán được subnet nào để đặt ALB — Ingress sẽ đứng ở trạng thái không có `ADDRESS` mãi. Kiểm tra tag ngay từ Terraform VPC module (bài trước).
+
+</Callout>
+
+<Callout type="cost" title="Mỗi Ingress annotation `alb` = một ALB riêng">
+
+Gom nhiều Service vào **một** Ingress (nhiều `path`/`host` rules) thay vì một Ingress cho mỗi service để tránh tạo nhiều ALB tính phí theo giờ song song.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "AWS Load Balancer Controller", meaning: "Tạo ALB/NLB thật từ Ingress hoặc Gateway API." },
+    { term: "target-type: ip", meaning: "ALB gửi traffic thẳng tới IP pod, bỏ qua NodePort." },
+    { term: "ExternalDNS", meaning: "Tự tạo bản ghi DNS (Route 53) từ host khai trong Ingress/Service." },
+    { term: "cert-manager", meaning: "Tự xin và gia hạn chứng chỉ TLS (Let's Encrypt) dựa trên Ingress/Certificate." },
+    { term: "DNS-01 challenge", meaning: "Chứng minh sở hữu domain bằng cách tạo bản ghi TXT — hỗ trợ wildcard." },
+    { term: "ClusterIssuer", meaning: "Cấu hình nguồn cấp chứng chỉ dùng chung cho mọi namespace." },
+  ]}
+/>
+
+<QuickCheck
+  question="Ingress đã tạo được ALB (có ADDRESS), nhưng `https://shop.example.com` báo lỗi chứng chỉ không hợp lệ. Bạn kiểm tra gì trước?"
+  options={[
+    "Xoá Ingress và tạo lại từ đầu",
+    "Trạng thái Certificate/CertificateRequest của cert-manager (`kubectl describe certificate`) — có thể đang chờ DNS-01 hoặc bị lỗi quyền Route 53",
+    "Restart AWS Load Balancer Controller",
+    "Tăng resources.limits của pod frontend",
+  ]}
+  answerIndex={1}
+  explanation="ALB có địa chỉ nghĩa là phần Load Balancer Controller đã xong việc. Lỗi chứng chỉ là việc của cert-manager — describe Certificate/CertificateRequest/Order/Challenge để xem đang kẹt ở bước nào."
+/>

@@ -1,0 +1,154 @@
+import { KarpenterScaleOutSimulatorDiagram } from "../diagrams/karpenter-scale-out-simulator-diagram";
+
+<Eli5 title="Karpenter là tổng đài gọi xe, không phải bến xe cố định" emoji="🚕">
+
+**Cluster Autoscaler** (cách cũ) giống một **bến xe buýt cố định**: bạn phải đăng ký trước "tuyến này có tối đa 10 xe loại m5.large", rồi bến mới thêm/bớt xe trong giới hạn đó.
+
+**Karpenter** giống **tổng đài gọi xe công nghệ**: không có bến cố định. Thấy **khách đứng chờ** (pod Pending) là tổng đài lập tức tính "khách này cần xe cỡ nào, đi đâu" rồi **gọi đúng loại xe đó tới** — có thể là xe Spot rẻ hơn nếu khách không gấp. Hết khách, tổng đài **cho xe về** ngay, không giữ xe chờ không.
+
+Việc **nâng cấp cluster** giống thay biển báo giao thông cả thành phố: phải thay ở trung tâm điều hành (control plane) trước, rồi mới cập nhật từng xe (node) — thay ngược lại là xe chạy sai luật mới.
+
+</Eli5>
+
+## Vì sao DevOps cần phần này?
+
+Autoscaling đúng là ranh giới giữa "app sập khi traffic tăng đột biến" và "tự phục hồi trong một phút". Chi phí EKS cũng dễ vượt tầm kiểm soát nhất trong tất cả dịch vụ AWS đã học — governance ở đây trực tiếp ảnh hưởng hoá đơn cuối tháng.
+
+<KarpenterScaleOutSimulatorDiagram />
+
+<Technical>
+
+### Karpenter: NodePool + EC2NodeClass
+
+```yaml title="default-nodepool.yaml"
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+  limits:
+    cpu: "20"                     # trần tổng CPU của NodePool này
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  amiSelectorTerms:
+    - alias: al2023@latest
+  role: karpenter-node-role
+  subnetSelectorTerms:
+    - tags: { karpenter.sh/discovery: shop-lab }
+  securityGroupSelectorTerms:
+    - tags: { karpenter.sh/discovery: shop-lab }
+```
+
+Không cần chọn instance type cụ thể — Karpenter tự tính loại **vừa đủ** cho tổ hợp pod đang Pending (bin-packing), ưu tiên rẻ nhất trong các lựa chọn thoả `requirements`.
+
+### Karpenter vs Cluster Autoscaler
+
+| | Cluster Autoscaler | Karpenter |
+|---|---|---|
+| Đơn vị quản lý | Auto Scaling Group có sẵn | Trực tiếp gọi EC2 API, không cần ASG |
+| Chọn instance type | Cố định theo ASG đã tạo | Tự chọn tối ưu theo pod đang chờ |
+| Tốc độ | Phút (phụ thuộc ASG scale-up) | Thường dưới 1 phút |
+| Consolidation (gộp node) | Hạn chế | Có sẵn, tự động dọn node thừa |
+
+### HPA + Karpenter: hai tầng scale khác nhau
+
+- **HPA** (M12): quyết định **số pod**.
+- **Karpenter**: quyết định **số/loại node** để chứa số pod đó.
+
+Không có HPA thì Karpenter chẳng có gì để phản ứng — pod Pending là tín hiệu duy nhất nó nhìn vào.
+
+### Nâng cấp cluster EKS — đúng thứ tự
+
+1. Đọc **release notes** cho version đích: API bị gỡ (`kubectl convert`, deprecation trong `kubectl get --v=6`), thay đổi hành vi add-on.
+2. Nâng **control plane** từng **một minor version** (`1.33 → 1.34`, không nhảy cóc): `terraform apply` với `cluster_version` mới, hoặc `aws eks update-cluster-version`.
+3. Cập nhật **add-ons** (`vpc-cni`, `coredns`, `kube-proxy`…) lên version tương thích.
+4. Nâng **node group / Karpenter AMI** — kubelet không được **mới hơn** API server (chỉ được cũ hơn tối đa vài minor tuỳ chính sách skew).
+5. Kiểm tra `kubectl get events`, dashboard lỗi, rollout của workload quan trọng trước khi coi là xong.
+
+```bash
+kubectl get deployments,daemonsets --all-namespaces \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.apiVersion}{"\n"}{end}' | grep -i "extensions/v1beta1"
+```
+
+### Kiểm soát chi phí EKS
+
+| Nguồn chi phí dễ bị quên | Cách kiểm soát |
+|---|---|
+| Control plane theo giờ, dù ít pod | Gom nhiều app nhỏ vào ít cluster hơn cho môi trường non-prod |
+| Node rảnh (managed node group) | Dùng Karpenter với `consolidationPolicy` |
+| ALB/NLB dư thừa | Gom Ingress, `terraform destroy` sau khi test |
+| EBS mồ côi | `reclaimPolicy` hợp lý + quét volume `available` định kỳ |
+| NAT Gateway | `single_nat_gateway = true` cho non-prod; VPC endpoint cho S3/ECR để giảm traffic qua NAT |
+| Spot bị thu hồi giữa chừng | PodDisruptionBudget + đa dạng instance type trong NodePool |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { command: "kubectl apply -f default-nodepool.yaml" },
+    { comment: "Deployment giả lập tải, bắt đầu ở 0", command: "kubectl create deployment inflate --image=public.ecr.aws/eks-distro/kubernetes/pause:3.9 --replicas=0 && kubectl set resources deployment inflate --requests=cpu=1" },
+    { comment: "Tăng tải đột ngột", command: "kubectl scale deployment inflate --replicas=5" },
+    { comment: "Theo dõi node claim mới được Karpenter tạo", command: "kubectl get nodeclaims -w", output: "NAME            TYPE         ZONE               NODE   READY   AGE\ndefault-x7k2p   m5.xlarge    ap-southeast-1a           False   8s\ndefault-x7k2p   m5.xlarge    ap-southeast-1a    ip-10-20-2-201   True    52s" },
+    { comment: "Xem lý do Karpenter quyết định như vậy", command: "kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=20 | grep -i provisioned" },
+    { comment: "Giảm tải, quan sát consolidation dọn node", command: "kubectl scale deployment inflate --replicas=2" },
+    { command: "kubectl get nodeclaims", output: "NAME            TYPE        ZONE               NODE               READY   AGE\ndefault-x7k2p   m5.xlarge   ap-southeast-1a    ip-10-20-2-201     True    3m\n# vài phút sau, sau consolidation:\n# No resources found" },
+    { comment: "Trước khi nâng cấp: quét API deprecated", command: "kubectl api-resources --verbs=list -o name | xargs -I{} kubectl get {} --all-namespaces --ignore-not-found -o jsonpath='{.apiVersion}{\"\\n\"}' 2>/dev/null | sort -u" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Đặt `limits.cpu` của NodePool bằng đúng nhu cầu hiện tại.** Traffic tăng đột biến sẽ chạm trần và pod kẹt Pending dù Karpenter vẫn "muốn" tạo thêm node. Đặt trần cao hơn nhu cầu dự kiến và dùng alert khi gần chạm.
+
+</Callout>
+
+<Callout type="cost" title="Node Spot bị thu hồi bất ngờ">
+
+AWS có thể thu hồi Spot instance với 2 phút cảnh báo. Karpenter tích hợp AWS interruption notices để chủ động drain trước, nhưng workload chịu gián đoạn kém (ví dụ database) nên chạy trên `on-demand` bằng cách giới hạn `capacity-type` trong `requirements` của một NodePool riêng.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "NodePool", meaning: "Cấu hình Karpenter: loại instance cho phép, giới hạn tổng tài nguyên, chính sách dọn node." },
+    { term: "EC2NodeClass", meaning: "Chi tiết hạ tầng: AMI, subnet, security group, IAM role cho node." },
+    { term: "consolidation", meaning: "Karpenter tự gộp/xoá node thừa để giảm chi phí." },
+    { term: "capacity-type: spot", meaning: "Instance rẻ hơn nhưng có thể bị AWS thu hồi bất ngờ." },
+    { term: "version skew policy", meaning: "Quy tắc chênh lệch version cho phép giữa control plane và node." },
+    { term: "consolidationPolicy", meaning: "Điều kiện Karpenter coi node là 'thừa' để dọn: rỗng hay dùng ít." },
+  ]}
+/>
+
+<QuickCheck
+  question="Sau khi scale Deployment lên 20 replicas, một số pod vẫn Pending dù Karpenter đã tạo thêm vài node. `kubectl describe nodepool default` cho thấy `cpu: 20/20 used`. Nguyên nhân?"
+  options={[
+    "HPA chưa được cấu hình",
+    "NodePool đã chạm `limits.cpu`, Karpenter không được phép tạo thêm node cho tới khi có chỗ trống hoặc bạn tăng limit",
+    "Deployment thiếu readinessProbe",
+    "Karpenter chỉ hỗ trợ tối đa 10 node",
+  ]}
+  answerIndex={1}
+  explanation="`limits.cpu` là trần cứng của NodePool — giống ngân sách gọi xe tối đa mỗi ngày. Chạm trần thì dù có khách chờ, tổng đài cũng không gọi thêm xe được nữa."
+/>

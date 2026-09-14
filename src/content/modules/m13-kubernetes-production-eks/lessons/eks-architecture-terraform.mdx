@@ -1,0 +1,150 @@
+import { EksNodeOptionsExplorerDiagram } from "../diagrams/eks-node-options-explorer-diagram";
+
+<Eli5 title="EKS là bạn thuê AWS làm ban quản lý cảng, còn bạn chọn kiểu cầu tàu" emoji="🚢">
+
+Ở M12, bạn tự làm "ban quản lý cảng" (`kind create cluster`): tự chạy API server, tự lo etcd, tự vá lỗi. Với **Amazon EKS**, bạn **thuê AWS** làm phần đó — họ chạy control plane ở nhiều AZ, tự backup etcd, tự vá bảo mật. Bạn chỉ còn quyết định **hàng hoá (pod) chạy trên loại cầu tàu nào**.
+
+AWS có 3 kiểu cầu tàu: **Managed Node Group** (bạn thuê nguyên chiếc xe buýt EC2, ngồi đủ hay vơi vẫn trả tiền cả xe), **Fargate** (đi taxi riêng cho từng pod, không cần lo xe), và **Karpenter** (tổng đài gọi xe tự động — thấy khách đứng chờ là điều ngay đúng loại xe tới, xong việc thì cho xe về).
+
+</Eli5>
+
+## Vì sao DevOps cần Terraform để dựng EKS?
+
+Cluster là hạ tầng — phải **tái tạo được**, review qua PR, không phải click tay trên console rồi quên mất đã bật gì. Đây cũng là lúc M10 (Terraform) và M12 (Kubernetes) gặp nhau: Terraform dựng hạ tầng AWS + cluster, sau đó bạn nói chuyện với cluster bằng `kubectl`/Helm như thường.
+
+<EksNodeOptionsExplorerDiagram />
+
+<Technical>
+
+### Kiến trúc EKS so với kind
+
+| Thành phần | Trên `kind` (M12) | Trên EKS |
+|---|---|---|
+| Control plane | Container chạy trên máy bạn | AWS vận hành, trải nhiều AZ, tự backup etcd |
+| Data plane (node) | Container "worker" giả lập | EC2 thật (managed node group / self-managed) hoặc Fargate |
+| Mạng pod | CNI đơn giản (kindnet), IP giả | **Amazon VPC CNI**: mỗi pod nhận IP thật trong VPC |
+| LB cho Service | Cần thêm `cloud-provider-kind` | `cloud-controller-manager` tạo NLB/ALB thật |
+| Add-ons | Tự cài | "EKS add-ons" quản lý qua API: `vpc-cni`, `coredns`, `kube-proxy`, `eks-pod-identity-agent`, `aws-ebs-csi-driver` |
+
+### Terraform dựng EKS bằng module cộng đồng
+
+```hcl title="main.tf"
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.19.0"
+
+  name = "shop-lab-vpc"
+  cidr = "10.20.0.0/16"
+  azs             = ["ap-southeast-1a", "ap-southeast-1b", "ap-southeast-1c"]
+  private_subnets = ["10.20.1.0/24", "10.20.2.0/24", "10.20.3.0/24"]
+  public_subnets  = ["10.20.101.0/24", "10.20.102.0/24", "10.20.103.0/24"]
+  enable_nat_gateway = true
+  single_nat_gateway = true   # 1 NAT thay vì 3 — tiết kiệm cho lab
+
+  private_subnet_tags = { "kubernetes.io/role/internal-elb" = "1" }
+  public_subnet_tags  = { "kubernetes.io/role/elb" = "1" }
+}
+
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "20.31.0"
+
+  cluster_name    = "shop-lab"
+  cluster_version = "1.34"
+
+  vpc_id     = module.vpc.vpc_id
+  subnet_ids = module.vpc.private_subnets
+
+  cluster_endpoint_public_access = true   # bật riêng tư hơn cho production thật
+
+  cluster_addons = {
+    vpc-cni                = {}
+    coredns                = {}
+    kube-proxy              = {}
+    eks-pod-identity-agent = {}
+    aws-ebs-csi-driver     = {}
+  }
+
+  eks_managed_node_groups = {
+    default = {
+      instance_types = ["t3.medium"]
+      min_size       = 2
+      max_size       = 4
+      desired_size   = 2
+    }
+  }
+}
+```
+
+- Subnet tag `kubernetes.io/role/elb` / `internal-elb` là cách **AWS Load Balancer Controller** (bài sau) tự tìm subnet để đặt ALB/NLB.
+- `cluster_addons` khai báo qua **EKS add-ons** (không phải `kubectl apply` tay) — AWS tự vá bản vá bảo mật khi bạn `terraform apply` lại với version mới.
+- Luôn **ghim version module** (`version = "20.31.0"`) — module major mới có thể đổi breaking cấu trúc biến.
+
+### Managed Node Group vs Fargate vs Karpenter
+
+| | Managed Node Group | Fargate | Karpenter |
+|---|---|---|---|
+| Đơn vị tính tiền | EC2 instance (dù rảnh) | Theo vCPU/RAM mỗi pod theo giây | EC2 instance do Karpenter tự chọn loại |
+| DaemonSet | Chạy được | **Không** hỗ trợ | Chạy được |
+| Tốc độ scale | Phút (ASG) | ~30–60s mỗi pod | Thường < 1 phút, chọn instance sát yêu cầu pod |
+| Điều khiển instance type | Bạn chọn cố định | AWS tự chọn | Bạn khai `NodePool`, Karpenter tự chọn tối ưu |
+
+Nhiều cluster production dùng **cả ba**: node group nhỏ cho hệ thống lõi (CoreDNS, controller), Karpenter cho workload biến động, Fargate cho job ngắn hạn hoặc namespace cần cách ly mạnh.
+
+### `aws eks update-kubeconfig`
+
+```bash
+aws eks update-kubeconfig --name shop-lab --region ap-southeast-1
+```
+
+Lệnh này không tạo credentials mới — nó thêm một entry vào `~/.kube/config` dùng **AWS IAM Authenticator**: mỗi lần `kubectl` chạy, nó ký một request bằng identity AWS hiện tại (`aws sts get-caller-identity`) để chứng minh với API server. Quyền trong cluster (RBAC) vẫn tách biệt — phải map IAM principal vào RBAC qua `aws-auth` ConfigMap hoặc `access entries` (API mới hơn, khuyến nghị).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { command: "terraform init && terraform apply", output: "module.vpc.aws_vpc.this[0]: Creating...\nmodule.eks.aws_eks_cluster.this[0]: Still creating... [8m0s elapsed]\n\nApply complete! Resources: 62 added, 0 changed, 0 destroyed." },
+    { comment: "Nạp kubeconfig để kubectl nói chuyện với EKS", command: "aws eks update-kubeconfig --name shop-lab --region ap-southeast-1" },
+    { command: "kubectl get nodes -o wide", output: "NAME                                          STATUS   ROLES    VERSION\nip-10-20-1-45.ap-southeast-1.compute.internal   Ready    <none>   v1.34.0-eks-abc123\nip-10-20-2-88.ap-southeast-1.compute.internal   Ready    <none>   v1.34.0-eks-abc123" },
+    { comment: "Add-on nào đang chạy và version", command: "aws eks list-addons --cluster-name shop-lab", output: "{\n    \"addons\": [\"vpc-cni\", \"coredns\", \"kube-proxy\", \"eks-pod-identity-agent\", \"aws-ebs-csi-driver\"]\n}" },
+    { comment: "Xem ai đang được map vào RBAC cluster", command: "kubectl get configmap aws-auth -n kube-system -o yaml" },
+    { comment: "Dọn dẹp — LUÔN làm ngay khi xong lab", command: "terraform destroy" },
+  ]}
+/>
+
+<Callout type="cost" title="EKS control plane tính tiền theo giờ, dù không có pod nào">
+
+Mỗi cluster EKS ~0.10 USD/giờ cho control plane, cộng thêm EC2/Fargate/NAT Gateway/EBS đang chạy. Dựng lab, làm xong trong ngày, `terraform destroy` — đừng để cluster "quên" qua đêm.
+
+</Callout>
+
+<Callout type="mistake">
+
+**Xoá Terraform state hoặc chỉnh sửa cluster bằng tay trên console rồi quên cập nhật code.** Lần `terraform apply` sau sẽ cố "sửa lại" theo code cũ và có thể xoá nhầm thay đổi bạn làm tay. Mọi thay đổi cluster nên đi qua Terraform.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "EKS control plane", meaning: "API server + etcd do AWS vận hành, trải nhiều AZ, tính phí theo giờ." },
+    { term: "Managed Node Group", meaning: "Auto Scaling Group EC2 do EKS quản lý vòng đời, bạn chọn instance type." },
+    { term: "Fargate profile", meaning: "Chạy pod trên hạ tầng serverless của AWS, không thấy node." },
+    { term: "Karpenter", meaning: "Controller tự chọn và tạo EC2 phù hợp cho pod đang Pending." },
+    { term: "Amazon VPC CNI", meaning: "CNI cấp IP thật trong VPC cho từng pod." },
+    { term: "EKS add-on", meaning: "Thành phần cluster (vpc-cni, coredns…) được AWS quản lý version qua API." },
+  ]}
+/>
+
+<QuickCheck
+  question="Cluster cần chạy DaemonSet thu thập log trên mọi node VÀ cần scale nhanh theo tải biến động. Lựa chọn node hợp lý nhất?"
+  options={[
+    "Chỉ dùng Fargate cho toàn bộ cluster",
+    "Managed node group nhỏ (chạy DaemonSet + hệ thống lõi) kết hợp Karpenter cho workload biến động",
+    "Chỉ dùng Karpenter, bỏ hẳn managed node group",
+    "Tăng desired_size của node group thủ công mỗi khi tải tăng",
+  ]}
+  answerIndex={1}
+  explanation="Fargate không chạy được DaemonSet. Node group đảm bảo có node ổn định cho hệ thống lõi; Karpenter lo phần biến động nhanh hơn tự tay chỉnh ASG."
+/>

@@ -21,4 +21,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "m15-observability": (lessonSlug) => import(`./modules/m15-observability/lessons/${lessonSlug}.mdx`),
   "m09-aws-well-architected-cost": (lessonSlug) => import(`./modules/m09-aws-well-architected-cost/lessons/${lessonSlug}.mdx`),
   "m11-ansible-packer": (lessonSlug) => import(`./modules/m11-ansible-packer/lessons/${lessonSlug}.mdx`),
+  "m13-kubernetes-production-eks": (lessonSlug) => import(`./modules/m13-kubernetes-production-eks/lessons/${lessonSlug}.mdx`),
 };

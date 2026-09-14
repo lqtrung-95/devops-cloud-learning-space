@@ -1,0 +1,162 @@
+import { PodIdentityCredentialExchangeDiagram } from "../diagrams/pod-identity-credential-exchange-diagram";
+
+<Eli5 title="Pod Identity là thẻ nhân viên tạm thời, không phải chìa khoá vạn năng khắc sẵn" emoji="🪪">
+
+Cách tệ nhất để cho pod gọi S3: **khắc chìa khoá vạn năng lên áo** (access key dài hạn nhét vào Secret) — mất áo (Secret bị lộ) là mất luôn chìa, và chìa không bao giờ tự hết hạn.
+
+**Pod Identity** giống hệ thống thẻ ra vào hiện đại: bạn đăng ký trước "ServiceAccount X được đóng vai trò Y", rồi mỗi khi nhân viên vào ca, **quầy bảo vệ tự phát thẻ tạm** — có hạn dùng, tự hết hạn, tự cấp mới. Nhân viên không bao giờ cầm chìa khoá thật, chỉ cầm thẻ tạm đủ dùng cho ca làm việc.
+
+</Eli5>
+
+## Vì sao DevOps phải làm đúng phần này?
+
+Access key dài hạn là nguyên nhân hàng đầu của rò rỉ AWS credentials (commit nhầm vào Git, lộ qua log). Pod Identity/IRSA loại bỏ hoàn toàn access key khỏi vòng đời pod — đây là thực hành bảo mật bắt buộc trên production, không phải "nice to have".
+
+<PodIdentityCredentialExchangeDiagram />
+
+<Technical>
+
+### EKS Pod Identity — cách mới, đơn giản hơn (khuyến nghị từ EKS 1.24+)
+
+1. Cài add-on `eks-pod-identity-agent` (đã làm ở bài trước qua Terraform).
+2. Tạo IAM role với **trust policy** tin cậy service `pods.eks.amazonaws.com`:
+
+```json title="trust-policy.json"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "pods.eks.amazonaws.com" },
+      "Action": ["sts:AssumeRole", "sts:TagSession"]
+    }
+  ]
+}
+```
+
+3. Tạo **association** nối ServiceAccount với role — không cần annotation trên ServiceAccount, không cần OIDC provider:
+
+```bash
+aws eks create-pod-identity-association \
+  --cluster-name shop-lab \
+  --namespace shop \
+  --service-account report-reader \
+  --role-arn arn:aws:iam::111122223333:role/s3-read-role
+```
+
+4. Deployment chỉ cần khai `serviceAccountName: report-reader` — mọi thứ còn lại tự động.
+
+### IRSA — cách cũ hơn, vẫn còn nhiều nơi dùng
+
+IRSA (**IAM Roles for Service Accounts**) cần:
+
+- Bật **OIDC identity provider** cho cluster (một lần, lúc tạo cluster).
+- Trust policy của role điều kiện theo `sub` khớp đúng namespace + ServiceAccount:
+
+```json title="irsa-trust-policy.json"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Federated": "arn:aws:iam::111122223333:oidc-provider/oidc.eks.ap-southeast-1.amazonaws.com/id/EXAMPLE" },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.ap-southeast-1.amazonaws.com/id/EXAMPLE:sub": "system:serviceaccount:shop:report-reader"
+        }
+      }
+    }
+  ]
+}
+```
+
+```yaml title="serviceaccount-irsa.yaml"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: report-reader
+  namespace: shop
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/s3-read-role
+```
+
+### So sánh
+
+| | Pod Identity | IRSA |
+|---|---|---|
+| Cần OIDC provider | Không | Có |
+| Cấu hình trên ServiceAccount | Không cần annotation | Cần annotation `role-arn` |
+| Cách gắn quyền | `create-pod-identity-association` (API riêng) | Trust policy điều kiện theo `sub` |
+| Đổi role cho SA có sẵn | Cập nhật association, không sửa pod | Sửa annotation, có thể cần restart pod để inject lại |
+| Khuyến nghị hiện tại | ✅ Mặc định cho cluster mới | Vẫn hỗ trợ, dùng khi cluster cũ hoặc cross-account phức tạp hơn |
+
+### IAM policy — luôn least privilege
+
+```json title="s3-read-policy.json"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::shop-lab-reports-trung",
+        "arn:aws:s3:::shop-lab-reports-trung/*"
+      ]
+    }
+  ]
+}
+```
+
+Không có `s3:PutObject`, `s3:DeleteObject`, không có `Resource: "*"`. Pod chỉ làm đúng việc nó cần làm.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo role và gắn policy least-privilege", command: "aws iam create-role --role-name s3-read-role --assume-role-policy-document file://trust-policy.json && aws iam put-role-policy --role-name s3-read-role --policy-name s3-read --policy-document file://s3-read-policy.json" },
+    { comment: "Tạo ServiceAccount và association (Pod Identity)", command: "kubectl create serviceaccount report-reader -n shop && aws eks create-pod-identity-association --cluster-name shop-lab --namespace shop --service-account report-reader --role-arn arn:aws:iam::111122223333:role/s3-read-role" },
+    { comment: "Chạy pod dùng đúng ServiceAccount, thử whoami và list bucket", command: "kubectl run s3-test -n shop --image=amazon/aws-cli --overrides='{\"spec\":{\"serviceAccountName\":\"report-reader\"}}' --rm -it --restart=Never -- sts get-caller-identity", output: "{\n    \"UserId\": \"AROAEXAMPLE:eks-pod-identity\",\n    \"Account\": \"111122223333\",\n    \"Arn\": \"arn:aws:sts::111122223333:assumed-role/s3-read-role/eks-pod-identity\"\n}" },
+    { command: "kubectl run s3-test -n shop --image=amazon/aws-cli --overrides='{\"spec\":{\"serviceAccountName\":\"report-reader\"}}' --rm -it --restart=Never -- s3 ls s3://shop-lab-reports-trung", output: "2026-09-10 08:12:03       2048 weekly-report.csv" },
+    { comment: "Thử thao tác không được phép — phải bị từ chối", command: "kubectl run s3-test -n shop --image=amazon/aws-cli --overrides='{\"spec\":{\"serviceAccountName\":\"report-reader\"}}' --rm -it --restart=Never -- s3 rm s3://shop-lab-reports-trung/weekly-report.csv", output: "An error occurred (AccessDenied) when calling the DeleteObject operation: Access Denied" },
+    { comment: "Pod dùng ServiceAccount default không có association → không có quyền", command: "kubectl run s3-test-default -n shop --image=amazon/aws-cli --rm -it --restart=Never -- s3 ls s3://shop-lab-reports-trung", output: "Unable to locate credentials" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Gắn IAM role thẳng vào node (Instance Profile) thay vì vào ServiceAccount.** Mọi pod chạy trên node đó — kể cả pod của người khác — đều "mượn" được quyền của node. Luôn gắn quyền theo ServiceAccount (Pod Identity/IRSA), không theo node.
+
+</Callout>
+
+<Callout type="warning" title="Đừng nhầm với imagePullSecrets">
+
+Pod Identity/IRSA cấp quyền gọi **AWS API** (S3, DynamoDB…). Kéo image từ **ECR private** dùng cơ chế khác (node role hoặc `aws ecr get-login-password`, thường đã có sẵn qua node IAM role). Hai việc khác nhau, đừng lẫn khi debug.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "EKS Pod Identity", meaning: "Gắn IAM role cho ServiceAccount qua association, không cần OIDC provider." },
+    { term: "IRSA", meaning: "IAM Roles for Service Accounts — cơ chế cũ hơn dùng OIDC + annotation." },
+    { term: "OIDC provider", meaning: "Nguồn tin cậy IAM dùng để xác minh JWT token của cluster (chỉ IRSA cần)." },
+    { term: "trust policy", meaning: "Phần của IAM role định nghĩa AI được assume role đó." },
+    { term: "sts:AssumeRoleWithWebIdentity", meaning: "API STS dùng token JWT để đổi lấy credentials tạm thời (IRSA)." },
+    { term: "least privilege", meaning: "Chỉ cấp đúng action/resource cần thiết, không dùng `*`." },
+  ]}
+/>
+
+<QuickCheck
+  question="Pod dùng ServiceAccount `report-reader` báo lỗi `AccessDenied` khi gọi S3, dù association Pod Identity đã tạo đúng. Kiểm tra tiếp điều gì?"
+  options={[
+    "Xem policy gắn vào role s3-read-role có cho phép đúng action/bucket đang gọi không",
+    "Restart toàn bộ cluster",
+    "Đổi ServiceAccount sang default",
+    "Tăng memory limit của pod",
+  ]}
+  answerIndex={0}
+  explanation="Association đúng nghĩa là pod ĐÃ lấy được credentials của đúng role — AccessDenied lúc này là do chính IAM policy của role chưa cho phép action/resource đó, không phải lỗi kết nối identity."
+/>
