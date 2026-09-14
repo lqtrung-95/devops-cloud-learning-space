@@ -1,0 +1,146 @@
+import { PullRequestGateFlowDiagram } from "../diagrams/pull-request-gate-flow-diagram";
+import { SemverBumpDiagram } from "../diagrams/semver-bump-diagram";
+
+<Eli5 title="Pull Request & branch protection giống như quy trình duyệt bài trước khi lên báo" emoji="📰">
+  Phóng viên viết bài xong **không được tự tay đưa lên trang nhất**. Bài phải qua **máy kiểm tra chính tả tự động** (CI), rồi **biên tập viên phụ trách chuyên mục** đọc duyệt (code review, CODEOWNERS). Toà soạn có **nội quy cứng**: bài chưa đủ chữ ký duyệt thì máy in từ chối in — kể cả tổng biên tập (branch protection).
+
+  Mỗi bài có **tiêu đề theo mẫu** ("[Sửa lỗi] …", "[Tin mới] …") để cuối tuần toà soạn tự tổng hợp mục lục (conventional commits → changelog). Và mỗi số báo có **số phát hành** cho biết thay đổi lớn hay nhỏ (semantic versioning).
+
+  Chỗ ví dụ gãy: quy trình này không để "làm khó" nhau — mục tiêu là **bắt lỗi sớm, chia sẻ kiến thức**, và vẫn phải **nhanh**. PR chờ duyệt 3 ngày cũng là một kiểu lãng phí.
+</Eli5>
+
+Đây là phần "sample app xuyên suốt" bắt đầu có **quy trình**: từ nay mọi thay đổi vào `main` của `sample-app` đều đi qua PR, CI và review. Bấm thử ba kịch bản bên dưới.
+
+<PullRequestGateFlowDiagram />
+
+<Technical>
+
+### Một PR tốt
+
+- **Nhỏ** và làm **một việc**; tiêu đề theo Conventional Commits (vì squash merge sẽ dùng tiêu đề PR làm commit message).
+- Mô tả: *vì sao* thay đổi, *cách test*, ảnh chụp/log nếu có, rủi ro & cách rollback.
+- Reviewer tập trung vào logic, thiết kế, bảo mật; phần định dạng để **máy** lo (formatter, linter).
+
+```markdown title=".github/pull_request_template.md"
+## Vì sao?
+<!-- Link issue, bối cảnh -->
+
+## Thay đổi gì?
+
+## Test thế nào?
+- [ ] Unit test pass (`npm test`)
+- [ ] Đã chạy local với docker compose
+
+## Rủi ro / rollback
+```
+
+### Branch protection & CODEOWNERS
+
+Trên GitHub: *Settings → Branches* (classic branch protection) hoặc *Settings → Rules → Rulesets* (cơ chế mới hơn, linh hoạt hơn). Với repo private, một số tính năng phụ thuộc gói GitHub — kiểm tra tài liệu hiện hành. Các rule nên bật cho `main`:
+
+| Rule | Tác dụng |
+|---|---|
+| Require a pull request before merging | Không push thẳng |
+| Require approvals (≥ 1) + Require review from Code Owners | Đúng người phụ trách phải duyệt |
+| Dismiss stale approvals | Push commit mới thì approval cũ bị huỷ |
+| Require status checks to pass (vd `test`) + branch up to date | CI đỏ thì không merge |
+| Block force pushes, restrict deletions | Không ai viết lại lịch sử main |
+| Do not allow bypassing / include administrators | Admin cũng theo quy trình |
+
+```text title=".github/CODEOWNERS"
+# Quy tắc khớp SAU CÙNG thắng
+*                   @trung
+/api/               @trung @org/backend-team
+/infra/             @org/platform-team
+/.github/workflows/ @org/platform-team
+```
+
+### Conventional Commits
+
+Cấu trúc: `type(scope)!: mô tả` + body + footer.
+
+| Type | Khi nào | Ảnh hưởng version |
+|---|---|---|
+| `feat` | Tính năng mới | MINOR |
+| `fix` | Sửa lỗi | PATCH |
+| `feat!` / footer `BREAKING CHANGE:` | Phá vỡ tương thích | MAJOR |
+| `docs`, `chore`, `refactor`, `test`, `ci`, `build`, `perf`, `style` | Còn lại | Thường không release (tuỳ cấu hình công cụ) |
+
+### Semantic Versioning `MAJOR.MINOR.PATCH`
+
+<SemverBumpDiagram />
+
+- **MAJOR**: thay đổi không tương thích ngược (xoá endpoint, đổi format response).
+- **MINOR**: thêm tính năng, tương thích ngược. **PATCH**: sửa lỗi tương thích ngược.
+- Pre-release: `2.0.0-rc.1`. Giai đoạn `0.y.z` được coi là chưa ổn định — API có thể đổi bất cứ lúc nào.
+- Công cụ tự động hoá từ commit: **semantic-release**, **release-please** (tạo PR release + changelog).
+
+### Pre-commit hooks — bắt lỗi trước cả khi commit
+
+```yaml title=".pre-commit-config.yaml"
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0            # chạy `pre-commit autoupdate` để lấy bản mới nhất
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: detect-private-key
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks        # quét secret (API key, token) trong thay đổi
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.6.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]   # kiểm tra message theo Conventional Commits
+```
+
+Hook chạy trên máy dev nên **có thể bị bỏ qua** (`git commit --no-verify`). Vì vậy các kiểm tra quan trọng phải **chạy lại trong CI** — hook chỉ để phản hồi nhanh hơn.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài pre-commit và gắn hook vào repo (cả hook commit-msg)", command: "pipx install pre-commit && pre-commit install && pre-commit install --hook-type commit-msg", output: "pre-commit installed at .git/hooks/pre-commit\npre-commit installed at .git/hooks/commit-msg" },
+    { comment: "Commit message sai chuẩn bị chặn", command: "git commit -m \"sua loi healthz\"", output: "trim trailing whitespace.................................................Passed\ndetect private key.......................................................Passed\nDetect hardcoded secrets.................................................Passed\nConventional Commit......................................................Failed\n- hook id: conventional-pre-commit\n- exit code: 1" },
+    { command: "git commit -m \"fix(api): return 503 when redis is down\"", output: "Conventional Commit......................................................Passed\n[feat/healthz 4d1b2c9] fix(api): return 503 when redis is down\n 1 file changed, 6 insertions(+), 2 deletions(-)" },
+    { comment: "Mở PR từ terminal", command: "gh pr create --fill --base main", output: "Creating pull request for feat/healthz into main in trung/sample-app\n\nhttps://github.com/trung/sample-app/pull/43" },
+    { comment: "Xem trạng thái CI của PR", command: "gh pr checks 43", output: "All checks were successful\n0 cancelled, 0 failing, 2 successful, 0 skipped, and 0 pending checks\n\n✓  lint  12s  https://github.com/trung/sample-app/actions/runs/...\n✓  test  41s  https://github.com/trung/sample-app/actions/runs/..." },
+    { comment: "Merge kiểu squash và xoá nhánh (chỉ thành công khi đủ điều kiện branch protection)", command: "gh pr merge 43 --squash --delete-branch", output: "✓ Squashed and merged pull request trung/sample-app#43 (fix(api): return 503 when redis is down)\n✓ Deleted local branch feat/healthz and switched to branch main\n✓ Deleted remote branch feat/healthz" },
+    { comment: "Thử push thẳng main khi đã bật protection", command: "git push origin main", output: "remote: error: GH006: Protected branch update failed for refs/heads/main.\nremote: - Changes must be made through a pull request.\n ! [remote rejected] main -> main (protected branch hook declined)" },
+  ]}
+/>
+
+Nếu dùng **Rulesets** thay vì branch protection cổ điển, thông báo lỗi sẽ khác (dạng `GH013: Repository rule violations found`) nhưng ý nghĩa tương tự.
+
+<Callout type="mistake" title="Required status check không bao giờ chạy">
+  Bạn bắt buộc check tên `test`, nhưng workflow CI đặt tên job là `unit-tests` → PR treo mãi ở "Expected — Waiting for status to be reported". Tên check trong rule phải **khớp chính xác** tên job hiển thị trên PR.
+</Callout>
+
+<Callout type="warning" title="Bump MAJOR âm thầm">
+  Đổi format JSON response hoặc xoá field mà commit là `fix:` → công cụ release chỉ tăng PATCH, client tự động cập nhật và… vỡ. Thay đổi phá vỡ tương thích **phải** đánh dấu `!` hoặc `BREAKING CHANGE:`.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Pull Request (PR)", meaning: "Đề nghị merge một nhánh, nơi chạy CI, review và thảo luận." },
+    { term: "branch protection / ruleset", meaning: "Luật bắt buộc cho nhánh: cần PR, approval, CI xanh, cấm force push." },
+    { term: "CODEOWNERS", meaning: "File chỉ định ai phải duyệt thay đổi ở từng đường dẫn." },
+    { term: "status check", meaning: "Kết quả CI gắn vào commit/PR, có thể bắt buộc phải xanh." },
+    { term: "Conventional Commits", meaning: "Chuẩn message `type(scope): mô tả` để máy hiểu và sinh changelog." },
+    { term: "semantic versioning", meaning: "MAJOR.MINOR.PATCH — số nào tăng cho biết mức độ thay đổi." },
+    { term: "pre-commit hook", meaning: "Script chạy tự động trước khi commit để bắt lỗi sớm." },
+  ]}
+/>
+
+<QuickCheck
+  question="Từ tag `v2.3.1`, main có các commit: `docs: fix typo`, `fix(api): null check`, `feat(api): add export CSV`. Version kế tiếp theo semantic-release mặc định là gì?"
+  options={["v2.3.2", "v3.0.0", "v2.4.0", "v2.3.1 (không đổi)"]}
+  answerIndex={2}
+  explanation="Lấy mức cao nhất: có feat → tăng MINOR và reset PATCH về 0 → v2.4.0. Không có ! hay BREAKING CHANGE nên không lên MAJOR. Như số báo: có tin mới thì tăng số kỳ, không phải chỉ đính chính."
+/>

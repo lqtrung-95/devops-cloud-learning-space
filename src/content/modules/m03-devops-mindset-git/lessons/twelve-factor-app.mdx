@@ -1,0 +1,143 @@
+import { TwelveFactorExplorerDiagram } from "../diagrams/twelve-factor-explorer-diagram";
+
+<Eli5 title="Twelve-Factor App giống như chuẩn hoá một chuỗi quán phở để mở chi nhánh ở đâu cũng được" emoji="🍲">
+  Quán phở gia đình ngon nhờ **bà chủ nhớ trong đầu**: nêm bao nhiêu muối, nồi nào để góc nào, sổ khách nợ nằm dưới quầy. Muốn mở chi nhánh thứ hai là… bế tắc.
+
+  Chuỗi phở chuyên nghiệp thì **chuẩn hoá**: công thức ghi rõ (dependencies), gia vị theo vùng ghi trên **tờ cấu hình dán ở bếp** chứ không sửa công thức (config qua env), nguyên liệu nhận từ **nhà cung cấp đổi được** (backing services), nhân viên ca nào vào cũng làm được vì **không giữ đồ riêng trong túi** (stateless), đóng cửa thì dọn dẹp gọn gàng (graceful shutdown).
+
+  Nhờ vậy muốn phục vụ đông hơn chỉ cần **mở thêm quầy** giống hệt — đó chính là scale out trên cloud.
+</Eli5>
+
+Bộ nguyên tắc này (12factor.net, ra đời từ kinh nghiệm vận hành nền tảng Heroku) là **ngôn ngữ chung** giữa dev và DevOps. Khi bạn đóng gói app vào container (M04), deploy lên Kubernetes (M12), mọi công cụ đều mặc định app đọc config từ env, log ra stdout và chịu được việc bị tắt/bật bất cứ lúc nào. App mẫu `sample-app` của khoá học sẽ được xây theo các nguyên tắc này.
+
+<TwelveFactorExplorerDiagram />
+
+<Technical>
+
+### 12 nguyên tắc tóm tắt
+
+| # | Factor | Một câu |
+|---|---|---|
+| I | Codebase | Một repo, nhiều lần deploy |
+| II | Dependencies | Khai báo tường minh, cô lập |
+| III | Config | Lưu trong environment |
+| IV | Backing services | DB/cache/queue là tài nguyên gắn qua URL |
+| V | Build, release, run | Tách biệt 3 giai đoạn |
+| VI | Processes | Stateless, share-nothing |
+| VII | Port binding | App tự export dịch vụ qua port |
+| VIII | Concurrency | Scale out bằng process model |
+| IX | Disposability | Khởi động nhanh, tắt êm |
+| X | Dev/prod parity | Môi trường giống nhau |
+| XI | Logs | Luồng sự kiện ra stdout |
+| XII | Admin processes | Tác vụ quản trị chạy như process một lần |
+
+### Áp dụng cho `sample-app` (Node.js ví dụ — Python/Go tương tự)
+
+```js title="api/src/config.js"
+// Factor III: mọi thứ thay đổi theo môi trường đều đến từ env. Thiếu là dừng ngay (fail fast).
+const required = ["DATABASE_URL", "REDIS_URL"];
+const missing = required.filter((name) => !process.env[name]);
+if (missing.length > 0) {
+  console.error(JSON.stringify({ level: "fatal", msg: "missing env vars", missing }));
+  process.exit(1);
+}
+
+export const config = {
+  port: Number(process.env.PORT ?? 3000),          // Factor VII
+  databaseUrl: process.env.DATABASE_URL,           // Factor IV
+  redisUrl: process.env.REDIS_URL,
+  logLevel: process.env.LOG_LEVEL ?? "info",
+};
+```
+
+```js title="api/src/server.js (rút gọn)"
+import express from "express";
+import { config } from "./config.js";
+import { db, redis } from "./clients.js";
+
+const app = express();
+
+// Liveness/readiness đơn giản cho load balancer & Kubernetes
+app.get("/healthz", async (_req, res) => {
+  try {
+    await db.query("SELECT 1");
+    await redis.ping();
+    res.json({ status: "ok" });
+  } catch (error) {
+    res.status(503).json({ status: "degraded", error: error.message });
+  }
+});
+
+const server = app.listen(config.port, () =>
+  console.log(JSON.stringify({ level: "info", msg: "listening", port: config.port })), // Factor XI: log ra stdout
+);
+
+// Factor IX: nhận SIGTERM (docker stop, Kubernetes) → ngừng nhận request mới, đóng kết nối rồi thoát
+process.on("SIGTERM", () => {
+  console.log(JSON.stringify({ level: "info", msg: "SIGTERM received, shutting down" }));
+  server.close(async () => {
+    await Promise.allSettled([db.end(), redis.quit()]);
+    process.exit(0);
+  });
+});
+```
+
+```ini title=".env.example (commit file này; KHÔNG commit .env thật)"
+PORT=3000
+DATABASE_URL=postgres://app:app@localhost:5432/sample_app
+REDIS_URL=redis://localhost:6379
+LOG_LEVEL=info
+```
+
+Endpoint `/metrics` (định dạng Prometheus) sẽ được thêm ở M15 — bây giờ chỉ cần chừa chỗ trong thiết kế.
+
+### Config ≠ secret store
+
+Factor III nói config **đi vào process qua env**; nó không bảo bạn rải mật khẩu trong file `.env` trên server. Ở production, secret nên nằm trong **AWS Secrets Manager / SSM Parameter Store / Kubernetes Secret** và được inject vào env lúc chạy (M08, M13).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chạy Postgres + Redis cho dev (sẽ học kỹ ở M04)", command: "docker run -d --name pg -e POSTGRES_USER=app -e POSTGRES_PASSWORD=app -e POSTGRES_DB=sample_app -p 127.0.0.1:5432:5432 postgres:16 && docker run -d --name redis -p 127.0.0.1:6379:6379 redis:7", output: "3f9c1d0e8a7b...\n9b2e44a1c6d3..." },
+    { comment: "Quên env → app dừng ngay với lỗi rõ ràng thay vì chạy sai âm thầm", command: "node api/src/server.js", output: "{\"level\":\"fatal\",\"msg\":\"missing env vars\",\"missing\":[\"DATABASE_URL\",\"REDIS_URL\"]}" },
+    { comment: "Nạp env từ file (Node ≥ 20.6 hỗ trợ --env-file)", command: "cp .env.example .env && node --env-file=.env api/src/server.js", output: "{\"level\":\"info\",\"msg\":\"listening\",\"port\":3000}" },
+    { comment: "Terminal khác: kiểm tra health", command: "curl -s localhost:3000/healthz", output: "{\"status\":\"ok\"}" },
+    { comment: "Cùng code, khác config: chạy bản thứ hai ở port khác (scale out)", command: "PORT=3001 node --env-file=.env api/src/server.js", output: "{\"level\":\"info\",\"msg\":\"listening\",\"port\":3001}" },
+    { comment: "Giả lập Kubernetes tắt pod: gửi SIGTERM", command: "pkill -TERM -f 'server.js'", output: "{\"level\":\"info\",\"msg\":\"SIGTERM received, shutting down\"}" },
+  ]}
+/>
+
+<Callout type="mistake" title="if (env === 'production') khắp nơi trong code">
+  Rẽ nhánh theo tên môi trường (`if NODE_ENV === "staging"` thì dùng DB này…) là giấu config vào code. Thêm một môi trường mới là phải sửa code. Hãy đưa **từng giá trị** thành biến env riêng.
+</Callout>
+
+<Callout type="warning" title="Commit file .env">
+  Thêm `.env` vào `.gitignore` ngay khi tạo repo, và bật pre-commit hook quét secret (bài PR workflow). Secret đã lên Git thì coi như **đã lộ**: phải rotate, xoá khỏi lịch sử là chưa đủ.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Twelve-Factor App", meaning: "12 nguyên tắc xây app dễ deploy, dễ scale trên cloud." },
+    { term: "config qua env", meaning: "Giá trị khác nhau giữa môi trường được truyền bằng biến môi trường." },
+    { term: "backing service", meaning: "Dịch vụ app dùng qua mạng (DB, cache, queue), gắn bằng URL." },
+    { term: "stateless process", meaning: "Process không giữ dữ liệu cần lưu lâu dài trong bộ nhớ/ổ đĩa local." },
+    { term: "graceful shutdown", meaning: "Nhận SIGTERM thì xử lý nốt request, đóng kết nối rồi mới thoát." },
+    { term: "dev/prod parity", meaning: "Giữ môi trường dev giống production để lỗi lộ ra sớm." },
+    { term: "/healthz", meaning: "Endpoint cho load balancer/orchestrator hỏi 'app còn khoẻ không?'." },
+  ]}
+/>
+
+<QuickCheck
+  question="App lưu ảnh người dùng upload vào thư mục `./uploads` trên máy chủ. Khi scale lên 3 instance sau load balancer, người dùng lúc thấy ảnh lúc không. Vi phạm factor nào và sửa thế nào?"
+  options={[
+    "Factor XI Logs — ghi log ra stdout",
+    "Factor I Codebase — tách thành 3 repo",
+    "Factor VI Processes — lưu file vào backing service dùng chung như S3",
+    "Factor VII Port binding — đổi port cho mỗi instance",
+  ]}
+  answerIndex={2}
+  explanation="Như nhân viên giữ đồ riêng trong túi: khách gặp nhân viên khác thì không lấy được. Process phải stateless — dữ liệu cần giữ đưa ra kho chung (S3, DB, Redis)."
+/>

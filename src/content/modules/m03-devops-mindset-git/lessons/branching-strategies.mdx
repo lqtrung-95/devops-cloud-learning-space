@@ -1,0 +1,96 @@
+import { BranchingStrategyTimelineDiagram } from "../diagrams/branching-strategy-timeline-diagram";
+
+<Eli5 title="Chiến lược nhánh Git giống như cách một nhóm cùng viết chung một cuốn sách" emoji="📚">
+  Cả nhóm viết chung **một bản thảo chính** (branch `main`). Mỗi người muốn viết thêm một đoạn thì **photo ra một bản nháp** (feature branch), viết xong rồi **ghép lại vào bản chính**.
+
+  Nhóm A (**trunk-based**) quy ước: bản nháp chỉ được giữ **1–2 ngày**, viết từng đoạn ngắn rồi ghép ngay. Vì ghép liên tục, các đoạn gần như không bao giờ đá nhau. Chương nào chưa xong thì vẫn ghép, nhưng **dán giấy "chưa in"** lên (feature flag).
+
+  Nhóm B (**GitFlow**) thì có bản chính, bản "sắp in", bản "đang gom chương mới", mỗi người giữ nháp **vài tuần**. Tới lúc ghép thì phát hiện ba người sửa cùng một trang theo ba kiểu — mất cả tuần để gỡ.
+</Eli5>
+
+Chiến lược nhánh quyết định pipeline CI/CD của bạn trông ra sao: build nhánh nào, deploy từ đâu, release thế nào. Nó cũng ảnh hưởng trực tiếp tới **lead time** và **deployment frequency** trong DORA. Chuyển qua lại hai chiến lược bên dưới và bấm từng bước.
+
+<BranchingStrategyTimelineDiagram />
+
+<Technical>
+
+### So sánh các chiến lược phổ biến
+
+| | Trunk-based development | GitHub Flow | GitFlow |
+|---|---|---|---|
+| Nhánh sống lâu | Chỉ `main` | Chỉ `main` | `main` + `develop` |
+| Nhánh tạm | Rất ngắn (giờ → 1–2 ngày), hoặc commit thẳng trunk ở team nhỏ kỷ luật cao | Feature branch + PR, deploy sau khi merge | `feature/*`, `release/*`, `hotfix/*`, thường sống lâu |
+| Tính năng chưa xong | Feature flag | Feature flag hoặc giữ PR mở | Nằm trên feature branch |
+| Release | Tag từ main, deploy liên tục | Deploy từ main | Qua nhánh release, merge vào main + develop |
+| Hợp với | Web/SaaS, CI/CD mạnh, deploy nhiều lần/ngày | Đa số team web dùng GitHub | Phần mềm đóng gói, nhiều version song song (mobile app, thư viện, on-premise) |
+| Rủi ro chính | Cần test tự động tốt, kỷ luật PR nhỏ | Như trunk-based nếu PR để lâu | Merge hell, lead time dài, nhiều nghi thức |
+
+Nghiên cứu DORA ghi nhận trunk-based development (nhánh ngắn, ít nhánh sống lâu) là một trong các năng lực gắn với hiệu quả giao phần mềm cao. Ngay cả tác giả mô hình GitFlow cũng đã ghi chú rằng nó không phải lựa chọn mặc định cho web app deploy liên tục.
+
+### Feature flag — tách "deploy" khỏi "release"
+
+```js title="api/src/routes/cart.js"
+// Code giỏ hàng mới đã merge và deploy, nhưng chỉ bật khi flag = true
+if (flags.isEnabled("cart_v2", { userId: req.user.id })) {
+  return renderCartV2(req, res);
+}
+return renderCartV1(req, res);
+```
+
+- **Deploy** = đưa code lên production. **Release** = cho người dùng thấy tính năng.
+- Flag cho phép bật dần (1% → 10% → 100%), tắt ngay khi lỗi mà không cần rollback.
+- Nhớ **dọn flag cũ** — flag tồn tại mãi là nợ kỹ thuật. Công cụ: tự viết đơn giản bằng config, hoặc LaunchDarkly, Unleash, OpenFeature, AWS AppConfig.
+
+### Giữ nhánh ngắn trong thực tế
+
+- Chia việc thành PR nhỏ (lý tưởng dưới vài trăm dòng thay đổi).
+- Cập nhật nhánh từ main thường xuyên: `git pull --rebase origin main`.
+- Merge rồi thì xoá nhánh; nhánh cũ hơn vài ngày là tín hiệu cần chia nhỏ việc.
+
+</Technical>
+
+## Thực hành: vòng đời một nhánh ngắn
+
+<Terminal
+  commands={[
+    { comment: "Luôn bắt đầu từ main mới nhất", command: "git switch main && git pull --ff-only", output: "Already on 'main'\nUpdating 3e1a9c2..7b4d0f1\nFast-forward\n api/src/server.js | 12 ++++++++++--\n 1 file changed, 10 insertions(+), 2 deletions(-)" },
+    { command: "git switch -c feat/healthz", output: "Switched to a new branch 'feat/healthz'" },
+    { comment: "Làm việc, commit nhỏ", command: "git add api/src/server.js && git commit -m \"feat(api): add /healthz endpoint\"", output: "[feat/healthz 9c2e7aa] feat(api): add /healthz endpoint\n 1 file changed, 14 insertions(+)" },
+    { comment: "Trong lúc đó main đã có commit mới — cập nhật bằng rebase để lịch sử thẳng", command: "git fetch origin && git rebase origin/main", output: "Successfully rebased and updated refs/heads/feat/healthz." },
+    { comment: "Đẩy nhánh lên (sau rebase cần --force-with-lease, an toàn hơn --force)", command: "git push --force-with-lease -u origin feat/healthz", output: "To github.com:trung/sample-app.git\n * [new branch]      feat/healthz -> feat/healthz\nbranch 'feat/healthz' set up to track 'origin/feat/healthz'." },
+    { comment: "Nhánh nào đã tồn tại lâu? (dọn dẹp định kỳ)", command: "git for-each-ref --sort=committerdate refs/remotes/origin --format='%(committerdate:relative)  %(refname:short)'", output: "5 weeks ago  origin/feature/new-checkout\n3 days ago   origin/feat/search\n2 hours ago  origin/feat/healthz\n10 minutes ago  origin/main" },
+  ]}
+/>
+
+Nhánh `feature/new-checkout` 5 tuần tuổi chính là "bản nháp giữ quá lâu": càng để lâu, conflict càng lớn. Hãy chia nhỏ và merge phần đã xong sau feature flag.
+
+<Callout type="mistake" title="Rebase nhánh mà người khác đang dùng chung">
+  Rebase viết lại lịch sử. Rebase nhánh cá nhân của bạn thì ổn; rebase `main` hay nhánh nhiều người cùng push rồi `git push --force` sẽ xoá mất commit của đồng nghiệp. Không bao giờ force-push lên `main` (branch protection sẽ chặn giúp bạn).
+</Callout>
+
+<Callout type="tip">
+  Chọn chiến lược theo **cách phát hành**, không theo thói quen: web app deploy liên tục → trunk-based/GitHub Flow. Thư viện hoặc app mobile phải duy trì nhiều version → cân nhắc thêm release branch, nhưng vẫn giữ feature branch ngắn.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "trunk-based development", meaning: "Mọi người tích hợp vào một nhánh chính qua nhánh rất ngắn." },
+    { term: "GitFlow", meaning: "Mô hình nhiều nhánh sống lâu: main, develop, release, hotfix, feature." },
+    { term: "feature branch", meaning: "Nhánh tạm để làm một thay đổi, merge vào nhánh chính qua PR." },
+    { term: "feature flag", meaning: "Công tắc bật/tắt tính năng lúc chạy, tách deploy khỏi release." },
+    { term: "rebase", meaning: "Đặt lại các commit của nhánh lên trên đỉnh mới của nhánh khác." },
+    { term: "merge conflict", meaning: "Hai nhánh sửa cùng chỗ theo cách khác nhau, Git cần người quyết định." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team web deploy nhiều lần mỗi ngày. Một tính năng thanh toán mới cần 3 tuần mới hoàn thiện. Cách làm phù hợp với trunk-based development?"
+  options={[
+    "Giữ một nhánh feature/payment 3 tuần rồi merge một lần",
+    "Tạo nhánh develop riêng cho tính năng này",
+    "Tạm dừng mọi deploy trong 3 tuần",
+    "Chia thành nhiều PR nhỏ merge liên tục vào main, ẩn tính năng sau feature flag tới khi xong",
+  ]}
+  answerIndex={3}
+  explanation="Như viết sách: ghép từng đoạn ngắn vào bản chính và dán giấy 'chưa in' lên chương chưa xong. Code được tích hợp liên tục mà người dùng chưa thấy tính năng dở dang."
+/>

@@ -1,0 +1,92 @@
+import { ErrorBudgetCalculatorDiagram } from "../diagrams/error-budget-calculator-diagram";
+
+<Eli5 title="DevOps, SRE và Platform Engineering giống như văn hoá, đội an toàn và đội hạ tầng của một hãng xe buýt" emoji="🚌">
+  **DevOps** là **văn hoá** của cả hãng xe buýt: tài xế, thợ sửa xe, người lập lộ trình cùng chịu trách nhiệm cho chuyến xe đúng giờ, cùng xem phản hồi của hành khách.
+
+  **SRE** (Site Reliability Engineering) là **đội an toàn vận hành** dùng tư duy kỹ sư: đặt cam kết rõ ràng "99,9% chuyến xe đúng giờ trong tháng" (SLO). Phần 0,1% còn lại là **ngân sách được phép trễ** (error budget). Còn ngân sách thì cứ mở tuyến mới; hết ngân sách thì tạm dừng mở tuyến, dồn sức bảo dưỡng xe.
+
+  **Platform Engineering** là **đội xây bến bãi và làm xe mẫu**: thay vì mỗi tuyến tự mua xe, tự làm trạm, họ cung cấp **"con đường trải sẵn"** (golden path) — muốn mở tuyến mới chỉ cần điền form, xe và trạm đạt chuẩn có sẵn.
+</Eli5>
+
+Khi đi xin việc bạn sẽ thấy các chức danh DevOps Engineer, SRE, Platform Engineer, Cloud Engineer với mô tả công việc chồng lấn nhau. Hiểu **mỗi hướng tối ưu cho điều gì** giúp bạn đọc JD chính xác và định hướng lộ trình (khoá này có M16 SRE Practices). Thử chọn SLO và thêm sự cố bên dưới để thấy error budget điều khiển quyết định thế nào.
+
+<ErrorBudgetCalculatorDiagram />
+
+<Technical>
+
+### So sánh ba hướng
+
+| | DevOps | SRE | Platform Engineering |
+|---|---|---|---|
+| Bản chất | Văn hoá + tập thực hành | Cách hiện thực DevOps bằng kỹ thuật phần mềm (Google khởi xướng) | Xây nền tảng nội bộ phục vụ các team sản phẩm |
+| Câu hỏi chính | Làm sao giao thay đổi nhanh và ổn định? | Hệ thống cần tin cậy tới mức nào, và làm sao đạt được? | Làm sao để dev tự phục vụ mà không cần hiểu hết hạ tầng? |
+| Công cụ tư duy | CALMS, DORA, CI/CD | SLI/SLO, error budget, giảm toil, postmortem, on-call | Internal Developer Platform (IDP), golden path, "platform as a product" |
+| Sản phẩm đầu ra | Pipeline, quy trình, tự động hoá | SLO dashboard, alert theo triệu chứng, runbook, cải tiến reliability | Template dịch vụ, portal (vd Backstage), module Terraform dùng chung, CI/CD tự phục vụ |
+| "Khách hàng" | Cả tổ chức | Người dùng cuối (thông qua reliability) | Developer nội bộ |
+
+Câu nổi tiếng trong sách *Site Reliability Engineering* của Google: SRE là *"what happens when you ask a software engineer to design an operations team"*. Còn sách Google thường tóm gọn quan hệ: **"class SRE implements interface DevOps"**.
+
+### SLI, SLO, SLA
+
+| Thuật ngữ | Là gì | Ví dụ cho `sample-app` |
+|---|---|---|
+| **SLI** (indicator) | Số đo thực tế về trải nghiệm | % request `/api/*` trả về không phải 5xx trong < 300ms |
+| **SLO** (objective) | Mục tiêu nội bộ cho SLI trong một khoảng thời gian | 99,9% request tốt trong cửa sổ 30 ngày |
+| **SLA** (agreement) | Cam kết hợp đồng với khách, vi phạm có phạt | 99,5% — luôn **lỏng hơn** SLO để có vùng đệm |
+
+### Error budget
+
+- Error budget = `1 − SLO`. Với 99,9% trong 30 ngày: `0,001 × 43.200 phút ≈ 43,2 phút` downtime (hoặc 0,1% request lỗi).
+- Mỗi số 9 thêm vào làm budget **nhỏ đi 10 lần**: 99,99% chỉ còn khoảng 4,3 phút/tháng — thường cần multi-AZ/multi-region, deploy canary, on-call nghiêm ngặt… rất đắt.
+- **Error budget policy** (team tự thống nhất): còn budget → ưu tiên tính năng; cạn budget → dừng release rủi ro, ưu tiên sửa reliability. Nó biến tranh cãi "dev muốn nhanh, ops muốn ổn định" thành một **quyết định dựa trên số liệu**.
+- **Toil**: việc vận hành thủ công, lặp lại, không tạo giá trị lâu dài (restart tay, tạo user tay). SRE đặt giới hạn toil và tự động hoá phần vượt.
+
+### Platform Engineering & golden path
+
+Ví dụ golden path cho một service mới: dev chạy template → có sẵn repo theo 12-factor, Dockerfile, pipeline CI/CD, dashboard, alert, IAM tối thiểu. Team platform coi đó là **sản phẩm**: đo mức độ dùng, lắng nghe dev, không ép buộc bằng quy định. Khoá học này dạy bạn đủ nền tảng (Terraform, Kubernetes, GitOps, observability) để làm cả ba hướng.
+
+</Technical>
+
+## Thực hành: tính SLO cho sample-app
+
+<Terminal
+  commands={[
+    { comment: "Budget downtime cho các mức SLO trong 30 ngày (phút)", command: "python3 -c \"[print(f'{s}% -> {(100-s)/100*43200:.2f} min') for s in (99, 99.5, 99.9, 99.95, 99.99)]\"", output: "99% -> 432.00 min\n99.5% -> 216.00 min\n99.9% -> 43.20 min\n99.95% -> 21.60 min\n99.99% -> 4.32 min" },
+    { comment: "SLI thô từ access log Nginx: % request không lỗi 5xx", command: "awk '{ total++; if ($9 !~ /^5/) good++ } END { printf \"good=%d total=%d SLI=%.3f%%\\n\", good, total, good/total*100 }' /var/log/nginx/access.log", output: "good=184213 total=184420 SLI=99.888%" },
+    { comment: "So với SLO 99.9%: đã dùng bao nhiêu % error budget?", command: "python3 -c \"bad=184420-184213; allowed=184420*0.001; print(f'bad={bad} allowed={allowed:.0f} used={bad/allowed*100:.0f}%')\"", output: "bad=207 allowed=184 used=112%" },
+  ]}
+/>
+
+Kết quả `used=112%`: theo error budget policy, team nên **tạm dừng release tính năng rủi ro** và ưu tiên tìm nguyên nhân các lỗi 5xx. Ở M15–M16 bạn sẽ đo SLI bằng Prometheus thay vì `awk` trên log.
+
+<Callout type="mistake" title="Đặt SLO 100% hoặc càng nhiều số 9 càng tốt">
+  100% là không thể (mạng của người dùng, nhà cung cấp cloud đều có lúc lỗi) và khiến team không dám thay đổi gì. Chọn SLO theo **mức người dùng thực sự cảm nhận** và theo SLO của những thứ bạn phụ thuộc — bạn không thể tin cậy hơn dependency yếu nhất nếu không có dự phòng.
+</Callout>
+
+<Callout type="info" title="Đọc JD cho đúng">
+  Nhiều công ty dùng "DevOps Engineer" cho công việc thực tế là platform/cloud engineer: viết Terraform, dựng CI/CD, vận hành Kubernetes. Hãy đọc phần trách nhiệm (on-call? SLO? xây IDP?) thay vì chỉ đọc chức danh.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "SRE", meaning: "Site Reliability Engineering — vận hành bằng tư duy và công cụ kỹ sư phần mềm." },
+    { term: "SLI", meaning: "Chỉ số đo trải nghiệm thực tế, vd tỉ lệ request thành công." },
+    { term: "SLO", meaning: "Mục tiêu nội bộ cho SLI trong một cửa sổ thời gian." },
+    { term: "SLA", meaning: "Cam kết hợp đồng với khách hàng, thường lỏng hơn SLO." },
+    { term: "error budget", meaning: "Phần được phép lỗi = 1 − SLO, dùng để cân bằng tốc độ và ổn định." },
+    { term: "toil", meaning: "Việc vận hành thủ công lặp lại, nên được tự động hoá." },
+    { term: "golden path", meaning: "Con đường trải sẵn do team platform cung cấp để dev tự phục vụ." },
+  ]}
+/>
+
+<QuickCheck
+  question="Service có SLO 99,9%/30 ngày. Mới giữa tháng đã có 50 phút downtime. Theo error budget policy thông thường, team nên làm gì?"
+  options={[
+    "Hạ SLO xuống 99% cho tháng này để số liệu đẹp",
+    "Tạm dừng release tính năng rủi ro, ưu tiên khắc phục nguyên nhân và cải thiện reliability",
+    "Deploy nhiều tính năng hơn để bù lại",
+    "Không làm gì, SLO chỉ để tham khảo",
+  ]}
+  answerIndex={1}
+  explanation="Budget 43,2 phút đã cạn: như hãng xe buýt hết 'ngân sách trễ', phải tạm dừng mở tuyến mới để bảo dưỡng xe. Đổi SLO để làm đẹp số là phá mục đích của đo lường."
+/>

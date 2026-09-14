@@ -1,0 +1,96 @@
+import { DevopsLifecycleLoopDiagram } from "../diagrams/devops-lifecycle-loop-diagram";
+
+<Eli5 title="DevOps giống như bếp và phục vụ trong nhà hàng cùng chịu trách nhiệm cho bữa ăn của khách" emoji="🍜">
+  Ở nhà hàng kiểu cũ, **bếp** (Dev) nấu xong thì "ném qua ô cửa" cho **phục vụ** (Ops). Khách chê món mặn thì phục vụ đổ lỗi bếp, bếp đổ lỗi phục vụ bưng chậm nên nguội. Món mới thì cả tháng mới dám ra một lần, vì lần nào ra cũng loạn.
+
+  Nhà hàng kiểu DevOps thì **bếp và phục vụ là một đội**, cùng nhìn **phản hồi của khách** mỗi ngày. Họ ra món mới **từng phần nhỏ, thường xuyên**, nếm thử tự động trước khi bưng (test), có quy trình chuẩn để ai làm cũng giống nhau (automation), và khi có sự cố thì **họp rút kinh nghiệm không đổ lỗi** để sửa quy trình.
+
+  Chỗ ví dụ gãy: DevOps **không phải** là gộp hai người thành một người làm hết việc, cũng không phải một chức danh "kỹ sư DevOps" đứng giữa. Đó là **cách làm việc** của cả tổ chức.
+</Eli5>
+
+Bạn sẽ học rất nhiều công cụ trong khoá này (Docker, Terraform, Kubernetes…). Nhưng công cụ chỉ là phương tiện: mục tiêu là **đưa thay đổi tới người dùng nhanh, an toàn và học được từ phản hồi**. Nhà tuyển dụng hỏi "DevOps là gì?" để xem bạn hiểu mục tiêu hay chỉ thuộc tên tool.
+
+<DevopsLifecycleLoopDiagram />
+
+<Technical>
+
+### CALMS — 5 trụ cột để đánh giá một tổ chức "có DevOps" chưa
+
+| Chữ | Nghĩa | Dấu hiệu thực tế |
+|---|---|---|
+| **C**ulture | Chia sẻ trách nhiệm, tin tưởng, không đổ lỗi | Postmortem blameless; "you build it, you run it" |
+| **A**utomation | Tự động hoá việc lặp lại | CI/CD, IaC, test tự động, không deploy bằng tay |
+| **L**ean | Làm theo lô nhỏ, giảm lãng phí, giảm việc dở dang | PR nhỏ, WIP limit, đo thời gian chờ |
+| **M**easurement | Quyết định dựa trên số liệu | DORA metrics, SLO, dashboard |
+| **S**haring | Chia sẻ kiến thức & công cụ | Runbook, tài liệu, inner-source, demo chung |
+
+### The Three Ways (từ *The Phoenix Project* / *The DevOps Handbook*)
+
+1. **Flow** — tối ưu dòng chảy từ Dev tới người dùng: lô nhỏ, tự động hoá, không để lỗi trôi xuống sau.
+2. **Feedback** — phản hồi nhanh từ phải sang trái: test trong vài phút, monitoring, cảnh báo sớm.
+3. **Continual learning & experimentation** — thử nghiệm có kiểm soát, học từ sự cố, dành thời gian cải tiến.
+
+### DORA metrics — đo hiệu quả giao phần mềm
+
+Nghiên cứu DORA (DevOps Research and Assessment, nay thuộc Google Cloud) nhiều năm cho thấy các metric sau gắn liền với hiệu quả của tổ chức:
+
+| Metric | Câu hỏi | Nhóm |
+|---|---|---|
+| **Deployment frequency** | Bao lâu deploy lên production một lần? | Throughput (tốc độ) |
+| **Lead time for changes** | Từ lúc commit tới lúc chạy trên production mất bao lâu? | Throughput |
+| **Change failure rate** | Bao nhiêu % lần deploy gây sự cố cần sửa gấp/rollback? | Stability (ổn định) |
+| **Time to restore** (nay DORA gọi là *failed deployment recovery time*) | Deploy lỗi thì mất bao lâu để khôi phục? | Stability |
+
+Phát hiện quan trọng nhất: **tốc độ và ổn định đi cùng nhau**, không phải đánh đổi. Team deploy thường xuyên theo lô nhỏ thường có tỉ lệ lỗi thấp hơn và khôi phục nhanh hơn. DORA tinh chỉnh tên gọi, số lượng metric (vd bổ sung rework rate, reliability) và ngưỡng xếp hạng qua từng năm — xem báo cáo mới nhất ở dora.dev thay vì học thuộc con số.
+
+### Anti-pattern hay gặp
+
+- Đổi tên team Ops thành "team DevOps" rồi mọi thứ vẫn như cũ — thêm một bức tường mới.
+- Dùng DORA metrics để **xếp hạng/phạt** cá nhân → mọi người "làm đẹp số" thay vì cải tiến.
+- Mua tool trước khi hiểu dòng chảy công việc đang tắc ở đâu.
+
+</Technical>
+
+## Thực hành: ước lượng DORA cho repo của bạn
+
+<Terminal
+  commands={[
+    { comment: "Các release gần nhất (nếu bạn tag mỗi lần deploy)", command: "git tag --list 'v*' --sort=-creatordate --format='%(creatordate:short) %(refname:short)' | head -5", output: "2026-09-12 v1.4.2\n2026-09-10 v1.4.1\n2026-09-08 v1.4.0\n2026-09-01 v1.3.0\n2026-08-25 v1.2.0" },
+    { comment: "Deployment frequency: số release trong 30 ngày qua", command: "git tag --list 'v*' --format='%(creatordate:short)' | awk '$1 >= \"2026-08-15\"' | wc -l", output: "5" },
+    { comment: "Lead time (xấp xỉ): thời gian từ lúc mở tới lúc merge các PR gần nhất", command: "gh pr list --state merged --limit 3 --json number,createdAt,mergedAt --jq '.[] | \"#\\(.number) \\(.createdAt) → \\(.mergedAt)\"'", output: "#42 2026-09-12T02:10:44Z → 2026-09-12T06:31:09Z\n#41 2026-09-10T08:03:12Z → 2026-09-10T09:15:40Z\n#40 2026-09-08T03:22:51Z → 2026-09-09T01:47:18Z" },
+    { comment: "Change failure rate (xấp xỉ): bao nhiêu commit revert / hotfix trong 30 ngày", command: "git log --since='30 days ago' --oneline | grep -ciE '^[0-9a-f]+ (revert|fix\\(hotfix\\))'", output: "1" },
+  ]}
+/>
+
+Với 5 lần deploy và 1 lần phải revert, change failure rate xấp xỉ 20%. Con số thô như vậy chưa hoàn hảo (lead time thật tính từ commit tới production), nhưng đủ để có **baseline** — ở M05 bạn sẽ đo chính xác hơn từ pipeline.
+
+<Callout type="mistake" title="Coi DevOps là một người hoặc một tool">
+  "Tuyển 1 bạn DevOps để lo CI/CD" trong khi dev vẫn không quan tâm code chạy trên production ra sao. Kỹ sư DevOps/Platform giỏi xây **đường ray** để team tự đi, không phải trở thành "người bấm deploy hộ".
+</Callout>
+
+<Callout type="tip">
+  Khi phỏng vấn, trả lời "DevOps là gì" bằng **mục tiêu + ví dụ**: "rút ngắn vòng phản hồi từ code tới người dùng mà vẫn ổn định; ví dụ ở dự án cũ tôi đưa deploy từ hàng tuần xuống hằng ngày nhờ CI và rollback tự động, đo bằng DORA metrics".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "DevOps", meaning: "Văn hoá + thực hành giúp Dev và Ops cùng giao phần mềm nhanh và ổn định." },
+    { term: "CALMS", meaning: "Culture, Automation, Lean, Measurement, Sharing — khung đánh giá DevOps." },
+    { term: "Three Ways", meaning: "Flow, Feedback, Continual learning — ba nguyên lý nền của DevOps." },
+    { term: "DORA metrics", meaning: "Bộ chỉ số đo tốc độ (deploy frequency, lead time) và ổn định (failure rate, recovery)." },
+    { term: "lead time for changes", meaning: "Thời gian từ commit tới khi chạy trên production." },
+    { term: "blameless postmortem", meaning: "Buổi rút kinh nghiệm sau sự cố, tập trung vào hệ thống thay vì đổ lỗi cá nhân." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team A deploy mỗi quý một lần với 300 thay đổi. Team B deploy mỗi ngày vài thay đổi. Theo nghiên cứu DORA, nhận định nào hợp lý nhất?"
+  options={[
+    "Team A ổn định hơn vì deploy ít nên ít rủi ro",
+    "Team B thường vừa nhanh hơn vừa dễ khoanh vùng và khôi phục lỗi hơn nhờ lô thay đổi nhỏ",
+    "Hai team như nhau, tần suất deploy không liên quan tới ổn định",
+    "Team B chắc chắn có change failure rate bằng 0",
+  ]}
+  answerIndex={1}
+  explanation="Như nhà hàng ra món mới từng món nhỏ mỗi ngày: món nào dở biết ngay và bỏ ngay. Gom 300 thay đổi một lần thì khi lỗi rất khó biết do đâu. Nhưng 'thường' không phải 'chắc chắn bằng 0'."
+/>
