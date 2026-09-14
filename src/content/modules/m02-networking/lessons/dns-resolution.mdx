@@ -1,0 +1,98 @@
+import { DnsResolutionFlowDiagram } from "../diagrams/dns-resolution-flow-diagram";
+
+<Eli5 title="DNS giống như hỏi đường tới nhà một người bạn qua nhiều tầng tổng đài" emoji="📞">
+  Bạn chỉ nhớ **tên** bạn mình ("app.example.com"), nhưng bưu tá cần **địa chỉ số** (IP). Bạn nhờ **tổng đài viên quen** (recursive resolver) tra giùm.
+
+  Tổng đài viên không thuộc hết mọi địa chỉ. Họ hỏi **tổng đài quốc gia** (root): "Ai quản các tên đuôi `.com`?" → được chỉ sang **tổng đài `.com`** (TLD) → được chỉ sang **văn phòng của chính công ty example.com** (authoritative name server) — nơi có sổ địa chỉ thật.
+
+  Hỏi xong, tổng đài viên **ghi vào sổ tay** kèm hạn dùng (TTL). Ai hỏi lại trong thời hạn đó thì trả lời ngay, khỏi gọi vòng vèo — nhưng nếu công ty vừa đổi địa chỉ, sổ tay vẫn còn địa chỉ cũ tới khi hết hạn.
+</Eli5>
+
+"It's always DNS" là câu đùa quen thuộc của dân vận hành: deploy xong mà người dùng vẫn vào bản cũ, service discovery trong Kubernetes lỗi, cert Let's Encrypt không cấp được… rất hay bắt nguồn từ DNS. Hiểu luồng resolve và TTL giúp bạn bình tĩnh khi migrate hệ thống.
+
+<DnsResolutionFlowDiagram />
+
+<Technical>
+
+### Các thành phần
+
+| Thành phần | Vai trò | Ví dụ |
+|---|---|---|
+| Stub resolver | Thư viện trên máy, đọc `/etc/hosts` + gửi truy vấn tới resolver | glibc, `systemd-resolved` (127.0.0.53) |
+| Recursive resolver | Đi hỏi thay bạn, cache kết quả | 1.1.1.1, 8.8.8.8, Route 53 Resolver trong VPC (`VPC CIDR base + 2`) |
+| Root server | Chỉ đường tới TLD | 13 tên `a`–`m.root-servers.net` (thực tế là hàng trăm máy anycast) |
+| TLD server | Chỉ đường tới authoritative của domain | `a.gtld-servers.net` cho `.com` |
+| Authoritative server | Giữ record thật của zone | Route 53 hosted zone, Cloudflare DNS |
+
+DNS chủ yếu chạy trên **UDP 53**; dùng **TCP 53** khi response quá lớn hoặc khi transfer zone. Các biến thể mã hoá: DoT (853), DoH (qua HTTPS).
+
+### Record types quan trọng
+
+| Type | Ý nghĩa | Ví dụ |
+|---|---|---|
+| `A` | Tên → IPv4 | `app.example.com. 300 IN A 203.0.113.10` |
+| `AAAA` | Tên → IPv6 | `app.example.com. 300 IN AAAA 2001:db8::10` |
+| `CNAME` | Tên → một tên khác (bí danh) | `www.example.com. CNAME app.example.com.` |
+| `MX` | Mail server của domain, kèm độ ưu tiên | `example.com. MX 10 mail.example.com.` |
+| `TXT` | Văn bản tuỳ ý: SPF, xác minh domain, DKIM | `example.com. TXT "v=spf1 include:_spf.google.com ~all"` |
+| `NS` | Name server có thẩm quyền của zone | `example.com. NS ns-123.awsdns-45.com.` |
+
+Lưu ý: theo chuẩn, **không đặt CNAME ở zone apex** (`example.com` trần) vì apex bắt buộc có NS/SOA. Route 53 có **alias record** và Cloudflare có "CNAME flattening" để lách giới hạn này khi trỏ apex vào load balancer.
+
+### TTL & chiến lược migrate
+
+- TTL (giây) = thời gian resolver được phép cache. TTL cao → ít truy vấn, nhanh; nhưng đổi IP lâu có hiệu lực.
+- Trước khi đổi record quan trọng: **hạ TTL** (vd 3600 → 60), **chờ ít nhất bằng TTL cũ**, rồi mới đổi, xong nâng TTL lại.
+- Một số client/resolver không tôn trọng TTL tuyệt đối (vd JVM có cache DNS riêng tuỳ cấu hình) — hãy test thực tế.
+
+### `dig` vs `getent` vs `nslookup`
+
+`dig` hỏi thẳng DNS server và **bỏ qua `/etc/hosts`**. Còn app thật (curl, trình duyệt, Node…) đi qua NSS nên **có đọc `/etc/hosts`**. Muốn thấy đúng thứ app thấy, dùng `getent hosts <tên>`.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Máy đang dùng resolver nào? (Ubuntu dùng systemd-resolved)", command: "grep -v '^#' /etc/resolv.conf", output: "nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch ." },
+    { comment: "Hỏi A record, chỉ lấy phần answer", command: "dig www.example.com +noall +answer", output: "www.example.com.\t3600\tIN\tCNAME\tapp.example.com.\napp.example.com.\t300\tIN\tA\t203.0.113.10" },
+    { comment: "Chạy lại ngay: TTL giảm dần vì resolver đang cache", command: "dig app.example.com +noall +answer", output: "app.example.com.\t212\tIN\tA\t203.0.113.10" },
+    { comment: "Hỏi thẳng authoritative server để bỏ qua cache", command: "dig @ns-123.awsdns-45.com app.example.com +short", output: "203.0.113.10" },
+    { comment: "Tự đi từ root xuống như một recursive resolver", command: "dig +trace app.example.com | grep -E 'IN\\s+(NS|A)\\s' | head -6", output: ".\t\t\t518400\tIN\tNS\ta.root-servers.net.\ncom.\t\t\t172800\tIN\tNS\ta.gtld-servers.net.\nexample.com.\t\t172800\tIN\tNS\tns-123.awsdns-45.com.\napp.example.com.\t300\tIN\tA\t203.0.113.10" },
+    { comment: "Các record khác", command: "dig example.com MX +short && dig example.com TXT +short", output: "10 mail.example.com.\n\"v=spf1 include:_spf.google.com ~all\"" },
+    { comment: "Thấy đúng thứ ứng dụng thấy (có tính /etc/hosts)", command: "getent hosts app.example.com", output: "203.0.113.10    app.example.com" },
+  ]}
+/>
+
+<Callout type="mistake" title="Sửa /etc/hosts để test rồi quên xoá">
+  Bạn thêm `127.0.0.1 app.example.com` để test local, vài tuần sau `curl` vào "production" lại toàn trả dữ liệu dev. `dig` vẫn ra IP đúng nên càng khó hiểu. Luôn kiểm tra `/etc/hosts` và dùng `getent hosts` khi kết quả kỳ lạ.
+</Callout>
+
+<Callout type="warning" title="Đổi DNS mà người dùng vẫn vào server cũ">
+  Không phải DNS "chưa cập nhật" — resolver của họ đang cache đúng như TTL cho phép. Đừng tắt server cũ ngay sau khi đổi record; giữ nó chạy ít nhất bằng TTL cũ (tốt nhất lâu hơn).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "recursive resolver", meaning: "Tổng đài viên đi hỏi giùm bạn và cache kết quả." },
+    { term: "authoritative name server", meaning: "Nơi giữ record thật của một domain (zone)." },
+    { term: "TTL", meaning: "Số giây một đáp án DNS được phép nằm trong cache." },
+    { term: "A / AAAA", meaning: "Record trỏ tên tới IPv4 / IPv6." },
+    { term: "CNAME", meaning: "Bí danh: tên này thực chất là tên kia." },
+    { term: "NXDOMAIN", meaning: "Trả lời 'tên miền không tồn tại'." },
+    { term: "/etc/hosts", meaning: "File tra tên thủ công trên máy, được đọc trước DNS." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn đổi A record của `api.example.com` sang IP mới. Record cũ có TTL 86400. Sau 10 phút, một số người dùng vẫn vào IP cũ. Chuyện gì đang xảy ra?"
+  options={[
+    "Authoritative server chưa lưu thay đổi, phải đổi lại",
+    "Resolver của người dùng đang cache đáp án cũ và có quyền giữ tới 24 giờ",
+    "Trình duyệt chặn IP mới vì lý do bảo mật",
+    "CNAME ghi đè A record",
+  ]}
+  answerIndex={1}
+  explanation="TTL 86400 giây = 24 giờ: tổng đài viên được phép dùng sổ tay cũ suốt 24 giờ. Lần sau hãy hạ TTL xuống thấp vài giờ/ngày trước khi migrate."
+/>

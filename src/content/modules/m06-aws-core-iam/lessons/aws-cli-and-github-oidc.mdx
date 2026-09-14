@@ -1,0 +1,151 @@
+import { GithubOidcRoleAssumptionDiagram } from "../diagrams/github-oidc-role-assumption-diagram";
+
+<Eli5 title="OIDC giống như gửi xe bằng vé có tên, thay vì đưa chìa khoá nhà" emoji="🎟️">
+  Cách cũ để CI/CD vào AWS là **đưa hẳn một chiếc chìa khoá** (access key) cho GitHub cất giữ. Chìa không hết hạn; ai sao chép được là vào nhà bạn bao lâu cũng được.
+
+  Cách mới dùng **vé gửi xe có tên**: mỗi lần chạy, GitHub in một **vé ngắn hạn** ghi rõ "xe của repo `trung/devops-app`, nhánh `main`". Bảo vệ AWS (**STS**) kiểm tra con dấu của GitHub trên vé và đối chiếu với **danh sách xe được phép** (trust policy).
+
+  Khớp thì bảo vệ đưa một **thẻ tạm dùng trong 1 giờ**. Hết giờ, thẻ vô dụng — lộ ra cũng không sao mấy.
+
+  Còn trên laptop, bạn cũng làm y như vậy với **IAM Identity Center**: đăng nhập SSO, nhận credential tạm, không có key nào nằm lâu dài trong máy.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+"Không có credential dài hạn" là tiêu chuẩn bảo mật mà nhà tuyển dụng DevOps sẽ hỏi. Bạn sẽ dùng **AWS CLI** mỗi ngày, và mọi pipeline ở các module sau (Terraform ở M10, deploy ECS/EKS) đều đi qua **OIDC role** thay vì `AWS_ACCESS_KEY_ID` trong GitHub Secrets.
+
+<GithubOidcRoleAssumptionDiagram />
+
+<Technical>
+
+### AWS CLI v2: profile & SSO
+
+`aws configure sso` sinh cấu hình dạng này:
+
+```ini title="~/.aws/config"
+[sso-session my-sso]
+sso_start_url = https://d-1234567890.awsapps.com/start
+sso_region = ap-southeast-1
+sso_registration_scopes = sso:account:access
+
+[profile dev-admin]
+sso_session = my-sso
+sso_account_id = 123456789012
+sso_role_name = AdministratorAccess
+region = ap-southeast-1
+output = json
+
+[profile prod-readonly]
+sso_session = my-sso
+sso_account_id = 210987654321
+sso_role_name = ReadOnlyAccess
+region = ap-southeast-1
+```
+
+- Chọn profile: `--profile dev-admin` hoặc `export AWS_PROFILE=dev-admin`.
+- CLI tìm credential theo thứ tự ưu tiên (rút gọn): tham số dòng lệnh → biến môi trường (`AWS_ACCESS_KEY_ID`…) → profile trong `~/.aws/config`/`credentials` (SSO, assume role, web identity…) → credential của container/EC2 instance profile.
+- Luôn chạy `aws sts get-caller-identity` khi nghi ngờ "mình đang là ai" — lệnh này **không cần quyền IAM nào**.
+
+### GitHub Actions → AWS bằng OIDC
+
+**Bước 1 — OIDC provider** (một lần mỗi account): URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`. (AWS CLI mới không còn bắt buộc thumbprint cho provider này — kiểm tra tài liệu hiện hành.)
+
+**Bước 2 — Role với trust policy khoá chặt repo và nhánh:**
+
+```json title="github-deploy-trust.json"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:trung/devops-app:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+```
+
+Một số giá trị `sub` thường gặp: `repo:ORG/REPO:ref:refs/heads/main` (push nhánh), `repo:ORG/REPO:pull_request`, `repo:ORG/REPO:environment:production` (job dùng GitHub Environment).
+
+**Bước 3 — Workflow:**
+
+```yaml title=".github/workflows/deploy.yml"
+name: deploy
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # cho phép xin OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4   # kiểm tra version mới nhất
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-deploy
+          aws-region: ap-southeast-1
+      - run: aws sts get-caller-identity
+      - run: aws s3 sync ./site s3://trung-lab-bucket
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cấu hình SSO (trả lời các câu hỏi: start URL, region, account, role, tên profile)", command: "aws configure sso" },
+    { comment: "Đăng nhập — mở trình duyệt để xác nhận", command: "aws sso login --profile dev-admin", output: "Successfully logged into Start URL: https://d-1234567890.awsapps.com/start" },
+    { comment: "Tôi là ai?", command: "aws sts get-caller-identity --profile dev-admin", output: "{\n    \"UserId\": \"AROAEXAMPLEID1234567:trung\",\n    \"Account\": \"123456789012\",\n    \"Arn\": \"arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_AdministratorAccess_0123abcd4567ef89/trung\"\n}" },
+    { comment: "Tạo OIDC provider cho GitHub", command: "aws iam create-open-id-connect-provider --url https://token.actions.githubusercontent.com --client-id-list sts.amazonaws.com", output: "{\n    \"OpenIDConnectProviderArn\": \"arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com\"\n}" },
+    { comment: "Tạo role deploy với trust policy ở trên, rồi gắn quyền tối thiểu", command: "aws iam create-role --role-name github-deploy --assume-role-policy-document file://github-deploy-trust.json && aws iam put-role-policy --role-name github-deploy --policy-name s3-deploy --policy-document file://s3-single-bucket-rw.json" },
+    { comment: "Log của job trên GitHub sau khi push lên main", command: "aws sts get-caller-identity --query Arn --output text", output: "arn:aws:sts::123456789012:assumed-role/github-deploy/GitHubActions" },
+  ]}
+/>
+
+<Callout type="mistake" title="Trust policy quá rộng">
+  Dùng `StringLike` với `"repo:trung/*"` cho role deploy prod → mọi repo, mọi nhánh của bạn đều deploy được. Tệ hơn, bỏ hẳn điều kiện `sub` → về lý thuyết workflow của **bất kỳ ai trên GitHub** cũng assume được role (IAM hiện có kiểm tra chặn một số trust policy quá lỏng, nhưng đừng dựa vào đó). Luôn khoá tới repo + nhánh/environment cụ thể và luôn kiểm tra `aud`.
+</Callout>
+
+<Callout type="warning">
+  Nếu vẫn còn `AWS_ACCESS_KEY_ID` trong GitHub Secrets sau khi chuyển sang OIDC: **deactivate rồi xoá key** đó trong IAM, và xoá secret. Key "dự phòng" chính là key bị lộ trong tương lai.
+</Callout>
+
+<Callout type="tip">
+  Lỗi `Could not load credentials from any providers` trong workflow gần như luôn do **thiếu `permissions: id-token: write`**. Còn `Not authorized to perform sts:AssumeRoleWithWebIdentity` là do `sub`/`aud` không khớp trust policy.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "AWS CLI profile", meaning: "Bộ cấu hình có tên (account, role, region) chọn bằng --profile hoặc AWS_PROFILE." },
+    { term: "aws sts get-caller-identity", meaning: "Lệnh cho biết credential hiện tại thuộc account và danh tính nào." },
+    { term: "STS", meaning: "Security Token Service — phát credential tạm thời khi assume role." },
+    { term: "OIDC", meaning: "OpenID Connect — chuẩn danh tính dựa trên token JWT được ký." },
+    { term: "AssumeRoleWithWebIdentity", meaning: "API đổi token OIDC lấy credential tạm của một role." },
+    { term: "sub claim", meaning: "Trường trong JWT mô tả chủ thể: repo, nhánh, environment." },
+  ]}
+/>
+
+<QuickCheck
+  question="Workflow deploy chạy tốt khi push lên main, nhưng job chạy trên pull request lại báo Not authorized to perform sts:AssumeRoleWithWebIdentity. Vì sao?"
+  options={[
+    "Token của pull request có sub là repo:ORG/REPO:pull_request, không khớp trust policy chỉ cho nhánh main",
+    "Pull request không được dùng AWS CLI",
+    "OIDC provider hết hạn sau mỗi lần merge",
+    "Role thiếu quyền s3:PutObject",
+  ]}
+  answerIndex={0}
+  explanation="Vé gửi xe ghi 'pull_request' chứ không phải 'main', nên bảo vệ STS từ chối — đúng như thiết kế để code chưa review không deploy được. Thiếu s3:PutObject sẽ lỗi ở bước sau, không phải lúc assume role."
+/>

@@ -1,0 +1,151 @@
+import { ImageReleaseFlowDiagram } from "../diagrams/image-release-flow-diagram";
+
+<Eli5 title="Registry giống kho hàng của công ty chuyển phát" emoji="📦">
+
+Bạn đóng thùng hàng xong (build image) — nhưng thùng nằm ở nhà bạn thì server không lấy được. Phải gửi vào **kho trung tâm** của công ty chuyển phát: đó là **registry** (Docker Hub, GHCR, Amazon ECR).
+
+Mỗi thùng có hai loại định danh. **Nhãn dán** tay (tag như `1.4.0`, `latest`) dễ đọc nhưng **bóc ra dán sang thùng khác được**. Còn **mã vạch in chìm** (digest `sha256:…`) được tính từ chính nội dung thùng — đổi một con ốc bên trong là mã vạch khác.
+
+Trước khi nhập kho, thùng phải qua **máy soi hành lý** (Trivy): phát hiện hàng cấm (lỗ hổng CRITICAL, secret lọt vào) là **hú còi và chặn lại**, không cho lên xe giao tới production.
+
+</Eli5>
+
+### Vì sao DevOps quan tâm?
+
+Registry là **cầu nối giữa CI và mọi môi trường chạy** — ECS, EKS, VM đều pull image từ đây. Tag sai cách khiến bạn không biết production đang chạy code nào và không rollback được. Quét image là yêu cầu gần như bắt buộc trong các team có yêu cầu bảo mật/compliance.
+
+<ImageReleaseFlowDiagram />
+
+<Technical>
+
+### Giải phẫu tên image
+
+```text
+ghcr.io / acme / api : sha-3f9c2e1 @sha256:9b1d4c…e07a
+└──┬──┘  └─┬─┘  └┬┘   └────┬────┘  └──────┬───────┘
+registry  namespace repo    tag            digest
+```
+
+- Không ghi registry → mặc định Docker Hub (`nginx` = `docker.io/library/nginx`).
+- Một image có thể có **nhiều tag**, nhưng mỗi nội dung chỉ có **một digest**.
+- Pull theo digest (`image@sha256:…`) đảm bảo **đúng từng byte**, kể cả khi ai đó gán lại tag.
+
+### So sánh registry phổ biến
+
+| Registry | Đăng nhập | Ghi chú |
+|---|---|---|
+| **Docker Hub** | `docker login` | Nhiều image chính thức; tài khoản free bị giới hạn số lần pull |
+| **GHCR** (`ghcr.io`) | PAT hoặc `GITHUB_TOKEN` trong Actions | Gắn với repo GitHub, tiện nhất khi CI dùng GitHub Actions |
+| **Amazon ECR** | `aws ecr get-login-password` (token hết hạn sau 12 giờ) | IAM kiểm soát quyền, scan tích hợp, gần EKS/ECS; tính phí lưu trữ |
+
+```bash
+# Đăng nhập ECR (region và account ID là ví dụ)
+aws ecr get-login-password --region ap-southeast-1 \
+  | docker login --username AWS --password-stdin 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com
+```
+
+### Chiến lược tag
+
+| Tag | Khi nào gán | Có đổi được không | Dùng cho |
+|---|---|---|---|
+| `sha-3f9c2e1` (git SHA) | Mỗi build | Không bao giờ nên đổi | **Deploy & rollback** — truy ngược về đúng commit |
+| `1.4.0` (semver) | Khi tạo release/git tag | Không nên đổi | Người dùng, changelog |
+| `1.4`, `1` | Khi release | Trôi theo bản vá mới | Người dùng muốn tự nhận patch |
+| `latest` | Tuỳ | Luôn trôi | Thử nghiệm local — **tránh ở production** |
+
+ECR có tuỳ chọn **tag immutability** để cấm ghi đè tag đã tồn tại — nên bật cho repo production.
+
+### Quét lỗ hổng với Trivy
+
+Trivy so danh sách package trong image (OS + thư viện ngôn ngữ) với cơ sở dữ liệu CVE:
+
+```bash
+# Quét, chỉ hiện HIGH và CRITICAL, bỏ qua lỗ hổng chưa có bản vá
+trivy image --severity HIGH,CRITICAL --ignore-unfixed ghcr.io/acme/api:sha-3f9c2e1
+
+# Dùng làm cổng chặn trong CI: có CRITICAL → exit code 1
+trivy image --severity CRITICAL --exit-code 1 --ignore-unfixed ghcr.io/acme/api:sha-3f9c2e1
+
+# Tìm secret bị lọt vào layer, và misconfig trong Dockerfile
+trivy image --scanners secret ghcr.io/acme/api:sha-3f9c2e1
+trivy config .
+```
+
+Cách xử lý thường gặp theo thứ tự: **nâng base image** (hầu hết CVE nằm ở đây) → nâng package có "Fixed Version" → đổi sang base nhỏ hơn (alpine/distroless) → nếu chưa có bản vá và đã đánh giá rủi ro, ghi vào `.trivyignore` **kèm lý do và ngày xem lại**.
+
+Công cụ tương tự: **Grype** (Anchore), **Docker Scout**, ECR image scanning. Mọi scanner đều có false positive — đọc kỹ trước khi hoảng.
+
+### Không nhét secret vào image
+
+- Không `COPY .env`, không `ENV API_KEY=...` (ai `docker inspect` cũng thấy), không `ARG` chứa secret (lưu trong history).
+- Secret lúc **chạy**: biến môi trường do orchestrator truyền vào, Docker/Compose secrets, AWS Secrets Manager / SSM Parameter Store (M06–M08).
+- Secret lúc **build** (vd. token tải package private): `RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci` và `docker build --secret id=npmrc,src=$HOME/.npmrc .` — secret không nằm trong layer nào.
+
+### Mở rộng: multi-arch với buildx
+
+Máy dev Apple Silicon (arm64), server EC2 Graviton (arm64) hay x86 (amd64)? Build một lần cho cả hai:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/acme/api:sha-3f9c2e1 --push .
+```
+
+Registry lưu một **manifest list**; mỗi máy tự pull đúng kiến trúc của nó.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Đăng nhập GHCR bằng Personal Access Token có scope write:packages", command: "echo \"$CR_PAT\" | docker login ghcr.io -u trungle --password-stdin", output: "Login Succeeded" },
+    { command: "GIT_SHA=$(git rev-parse --short HEAD) && echo $GIT_SHA", output: "3f9c2e1" },
+    { command: "docker tag api:multi ghcr.io/trungle/api:sha-$GIT_SHA" },
+    { comment: "Cổng chặn: quét trước khi push", command: "trivy image --severity CRITICAL --exit-code 1 --ignore-unfixed ghcr.io/trungle/api:sha-$GIT_SHA", output: "ghcr.io/trungle/api:sha-3f9c2e1 (alpine 3.21)\nTotal: 0 (CRITICAL: 0)" },
+    { command: "docker push ghcr.io/trungle/api:sha-$GIT_SHA", output: "sha-3f9c2e1: digest: sha256:9b1d4c7a…e07a size: 1987" },
+    { comment: "Xem digest của image trên registry", command: "docker buildx imagetools inspect ghcr.io/trungle/api:sha-$GIT_SHA --format '{{json .Manifest.Digest}}'", output: "\"sha256:9b1d4c7a…e07a\"" },
+    { comment: "Kiểm tra ENV có lộ gì không", command: "docker inspect ghcr.io/trungle/api:sha-$GIT_SHA --format '{{json .Config.Env}}'", output: "[\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\",\"NODE_ENV=production\"]" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Deploy production bằng `:latest`.** Hai server pull cách nhau một giờ có thể chạy hai phiên bản khác nhau, và "rollback về latest trước đó" là không thể. Deploy bằng tag git SHA hoặc digest.
+
+</Callout>
+
+<Callout type="mistake">
+
+**Tắt Trivy khi pipeline đỏ "để kịp release".** Nếu một CVE thật sự chưa có bản vá và không ảnh hưởng app, ghi vào `.trivyignore` kèm lý do và ngày xem lại — đừng tắt cả cổng chặn.
+
+</Callout>
+
+<Callout type="cost">
+
+ECR tính phí theo GB lưu trữ mỗi tháng và băng thông ra ngoài region. Mỗi commit một image, sau vài tháng có thể thành hàng nghìn image. Đặt **lifecycle policy** (vd. chỉ giữ 30 image `sha-*` gần nhất, xoá image untagged sau 7 ngày). GHCR cũng có hạn mức — kiểm tra tài liệu mới nhất về giới hạn và giá.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "registry", meaning: "Kho lưu và phân phối image: Docker Hub, GHCR, ECR." },
+    { term: "tag", meaning: "Nhãn dễ đọc trỏ tới một image, có thể bị gán lại." },
+    { term: "digest", meaning: "Hash sha256 của manifest, định danh bất biến cho đúng nội dung image." },
+    { term: "CVE", meaning: "Mã định danh công khai của một lỗ hổng bảo mật." },
+    { term: "Trivy", meaning: "Công cụ mã nguồn mở quét lỗ hổng, secret và misconfig." },
+    { term: "tag immutability", meaning: "Cấu hình registry cấm ghi đè tag đã tồn tại." },
+    { term: "lifecycle policy", meaning: "Luật tự động xoá image cũ để tiết kiệm chi phí lưu trữ." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bản deploy lúc 14:00 lỗi. Bạn cần quay về đúng image chạy lúc 9:00. Chiến lược tag nào giúp việc này đơn giản nhất?"
+  options={[
+    "Chỉ dùng tag latest và push đè mỗi lần build",
+    "Dùng tag theo ngày, ví dụ 2026-09-14",
+    "Không tag, chỉ dùng image ID trên máy build",
+    "Mỗi build tag theo git SHA; deploy lại tag SHA của bản lúc 9:00",
+  ]}
+  answerIndex={3}
+  explanation="Git SHA như mã vận đơn duy nhất cho từng thùng hàng: tìm đúng mã là lấy lại đúng thùng. Tag theo ngày trùng khi có nhiều build một ngày; latest đã bị dán đè."
+/>

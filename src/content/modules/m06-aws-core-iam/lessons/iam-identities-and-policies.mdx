@@ -1,0 +1,134 @@
+import { IamBuildingBlocksDiagram } from "../diagrams/iam-building-blocks-diagram";
+
+<Eli5 title="IAM giống như hệ thống thẻ từ của khách sạn" emoji="🏨">
+  Trong khách sạn, **nhân viên** có thẻ từ riêng dùng lâu dài — đó là **IAM user**. Nhân viên được xếp vào **bộ phận** (buồng phòng, bếp, kế toán) — đó là **group**. Quyền mở cửa gắn cho bộ phận, ai vào bộ phận là có quyền.
+
+  **Khách lưu trú** thì nhận **thẻ tạm** ở quầy lễ tân, hết hạn khi trả phòng — đó là **IAM role**. Lễ tân chỉ phát thẻ cho người có tên trong danh sách đặt phòng (**trust policy**).
+
+  Thứ ghi trên thẻ "được mở tầng 3, phòng 301, từ 14h tới 12h trưa" là **policy**. Còn tấm biển "Chỉ nhân viên kỹ thuật" dán ngay trên cửa phòng máy là **resource-based policy**.
+
+  Ví dụ lệch một chỗ: trong IAM, mặc định thẻ **không mở được cửa nào** — mọi quyền đều phải được ghi rõ.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+Pipeline CI/CD, EC2, Lambda, pod Kubernetes… **mọi thứ gọi API AWS đều cần danh tính và quyền**. Cấp thiếu thì deploy fail; cấp thừa thì một access key lộ ra có thể xoá sạch production. Viết policy đúng và đủ là kỹ năng DevOps dùng hằng ngày.
+
+<IamBuildingBlocksDiagram />
+
+<Technical>
+
+### Principal: ai đang gọi API?
+
+| Danh tính | Credential | Dùng cho |
+|---|---|---|
+| **Root user** | Email + mật khẩu (+ MFA) | Chỉ vài tác vụ đặc biệt của account. Không dùng hằng ngày |
+| **IAM user** | Mật khẩu console, access key dài hạn | Hạn chế; ưu tiên Identity Center cho người, role cho máy |
+| **IAM role** | Credential tạm thời từ STS | EC2, Lambda, ECS task, CI/CD (OIDC), truy cập cross-account |
+| **Federated user** (Identity Center, SAML, OIDC) | Đăng nhập qua IdP, nhận role tạm | Con người trong công ty |
+
+**Group** không phải principal — nó chỉ là cách gắn policy cho nhiều user một lúc.
+
+### Cấu trúc một policy
+
+```json title="s3-read-reports.json"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListReportsBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::company-reports"
+    },
+    {
+      "Sid": "ReadReportObjects",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::company-reports/*",
+      "Condition": {
+        "Bool": { "aws:SecureTransport": "true" }
+      }
+    }
+  ]
+}
+```
+
+- `Version`: luôn dùng `2012-10-17` (phiên bản ngôn ngữ policy, không phải ngày của bạn).
+- `Effect`: `Allow` hoặc `Deny`. `Action`: `service:ApiName`, có thể dùng wildcard `s3:Get*`.
+- `Resource`: ARN. Chú ý **bucket** (`arn:aws:s3:::name`) khác **object trong bucket** (`arn:aws:s3:::name/*`).
+- `Condition`: thêm điều kiện — IP nguồn, có MFA, tag, bắt buộc HTTPS…
+
+### Identity-based vs resource-based
+
+| | Identity-based | Resource-based |
+|---|---|---|
+| Gắn vào | User, group, role | Chính resource: S3 bucket, SQS queue, KMS key, Lambda… |
+| Có `Principal`? | Không (principal là thứ được gắn) | **Có** — ghi rõ ai được phép |
+| Cross-account | Cần kết hợp với role/resource policy | Cấp trực tiếp cho account khác được |
+
+Loại identity policy: **AWS managed** (AWS viết sẵn, ví dụ `ReadOnlyAccess`), **customer managed** (bạn viết, tái sử dụng, có version), **inline** (dính chặt vào một danh tính — ít dùng).
+
+### Role = trust policy + permissions policy
+
+```json title="trust-policy-ec2.json"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "ec2.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+Trust policy trả lời **"AI được đeo thẻ này?"**; permissions policy trả lời **"đeo thẻ rồi được LÀM GÌ?"**. EC2 nhận role qua **instance profile**, SDK tự lấy credential tạm từ metadata service — không cần access key trong code.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo customer managed policy từ file JSON", command: "aws iam create-policy --policy-name S3ReadReports --policy-document file://s3-read-reports.json", output: "{\n    \"Policy\": {\n        \"PolicyName\": \"S3ReadReports\",\n        \"Arn\": \"arn:aws:iam::123456789012:policy/S3ReadReports\",\n        \"DefaultVersionId\": \"v1\"\n    }\n}" },
+    { comment: "Tạo group và gắn policy cho group", command: "aws iam create-group --group-name analysts && aws iam attach-group-policy --group-name analysts --policy-arn arn:aws:iam::123456789012:policy/S3ReadReports" },
+    { comment: "Tạo role cho EC2 với trust policy", command: "aws iam create-role --role-name app-ec2-role --assume-role-policy-document file://trust-policy-ec2.json" },
+    { comment: "Gắn quyền cho role", command: "aws iam attach-role-policy --role-name app-ec2-role --policy-arn arn:aws:iam::123456789012:policy/S3ReadReports" },
+    { comment: "Tạo instance profile để EC2 dùng được role", command: "aws iam create-instance-profile --instance-profile-name app-ec2-profile && aws iam add-role-to-instance-profile --instance-profile-name app-ec2-profile --role-name app-ec2-role" },
+    { comment: "Xem các policy đang gắn vào role", command: "aws iam list-attached-role-policies --role-name app-ec2-role --query 'AttachedPolicies[].PolicyName'", output: "[\n    \"S3ReadReports\"\n]" },
+  ]}
+/>
+
+<Callout type="mistake" title="Quên dấu /* hoặc thêm nhầm">
+  `s3:ListBucket` áp dụng lên **bucket** (`arn:aws:s3:::company-reports`), còn `s3:GetObject`/`s3:PutObject` áp dụng lên **object** (`arn:aws:s3:::company-reports/*`). Viết lẫn hai ARN này là nguyên nhân số một của lỗi `AccessDenied` "khó hiểu" với S3.
+</Callout>
+
+<Callout type="warning">
+  Đừng gắn `AdministratorAccess` cho role của CI/CD "cho nhanh". Bắt đầu với quyền tối thiểu, xem lỗi `AccessDenied` (hoặc CloudTrail) để biết thiếu gì rồi thêm dần. IAM Access Analyzer còn có thể gợi ý policy dựa trên hoạt động thực tế.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Principal", meaning: "Thực thể gọi API: user, role, dịch vụ AWS, federated user." },
+    { term: "IAM role", meaning: "Danh tính không có credential dài hạn; ai được assume sẽ nhận credential tạm từ STS." },
+    { term: "Trust policy", meaning: "Resource policy của role, quy định ai được sts:AssumeRole." },
+    { term: "Identity-based policy", meaning: "Policy gắn vào user/group/role, nói danh tính đó được làm gì." },
+    { term: "Resource-based policy", meaning: "Policy gắn vào resource, có Principal, cấp được cho account khác." },
+    { term: "ARN", meaning: "Amazon Resource Name — định danh duy nhất của một resource." },
+    { term: "Instance profile", meaning: "Vỏ bọc giúp EC2 mang một IAM role." },
+  ]}
+/>
+
+<QuickCheck
+  question="App chạy trên EC2 cần đọc S3. Cách nào đúng chuẩn nhất?"
+  options={[
+    "Tạo IAM user, lưu access key vào file .env trên EC2",
+    "Dùng access key của root cho đơn giản",
+    "Tạo IAM user và đưa access key vào biến môi trường trong AMI",
+    "Tạo IAM role có quyền đọc S3, gắn vào EC2 qua instance profile",
+  ]}
+  answerIndex={3}
+  explanation="Như khách lưu trú nhận thẻ tạm ở lễ tân: role cấp credential tạm thời, tự xoay vòng. Không có access key dài hạn nào nằm trên máy để bị lộ."
+/>

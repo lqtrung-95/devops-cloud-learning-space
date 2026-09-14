@@ -1,0 +1,137 @@
+import { NetworkVolumeExplorerDiagram } from "../diagrams/network-volume-explorer-diagram";
+
+<Eli5 title="Network và volume giống hệ thống liên lạc và kho gửi đồ của chung cư" emoji="🏘️">
+
+Các căn hộ trong cùng một **toà chung cư** (network) gọi nhau qua **điện thoại nội bộ bằng số phòng**: "alo phòng `db`". Không ai cần nhớ số điện thoại thật — lễ tân (**DNS nội bộ của Docker**) tự nối máy, kể cả khi căn hộ đổi người ở.
+
+Người **ngoài phố** thì không gọi nội bộ được. Muốn vào phải qua **cổng chính có bảo vệ** — đó là **publish port** (`-p 8080:80`): khách tới cổng 8080, bảo vệ dẫn lên phòng web cửa số 80.
+
+Về đồ đạc: đồ để trong căn hộ thuê (**writable layer**) sẽ **mất khi trả phòng**. Muốn giữ lâu dài thì gửi vào **kho của ban quản lý** (**named volume**), hoặc mang **đồ từ nhà mình** tới dùng tạm (**bind mount** — thư mục trên máy host).
+
+</Eli5>
+
+### Vì sao DevOps quan tâm?
+
+Hai sự cố kinh điển của người mới: "API không kết nối được database dù cả hai đang chạy" (sai network/hostname) và "restart xong mất sạch dữ liệu" (không dùng volume). Hiểu rõ phần này cũng là nền tảng cho Service, PersistentVolume trong Kubernetes.
+
+<NetworkVolumeExplorerDiagram />
+
+<Technical>
+
+### Các loại network driver
+
+| Driver | Đặc điểm | Dùng khi |
+|---|---|---|
+| **bridge** (mặc định) | Mạng ảo riêng trên host, container có IP nội bộ, ra Internet qua NAT | Hầu hết trường hợp một host |
+| **user-defined bridge** | Như bridge nhưng **có DNS theo tên container/service**, cô lập theo nhóm | Luôn tạo network riêng cho từng app (Compose làm sẵn) |
+| **host** | Container dùng thẳng network stack của host, không cần `-p` | Cần hiệu năng mạng tối đa; hỗ trợ đầy đủ trên Linux |
+| **none** | Không có mạng | Job xử lý dữ liệu cần cô lập tuyệt đối |
+
+Điểm dễ nhầm: network **bridge mặc định** (tên `bridge`) **không** có DNS theo tên. Chạy `docker run` không chỉ định `--network` thì container phải gọi nhau bằng IP — thứ thay đổi mỗi lần tạo lại. Hãy luôn dùng user-defined network.
+
+### `localhost` trong container là chính container đó
+
+Mỗi container có network namespace riêng. API gọi `localhost:5432` là gọi port 5432 **bên trong container API** — không phải database. Gọi đúng: `db:5432`.
+
+### Publish port
+
+```bash
+docker run -p 8080:80 nginx            # 0.0.0.0:8080 trên host → port 80 container
+docker run -p 127.0.0.1:5432:5432 postgres  # chỉ máy host truy cập được
+```
+
+`EXPOSE` trong Dockerfile chỉ là **tài liệu** — không mở port nào cả. Chỉ `-p` / `ports:` mới publish.
+
+### Ba cách lưu dữ liệu
+
+| | Named volume | Bind mount | tmpfs |
+|---|---|---|---|
+| Nằm ở đâu | Docker quản lý (`/var/lib/docker/volumes/…` trên Linux) | Đường dẫn bạn chỉ định trên host | RAM |
+| Sống sót khi xoá container | ✅ | ✅ (là file của host) | ❌ |
+| Dùng cho | Dữ liệu database, upload | Code khi dev (hot-reload), file cấu hình | Dữ liệu tạm, nhạy cảm |
+| Phụ thuộc cấu trúc host | Không | Có — kém portable | Không |
+
+```bash
+# Cú pháp --mount rõ ràng hơn -v, nên dùng trong script
+docker volume create pgdata
+docker run -d --name db \
+  --network app-net \
+  --mount type=volume,src=pgdata,dst=/var/lib/postgresql/data \
+  -e POSTGRES_PASSWORD=devpass postgres:17-alpine
+
+docker run -d --name web -p 8080:80 \
+  --mount type=bind,src="$(pwd)/nginx.conf",dst=/etc/nginx/conf.d/default.conf,readonly \
+  nginx:1.27-alpine
+```
+
+Đường dẫn dữ liệu bên trong image có thể đổi giữa các major version (ví dụ Postgres 18 đổi cách tổ chức thư mục data) — luôn đọc trang Docker Hub của image trước khi mount.
+
+### Backup một volume
+
+Volume chỉ là thư mục — chạy một container tạm mount volume đó và nén lại:
+
+```bash
+docker run --rm -v pgdata:/data:ro -v "$(pwd)":/backup alpine \
+  tar czf /backup/pgdata-$(date +%F).tar.gz -C /data .
+```
+
+Với database, cách đúng hơn là dump logic (`pg_dump`) để tránh copy file khi DB đang ghi.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo user-defined network", command: "docker network create app-net" },
+    { command: "docker run -d --name db --network app-net -e POSTGRES_PASSWORD=devpass -v pgdata:/var/lib/postgresql/data postgres:17-alpine" },
+    { comment: "Từ container khác cùng network, gọi db bằng tên", command: "docker run --rm --network app-net postgres:17-alpine pg_isready -h db", output: "db:5432 - accepting connections" },
+    { comment: "Cùng lệnh nhưng ở network bridge mặc định: không phân giải được tên", command: "docker run --rm postgres:17-alpine pg_isready -h db", output: "db:5432 - no response" },
+    { comment: "Tạo dữ liệu, xoá container, chạy lại với cùng volume", command: "docker exec db psql -U postgres -c 'CREATE TABLE notes(id int);' && docker rm -f db", output: "CREATE TABLE\ndb" },
+    { command: "docker run -d --name db --network app-net -e POSTGRES_PASSWORD=devpass -v pgdata:/var/lib/postgresql/data postgres:17-alpine && sleep 3 && docker exec db psql -U postgres -c '\\dt'", output: "         List of relations\n Schema | Name  | Type  |  Owner\n--------+-------+-------+----------\n public | notes | table | postgres" },
+    { comment: "Volume nằm ở đâu?", command: "docker volume inspect pgdata --format '{{.Mountpoint}}'", output: "/var/lib/docker/volumes/pgdata/_data" },
+    { comment: "Dọn dẹp (cẩn thận: volume rm là mất dữ liệu)", command: "docker rm -f db && docker network rm app-net && docker volume rm pgdata" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**API dùng `localhost:5432` để gọi database trong container khác.** Bên trong container, `localhost` là chính nó. Dùng tên service/container (`db:5432`) trên cùng user-defined network.
+
+</Callout>
+
+<Callout type="warning" title="Docker publish port có thể vượt mặt firewall">
+
+Trên Linux, Docker tự thêm rule iptables cho port được publish. Với `ufw`, port publish kiểu `-p 5432:5432` thường **vẫn truy cập được từ Internet** dù ufw không cho phép. Database đừng publish ra host; nếu cần cho công cụ trên máy host, bind `127.0.0.1:5432:5432`. Trên cloud, thêm một lớp Security Group chặn từ bên ngoài.
+
+</Callout>
+
+<Callout type="tip">
+
+Bind mount trên Docker Desktop (macOS/Windows) chậm hơn trên Linux vì file phải đi qua VM. Thư mục nặng như `node_modules` nên để trong named volume thay vì bind mount.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "bridge network", meaning: "Mạng ảo riêng trên một host; container ra ngoài qua NAT." },
+    { term: "user-defined network", meaning: "Bridge network tự tạo, có DNS nội bộ theo tên container/service." },
+    { term: "publish port (-p)", meaning: "Chuyển traffic từ port của host vào port của container." },
+    { term: "EXPOSE", meaning: "Ghi chú port app nghe trong Dockerfile, không tự mở port." },
+    { term: "named volume", meaning: "Vùng lưu trữ do Docker quản lý, sống độc lập với container." },
+    { term: "bind mount", meaning: "Gắn file/thư mục có sẵn trên host vào container." },
+    { term: "tmpfs", meaning: "Mount lưu trong RAM, mất khi container dừng." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn muốn khi dev, sửa code trên laptop là container thấy ngay; còn dữ liệu Postgres phải giữ qua các lần tạo lại container. Chọn gì?"
+  options={[
+    "Code: named volume; Postgres: bind mount",
+    "Code: bind mount; Postgres: named volume",
+    "Cả hai để trong writable layer",
+    "Code: tmpfs; Postgres: tmpfs",
+  ]}
+  answerIndex={1}
+  explanation="Mang đồ từ nhà mình tới (bind mount) để sửa là thấy ngay; gửi dữ liệu quan trọng vào kho ban quản lý (named volume) để trả phòng vẫn còn."
+/>

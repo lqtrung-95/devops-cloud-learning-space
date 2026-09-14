@@ -1,0 +1,169 @@
+import { ComposeStartupOrderDiagram } from "../diagrams/compose-startup-order-diagram";
+
+<Eli5 title="Docker Compose giống bản kế hoạch mở cửa nhà hàng" emoji="🍽️">
+
+Mở cửa một nhà hàng không chỉ là bật đèn. Phải **nhóm bếp** (database), **chuẩn bị quầy nước** (Redis), rồi mới cho **đầu bếp nhận order** (API), cuối cùng **mở cửa đón khách** (frontend).
+
+Thay vì mỗi sáng dặn từng người bằng miệng (gõ 10 lệnh `docker run`), quản lý viết **một tờ kế hoạch** dán trên tường: ai làm gì, dùng đồ gì, ai phải đợi ai. Đó là file **`compose.yaml`** — một lệnh `docker compose up` là cả nhà hàng vận hành.
+
+Điểm tinh tế: "đợi bếp" có hai kiểu. Đợi **bếp đã có người đứng** (container started) khác hẳn đợi **bếp báo đã nóng, sẵn sàng nấu** (healthy). Chỉ kiểu thứ hai mới tránh cảnh khách vào mà chưa có gì ăn.
+
+</Eli5>
+
+### Vì sao DevOps quan tâm?
+
+Compose là cách chuẩn để **chạy cả hệ thống trên máy dev** chỉ bằng một lệnh, để **chạy integration test trong CI**, và để **deploy app nhỏ lên một VM** (chính là Checkpoint 1). File compose cũng là "tài liệu sống" mô tả kiến trúc app.
+
+<ComposeStartupOrderDiagram />
+
+<Technical>
+
+### `compose.yaml` cho app 3-tier
+
+Tên file khuyến nghị hiện nay là `compose.yaml`. Trường `version:` ở đầu file đã **lỗi thời** — Compose v2 bỏ qua và in cảnh báo.
+
+```yaml title="compose.yaml"
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    build: ./api
+    env_file: .env                      # biến cho app (không commit file .env)
+    environment:
+      DATABASE_URL: postgres://app:${POSTGRES_PASSWORD}@db:5432/app
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_DB: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  adminer:                              # công cụ xem DB, chỉ bật khi cần
+    image: adminer
+    ports:
+      - "127.0.0.1:8081:8080"
+    profiles: ["debug"]
+
+volumes:
+  pgdata:
+```
+
+### Những gì Compose làm giùm bạn
+
+- Tạo network riêng `<project>_default` → mọi service gọi nhau bằng **tên service** (`db`, `redis`, `api`).
+- Tạo named volume, đặt tên container theo project (`app-api-1`).
+- `up` lần sau chỉ **tạo lại service có thay đổi** cấu hình hoặc image.
+
+### `depends_on`: started vs healthy
+
+| Cách viết | Compose đợi tới khi… |
+|---|---|
+| `depends_on: [db]` | Container db **được khởi động** (chưa chắc Postgres nhận kết nối) |
+| `condition: service_healthy` | Healthcheck của db **pass** |
+| `condition: service_completed_successfully` | Service kết thúc với exit code 0 — hợp cho job migration chạy một lần |
+
+Kể cả khi dùng `service_healthy`, app **vẫn nên retry** kết nối: database có thể restart giữa chừng lúc đang chạy, và `depends_on` chỉ có tác dụng lúc khởi động.
+
+### Hai loại "file env" dễ nhầm
+
+- File **`.env`** cạnh `compose.yaml`: Compose dùng để **thay biến** `${POSTGRES_PASSWORD}` *trong chính file compose*.
+- **`env_file:`** trong một service: nạp biến **vào bên trong container**.
+- `${VAR:?message}` làm Compose báo lỗi ngay nếu thiếu biến — tốt hơn chạy với mật khẩu rỗng.
+
+### Profiles & override
+
+- Service có `profiles: ["debug"]` chỉ chạy khi `docker compose --profile debug up`.
+- `compose.override.yaml` (nếu có) được **tự động gộp** vào `compose.yaml` — thường dùng cho cấu hình dev (bind mount source, bật hot-reload). Production chỉ định rõ: `docker compose -f compose.yaml -f compose.prod.yaml up -d`.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra file hợp lệ và xem cấu hình sau khi thay biến", command: "docker compose config --quiet && echo OK", output: "OK" },
+    { comment: "Build image và khởi động, đợi mọi service healthy mới trả về", command: "docker compose up -d --build --wait", output: " ✔ Network app_default     Created\n ✔ Volume \"app_pgdata\"     Created\n ✔ Container app-redis-1   Healthy\n ✔ Container app-db-1      Healthy\n ✔ Container app-api-1     Healthy\n ✔ Container app-frontend-1 Started" },
+    { command: "docker compose ps --format 'table {{.Service}}\\t{{.Status}}\\t{{.Ports}}'", output: "SERVICE    STATUS                   PORTS\napi        Up 40 seconds (healthy)  3000/tcp\ndb         Up 52 seconds (healthy)  5432/tcp\nfrontend   Up 28 seconds            0.0.0.0:8080->80/tcp\nredis      Up 52 seconds (healthy)  6379/tcp" },
+    { comment: "Xem log của api, theo dõi liên tục", command: "docker compose logs -f api" },
+    { comment: "Chạy lệnh trong service đang chạy", command: "docker compose exec db psql -U app -c 'select now();'" },
+    { comment: "Bật thêm service trong profile debug", command: "docker compose --profile debug up -d adminer" },
+    { comment: "Dừng và xoá container + network (volume vẫn giữ)", command: "docker compose down" },
+    { comment: "Xoá luôn volume — mất dữ liệu!", command: "docker compose down -v" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Chỉ dùng `depends_on: [db]` rồi thắc mắc vì sao API thỉnh thoảng crash lúc khởi động.** Dạng ngắn không đợi Postgres sẵn sàng. Thêm `healthcheck` cho db và `condition: service_healthy`, đồng thời cho app retry kết nối.
+
+</Callout>
+
+<Callout type="mistake">
+
+**Commit file `.env` chứa mật khẩu thật.** Thêm `.env` vào `.gitignore`, commit một file mẫu `.env.example` không có giá trị bí mật.
+
+</Callout>
+
+<Callout type="tip">
+
+Vẫn gõ `docker-compose` (có gạch nối)? Đó là Compose v1 viết bằng Python, đã ngừng phát triển. Dùng `docker compose` (plugin v2) — cú pháp gần như giống hệt.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "compose.yaml", meaning: "File khai báo các service, network, volume của một app nhiều container." },
+    { term: "service", meaning: "Một thành phần của app trong Compose; tên service cũng là hostname nội bộ." },
+    { term: "depends_on", meaning: "Thứ tự khởi động giữa các service, có thể kèm điều kiện healthy." },
+    { term: "healthcheck", meaning: "Lệnh kiểm tra định kỳ để đánh dấu service healthy/unhealthy." },
+    { term: "profiles", meaning: "Nhóm service chỉ chạy khi được bật rõ ràng bằng --profile." },
+    { term: "--wait", meaning: "Cờ của up: chỉ trả về khi các service đã running/healthy." },
+    { term: "env_file / .env", meaning: "Nạp biến vào container / thay biến trong chính file compose." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn cần chạy migration database một lần trước khi API khởi động. Cách khai báo hợp lý nhất trong Compose?"
+  options={[
+    "Service migrate chạy xong thoát; api có depends_on migrate với condition: service_completed_successfully",
+    "Đặt migrate đứng trước api trong file compose.yaml",
+    "Thêm sleep 30 vào lệnh khởi động api",
+    "Cho migrate restart: always",
+  ]}
+  answerIndex={0}
+  explanation="Như việc lau dọn bếp phải XONG thì đầu bếp mới vào. Thứ tự dòng trong file không có ý nghĩa; restart: always sẽ chạy migrate lặp vô tận."
+/>

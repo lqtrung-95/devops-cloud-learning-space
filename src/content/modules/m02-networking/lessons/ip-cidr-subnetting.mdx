@@ -1,0 +1,103 @@
+import { CidrSubnetCalculatorDiagram } from "../diagrams/cidr-subnet-calculator-diagram";
+
+<Eli5 title="Địa chỉ IP & subnet giống như chia lô một khu đô thị" emoji="🏘️">
+  Một khu đô thị mới được cấp mã `10.0`. Chủ đầu tư chia khu này thành nhiều **đường** (subnet), mỗi đường có nhiều **số nhà** (host).
+
+  Địa chỉ `10.0.3.77/24` đọc là: "24 bit đầu là **tên đường** `10.0.3`, phần còn lại là **số nhà** 77". Con số sau dấu `/` càng lớn → tên đường càng dài → mỗi đường càng ít nhà.
+
+  Trong khu đô thị có **đường nội bộ** (private IP) — người ngoài không tìm tới được. Khi cư dân ra ngoài, họ đi qua **cổng bảo vệ** (NAT) — người ngoài chỉ thấy địa chỉ của cổng, không thấy số nhà bên trong.
+</Eli5>
+
+Trên AWS, việc đầu tiên khi dựng hạ tầng là chọn **CIDR cho VPC** và chia **subnet**. Chọn sai (quá nhỏ, trùng dải với văn phòng hay VPC khác) thì sau này rất khó sửa — thường phải dựng lại. Kéo thanh prefix bên dưới để cảm nhận.
+
+<CidrSubnetCalculatorDiagram />
+
+<Technical>
+
+### IPv4 & CIDR
+
+IPv4 là số **32 bit**, viết thành 4 octet thập phân: `10.0.3.77` = `00001010.00000000.00000011.01001101`.
+
+**CIDR** `/n` = n bit đầu là phần network. Số địa chỉ trong một khối = `2^(32-n)`.
+
+| CIDR | Subnet mask | Tổng IP | Dùng được (mạng thường) | Trên AWS |
+|---|---|---|---|---|
+| `/16` | 255.255.0.0 | 65,536 | 65,534 | 65,531 |
+| `/20` | 255.255.240.0 | 4,096 | 4,094 | 4,091 |
+| `/24` | 255.255.255.0 | 256 | 254 | 251 |
+| `/28` | 255.255.255.240 | 16 | 14 | 11 |
+
+Mạng thường mất 2 địa chỉ (network + broadcast). **AWS giữ 5 địa chỉ mỗi subnet**: `.0` network, `.1` VPC router, `.2` DNS, `.3` dự phòng, và địa chỉ cuối cùng.
+
+### Private, public & địa chỉ đặc biệt
+
+| Dải | Ý nghĩa |
+|---|---|
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | Private (RFC 1918) — không định tuyến trên Internet |
+| `127.0.0.0/8` | Loopback — chính máy mình |
+| `169.254.0.0/16` | Link-local — trên AWS có `169.254.169.254` (instance metadata) |
+| `100.64.0.0/10` | Carrier-grade NAT (nhà mạng dùng) |
+| Còn lại (phần lớn) | Public — định tuyến toàn cầu |
+
+### NAT
+
+**NAT** (chính xác hơn là SNAT/PAT) đổi IP:port nguồn private thành IP public của router khi gói đi ra, và nhớ bảng ánh xạ để trả gói về đúng máy. Hệ quả: máy private **chủ động gọi ra** được, nhưng Internet **không tự gọi vào** được. Trên AWS, đây chính là vai trò của **NAT Gateway** cho private subnet.
+
+### Chia subnet: nhiệm vụ của lab
+
+Chia `10.0.0.0/16` thành 8 phần bằng nhau → cần thêm 3 bit (`2^3 = 8`) → mỗi phần là `/19` (8,192 IP):
+
+| Subnet | CIDR | Dải |
+|---|---|---|
+| public-a | `10.0.0.0/19` | 10.0.0.0 – 10.0.31.255 |
+| public-b | `10.0.32.0/19` | 10.0.32.0 – 10.0.63.255 |
+| public-c | `10.0.64.0/19` | 10.0.64.0 – 10.0.95.255 |
+| public-d | `10.0.96.0/19` | 10.0.96.0 – 10.0.127.255 |
+| private-a | `10.0.128.0/19` | 10.0.128.0 – 10.0.159.255 |
+| private-b … d | `10.0.160.0/19`, `10.0.192.0/19`, `10.0.224.0/19` | … |
+
+Thực tế nhiều team cho public subnet **nhỏ hơn** (chỉ chứa load balancer, NAT) và private subnet **lớn hơn** (chứa app, pod Kubernetes ngốn rất nhiều IP), đồng thời **chừa dải trống** để mở rộng về sau.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "IP private của máy (trong VPC / mạng nhà)", command: "ip -4 -brief addr show eth0", output: "eth0             UP             10.0.1.25/24" },
+    { comment: "IP public mà Internet nhìn thấy (IP của NAT/router)", command: "curl -s https://checkip.amazonaws.com", output: "203.0.113.45" },
+    { comment: "Dùng Python có sẵn để chia 10.0.0.0/16 thành 8 subnet", command: "python3 -c \"import ipaddress; print(list(ipaddress.ip_network('10.0.0.0/16').subnets(new_prefix=19)))\"", output: "[IPv4Network('10.0.0.0/19'), IPv4Network('10.0.32.0/19'), IPv4Network('10.0.64.0/19'), IPv4Network('10.0.96.0/19'), IPv4Network('10.0.128.0/19'), IPv4Network('10.0.160.0/19'), IPv4Network('10.0.192.0/19'), IPv4Network('10.0.224.0/19')]" },
+    { comment: "Một IP có thuộc subnet không?", command: "python3 -c \"import ipaddress; print(ipaddress.ip_address('10.0.40.7') in ipaddress.ip_network('10.0.32.0/19'))\"", output: "True" },
+    { comment: "Hai dải có chồng lấn không? (quan trọng khi peering VPC / VPN)", command: "python3 -c \"import ipaddress as i; print(i.ip_network('10.0.0.0/16').overlaps(i.ip_network('10.0.128.0/17')))\"", output: "True" },
+  ]}
+/>
+
+<Callout type="mistake" title="Dùng dải CIDR trùng nhau">
+  VPC `10.0.0.0/16` ở dev và prod, văn phòng cũng `10.0.0.0/16`. Ngày cần nối VPN hay VPC peering, route không biết gói thuộc bên nào. Hãy **lên sơ đồ IP cho cả công ty** ngay từ đầu: mỗi môi trường/region một dải riêng, không chồng lấn.
+</Callout>
+
+<Callout type="tip">
+  Tính nhẩm nhanh: mỗi lần prefix **tăng 1** thì khối **chia đôi**. `/24` = 256 → `/25` = 128 → `/26` = 64. Và bước nhảy của octet cuối trong một `/26` là 64: `.0`, `.64`, `.128`, `.192`.
+</Callout>
+
+<Callout type="cost">
+  NAT Gateway trên AWS tính tiền **theo giờ và theo GB dữ liệu xử lý** — một NAT Gateway để quên trong tài khoản học tập có thể tốn vài chục USD/tháng. Kiểm tra bảng giá hiện hành và xoá khi không dùng.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "CIDR", meaning: "Cách viết dải IP bằng địa chỉ + /prefix, vd 10.0.0.0/16." },
+    { term: "prefix /n", meaning: "Số bit đầu dành cho network; phần còn lại cho host." },
+    { term: "subnet mask", meaning: "Cách viết khác của prefix, vd /24 = 255.255.255.0." },
+    { term: "private IP", meaning: "IP trong dải RFC 1918, chỉ dùng nội bộ, không đi thẳng ra Internet." },
+    { term: "NAT", meaning: "Cổng bảo vệ đổi IP private thành IP public khi đi ra ngoài." },
+    { term: "broadcast", meaning: "Địa chỉ cuối của subnet, gửi tới mọi host trong subnet (không gán cho máy)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Subnet AWS `10.0.5.0/24` có bao nhiêu IP gán được cho EC2/ENI?"
+  options={["256", "254", "251", "250"]}
+  answerIndex={2}
+  explanation="/24 có 2^8 = 256 địa chỉ. AWS giữ 5 (network, router, DNS, dự phòng, broadcast) nên còn 251. Như khu phố 256 lô nhưng ban quản lý giữ 5 lô làm văn phòng."
+/>

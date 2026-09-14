@@ -1,0 +1,103 @@
+import { TcpVsUdpHandshakeDiagram } from "../diagrams/tcp-vs-udp-handshake-diagram";
+
+<Eli5 title="Gửi dữ liệu qua mạng giống như gửi bưu kiện tới một căn hộ chung cư" emoji="📦">
+  Muốn gửi quà cho bạn, bạn cần **địa chỉ toà nhà** (IP address) và **số căn hộ** (port). Toà nhà `203.0.113.10` có thể có nhiều "căn": căn 22 là SSH, căn 443 là web HTTPS, căn 5432 là PostgreSQL.
+
+  Món quà được **đóng nhiều lớp**: hộp quà (dữ liệu HTTP) → bỏ vào thùng có ghi số căn hộ (TCP) → dán nhãn địa chỉ toà nhà (IP) → xe tải chở trên đường (Ethernet/Wi-Fi). Tới nơi, người nhận **bóc ngược từng lớp**.
+
+  Còn cách giao thì có hai kiểu: **TCP** như ship COD có gọi điện xác nhận, mất hàng thì gửi lại; **UDP** như ném tờ rơi vào hộp thư — nhanh, nhẹ, nhưng rơi mất thì thôi.
+
+  Chỗ ví dụ này "gãy": một bưu kiện thật đi nguyên khối, còn dữ liệu bị **cắt thành nhiều gói nhỏ** đi riêng, có thể tới lệch thứ tự — TCP có nhiệm vụ ráp lại cho đúng.
+</Eli5>
+
+Là DevOps, bạn sẽ gặp mạng ở mọi nơi: Security Group mở port nào, container listen ở đâu, vì sao service A không gọi được service B. Hầu hết lỗi "không kết nối được" đều quy về 3 câu hỏi: **đúng IP chưa? đúng port chưa? giữa đường có ai chặn không?**
+
+<TcpVsUdpHandshakeDiagram />
+
+<Technical>
+
+### Mô hình OSI vs TCP/IP
+
+OSI có 7 tầng (dùng để *nói chuyện*), TCP/IP có 4 tầng (thứ *thực sự chạy*). DevOps hay gọi theo số tầng OSI: "load balancer L4", "L7".
+
+| OSI | TCP/IP | Ví dụ giao thức | Đơn vị dữ liệu | Thiết bị / thành phần |
+|---|---|---|---|---|
+| 7 Application (+6, 5) | Application | HTTP, DNS, SSH, TLS | message | Nginx, ALB (L7) |
+| 4 Transport | Transport | TCP, UDP | segment / datagram | NLB (L4), firewall theo port |
+| 3 Network | Internet | IP, ICMP | packet | router, route table |
+| 2 Data link (+1) | Link | Ethernet, Wi-Fi, ARP | frame | switch, card mạng |
+
+**Encapsulation:** mỗi tầng thêm header của mình rồi đưa xuống tầng dưới. Bên nhận làm ngược lại.
+
+### TCP vs UDP
+
+| | TCP | UDP |
+|---|---|---|
+| Kết nối | Có: 3-way handshake (SYN, SYN-ACK, ACK) | Không |
+| Đảm bảo | Đủ, đúng thứ tự, gửi lại gói mất | Không đảm bảo gì |
+| Kiểm soát tốc độ | Flow control + congestion control | Không |
+| Dùng cho | HTTP/1.1, HTTP/2, SSH, database | DNS, video call, game, QUIC (HTTP/3) |
+
+### Port & socket
+
+- Port là số 16-bit (0–65535). **Well-known** 0–1023 (mặc định trên Linux cần root hoặc capability `CAP_NET_BIND_SERVICE` để listen), ví dụ `22` SSH, `53` DNS, `80` HTTP, `443` HTTPS.
+- Port hay gặp trong DevOps: `3306` MySQL, `5432` PostgreSQL, `6379` Redis, `9090` Prometheus, `3000`/`8080` app dev.
+- Client dùng **ephemeral port** do OS cấp ngẫu nhiên. Trên Linux xem dải bằng `cat /proc/sys/net/ipv4/ip_local_port_range` (thường `32768 60999`).
+- Một kết nối TCP được định danh duy nhất bởi **5-tuple**: protocol, IP nguồn, port nguồn, IP đích, port đích. Vì vậy một server port 443 phục vụ được hàng nghìn client cùng lúc.
+
+### Listen trên địa chỉ nào?
+
+| Bind address | Ai kết nối được |
+|---|---|
+| `127.0.0.1:3000` | Chỉ chính máy đó (loopback) |
+| `0.0.0.0:3000` | Mọi interface IPv4 của máy |
+| `10.0.1.25:3000` | Chỉ qua interface có IP đó |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "IP của máy trên từng interface", command: "ip -brief addr", output: "lo               UNKNOWN        127.0.0.1/8 ::1/128\neth0             UP             10.0.1.25/24 fe80::a00:27ff:fe4e:66a1/64" },
+    { comment: "Gói tin ra ngoài đi qua gateway nào?", command: "ip route", output: "default via 10.0.1.1 dev eth0 proto dhcp src 10.0.1.25 metric 100\n10.0.1.0/24 dev eth0 proto kernel scope link src 10.0.1.25" },
+    { comment: "Process nào đang LISTEN ở port TCP nào? (-t tcp, -l listen, -n số, -p process)", command: "sudo ss -tlnp", output: "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process\nLISTEN 0      511          0.0.0.0:80         0.0.0.0:*     users:((\"nginx\",pid=1234,fd=6))\nLISTEN 0      4096   127.0.0.53%lo:53         0.0.0.0:*     users:((\"systemd-resolve\",pid=567,fd=14))\nLISTEN 0      128          0.0.0.0:22         0.0.0.0:*     users:((\"sshd\",pid=890,fd=3))\nLISTEN 0      511        127.0.0.1:3000       0.0.0.0:*     users:((\"node\",pid=2045,fd=19))" },
+    { comment: "Các kết nối đang ESTABLISHED tới port 443", command: "ss -tn state established '( dport = :443 )'", output: "Recv-Q Send-Q  Local Address:Port    Peer Address:Port\n0      0          10.0.1.25:51514   140.82.112.3:443" },
+    { comment: "Thử mở kết nối TCP tới một port (không gửi dữ liệu)", command: "nc -vz 10.0.1.30 5432", output: "Connection to 10.0.1.30 5432 port [tcp/postgresql] succeeded!" },
+    { comment: "Gửi truy vấn DNS (UDP 53) thẳng tới resolver 1.1.1.1 — IP trả về có thể khác theo thời điểm", command: "dig +short example.com @1.1.1.1", output: "93.184.215.14" },
+  ]}
+/>
+
+Nhìn output `ss` ở trên: `node` đang nghe ở `127.0.0.1:3000` — nghĩa là chỉ Nginx trên cùng máy gọi được app, bên ngoài thì không. Đây thường là **cố ý** (app đứng sau reverse proxy).
+
+<Callout type="mistake" title="App chạy rồi mà bên ngoài vẫn không vào được">
+  App (hoặc container) đang listen `127.0.0.1` thay vì `0.0.0.0`. Từ ngoài gọi vào sẽ bị `Connection refused`. Kiểm tra ngay bằng `ss -tlnp` trước khi đi đổ lỗi cho firewall.
+</Callout>
+
+<Callout type="tip">
+  Khi debug, hãy phân biệt **timeout** (gói đi mà không ai trả lời — thường do firewall DROP) với **connection refused** (tới được máy nhưng không ai nghe port đó). Hai lỗi này chỉ về hai hướng điều tra khác nhau — bài cuối module sẽ luyện kỹ.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "IP address", meaning: "Địa chỉ toà nhà — xác định máy trên mạng (tầng 3)." },
+    { term: "port", meaning: "Số căn hộ — xác định ứng dụng trên máy (0–65535)." },
+    { term: "TCP", meaning: "Giao thức có kết nối, đảm bảo dữ liệu tới đủ và đúng thứ tự." },
+    { term: "UDP", meaning: "Giao thức không kết nối, nhẹ và nhanh, không đảm bảo tới nơi." },
+    { term: "3-way handshake", meaning: "SYN → SYN-ACK → ACK: TCP bắt tay trước khi truyền dữ liệu." },
+    { term: "ephemeral port", meaning: "Port tạm OS cấp cho phía client của kết nối." },
+    { term: "5-tuple", meaning: "Protocol + IP/port nguồn + IP/port đích — định danh một kết nối." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn chạy `ss -tlnp` trên server và thấy `LISTEN 127.0.0.1:8080 ... java`. Đồng nghiệp gọi `curl http://10.0.1.25:8080` từ máy khác và bị lỗi. Nguyên nhân khả dĩ nhất?"
+  options={[
+    "Port 8080 vượt quá giới hạn 65535",
+    "App chỉ nghe trên loopback nên máy khác không kết nối được",
+    "Phải dùng UDP thay vì TCP",
+    "Thiếu bản ghi DNS cho 10.0.1.25",
+  ]}
+  answerIndex={1}
+  explanation="127.0.0.1 là 'cửa trong nhà' — chỉ người trong toà nhà (chính máy đó) đi qua được. Muốn nhận khách từ ngoài phải bind 0.0.0.0 hoặc IP của interface. Gọi thẳng bằng IP thì DNS không liên quan."
+/>

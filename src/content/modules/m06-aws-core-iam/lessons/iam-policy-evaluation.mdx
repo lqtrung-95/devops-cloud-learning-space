@@ -1,0 +1,132 @@
+import { PolicyEvaluationDecisionDiagram } from "../diagrams/policy-evaluation-decision-diagram";
+
+<Eli5 title="Policy evaluation giống như bảo vệ toà nhà kiểm tra danh sách" emoji="💂">
+  Bác bảo vệ toà nhà có một nguyên tắc: **ai không có tên trong danh sách thì không cho vào** — không cần lý do. Đó là **implicit deny** (từ chối mặc định).
+
+  Nếu có tờ giấy ghi "**Cấm anh Trung vào phòng máy**" thì dù Trung có thêm mười tờ giấy cho phép, bác vẫn chặn. Đó là **explicit deny** — lệnh cấm luôn thắng.
+
+  Ban quản lý toà nhà còn có **nội quy chung** (SCP): "Tầng 5 đang sửa, không ai được lên". Nội quy này không cấp thêm quyền cho ai, nhưng **giới hạn** tất cả — kể cả giám đốc.
+
+  Chỗ ví dụ lệch: bảo vệ ngoài đời có thể "linh động", còn IAM thì không bao giờ. Cùng đầu vào luôn ra cùng kết quả.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+Khi gặp `AccessDenied`, bạn cần biết **tìm ở đâu**: thiếu Allow? có Deny ẩn đâu đó? SCP của công ty chặn? Hiểu thứ tự đánh giá giúp debug trong 5 phút thay vì 5 giờ, và giúp viết policy **least privilege** mà vẫn chạy được.
+
+<PolicyEvaluationDecisionDiagram />
+
+<Technical>
+
+### Ba luật nền tảng
+
+1. **Mặc định: Deny.** Mọi request bắt đầu ở trạng thái bị từ chối (trừ root user có toàn quyền trong account của mình — nhưng root vẫn bị SCP giới hạn nếu account là member của Organization).
+2. **Explicit Deny thắng tất cả.** Một `"Effect": "Deny"` khớp ở bất kỳ policy liên quan nào → kết thúc, Deny.
+3. **Cần ít nhất một Allow** từ loại policy phù hợp, và **không bị giới hạn** bởi các "trần quyền" (SCP, permissions boundary, session policy).
+
+### Các loại policy tham gia đánh giá
+
+| Loại | Vai trò | Cấp quyền hay giới hạn? |
+|---|---|---|
+| Identity-based policy | Danh tính được làm gì | **Cấp** |
+| Resource-based policy | Ai được làm gì trên resource này | **Cấp** |
+| SCP (Organizations) | Trần quyền tối đa cho mọi principal trong account | Chỉ **giới hạn** |
+| RCP (Organizations) | Trần quyền tối đa trên resource của account | Chỉ **giới hạn** |
+| Permissions boundary | Trần quyền cho một user/role cụ thể | Chỉ **giới hạn** |
+| Session policy | Trần quyền cho một phiên assume role | Chỉ **giới hạn** |
+
+Quyền hiệu lực ≈ **giao** của các "trần" với **hợp** của các Allow, trừ đi mọi Deny. SCP không áp dụng cho management account của Organization.
+
+**Cross-account**: account A gọi resource ở account B thì cần Allow ở **cả hai phía** — identity policy bên A **và** resource policy (hoặc trust policy của role) bên B.
+
+### Least privilege trong thực tế
+
+Lab của module: cho phép đọc/ghi **đúng một** bucket.
+
+```json title="s3-single-bucket-rw.json"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListOnlyThisBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::trung-lab-bucket"
+    },
+    {
+      "Sid": "ReadWriteObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::trung-lab-bucket/*"
+    }
+  ]
+}
+```
+
+Và một Deny "phanh tay" hay dùng: chặn xoá object nếu phiên không có MFA.
+
+```json title="deny-delete-without-mfa.json"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::trung-lab-bucket/*",
+      "Condition": {
+        "BoolIfExists": { "aws:MultiFactorAuthPresent": "false" }
+      }
+    }
+  ]
+}
+```
+
+### Công cụ kiểm chứng
+
+- **IAM Policy Simulator** (web) và `aws iam simulate-principal-policy` (CLI): thử "nếu gọi action X trên resource Y thì sao?" mà không cần gọi thật.
+- **IAM Access Analyzer**: phát hiện resource chia sẻ ra ngoài account, kiểm tra cú pháp policy, gợi ý policy từ CloudTrail.
+- **Thông báo lỗi**: nhiều dịch vụ ghi rõ loại policy chặn, ví dụ `...with an explicit deny in a service control policy`.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Gắn policy tối thiểu cho user lab", command: "aws iam put-user-policy --user-name lab-user --policy-name s3-single-bucket-rw --policy-document file://s3-single-bucket-rw.json" },
+    { comment: "Mô phỏng: được đọc, ghi, xoá không?", command: "aws iam simulate-principal-policy --policy-source-arn arn:aws:iam::123456789012:user/lab-user --action-names s3:GetObject s3:PutObject s3:DeleteObject --resource-arns 'arn:aws:s3:::trung-lab-bucket/*' --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output table", output: "-----------------------------------\n|     SimulatePrincipalPolicy     |\n+-----------------+---------------+\n|  s3:GetObject   |  allowed      |\n|  s3:PutObject   |  allowed      |\n|  s3:DeleteObject|  implicitDeny |\n+-----------------+---------------+" },
+    { comment: "Thử với bucket khác — phải bị chặn", command: "aws iam simulate-principal-policy --policy-source-arn arn:aws:iam::123456789012:user/lab-user --action-names s3:GetObject --resource-arns 'arn:aws:s3:::other-bucket/*' --query 'EvaluationResults[0].EvalDecision' --output text", output: "implicitDeny" },
+    { comment: "Kiểm chứng thật bằng profile của lab-user", command: "aws s3 rm s3://trung-lab-bucket/test.txt --profile lab-user", output: "delete failed: s3://trung-lab-bucket/test.txt An error occurred (AccessDenied) when calling the DeleteObject operation: User: arn:aws:iam::123456789012:user/lab-user is not authorized to perform: s3:DeleteObject on resource: \"arn:aws:s3:::trung-lab-bucket/test.txt\" because no identity-based policy allows the s3:DeleteObject action" },
+  ]}
+/>
+
+<Callout type="mistake" title="Cố thêm Allow để 'đè' một Deny">
+  Không có Allow nào ghi đè được explicit Deny — kể cả `AdministratorAccess`. Nếu vẫn `AccessDenied` sau khi đã thêm Allow, hãy tìm Deny ở: policy khác của user/group/role, bucket policy, permissions boundary, SCP.
+</Callout>
+
+<Callout type="tip">
+  Đọc kỹ đuôi thông báo lỗi: `no identity-based policy allows` (thiếu Allow) khác hẳn `with an explicit deny in a ...` (bị Deny chặn). Chỉ riêng câu đó đã chỉ ra hướng debug.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Implicit deny", meaning: "Từ chối mặc định khi không có Allow nào khớp." },
+    { term: "Explicit deny", meaning: "Statement Effect: Deny khớp request — luôn thắng mọi Allow." },
+    { term: "SCP", meaning: "Service Control Policy của Organizations: trần quyền cho account, không cấp quyền." },
+    { term: "Permissions boundary", meaning: "Trần quyền tối đa đặt lên một user/role cụ thể." },
+    { term: "Least privilege", meaning: "Chỉ cấp đúng action, đúng resource, đúng điều kiện cần thiết." },
+    { term: "Policy Simulator", meaning: "Công cụ thử quyết định Allow/Deny mà không gọi API thật." },
+  ]}
+/>
+
+<QuickCheck
+  question="Role deploy có AdministratorAccess nhưng gọi ec2:RunInstances ở region eu-west-1 bị AccessDenied. Công ty dùng AWS Organizations. Nguyên nhân khả dĩ nhất?"
+  options={[
+    "AdministratorAccess không bao gồm EC2",
+    "Một SCP chặn các region ngoài danh sách cho phép",
+    "Role cần thêm trust policy cho EC2",
+    "Region eu-west-1 không có EC2",
+  ]}
+  answerIndex={1}
+  explanation="Như nội quy toà nhà 'không ai lên tầng 5': SCP là trần quyền áp cho cả account. Allow trong identity policy không vượt được trần đó. Chặn region bằng SCP là guardrail rất phổ biến."
+/>

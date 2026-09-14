@@ -1,0 +1,130 @@
+import { NetworkDebuggingScenariosDiagram } from "../diagrams/network-debugging-scenarios-diagram";
+
+<Eli5 title="Firewall là bảo vệ cổng khu chung cư, debug mạng là lần theo đường đi của shipper" emoji="🛵">
+  **Firewall** là **bác bảo vệ** cầm danh sách: "căn 22 chỉ nhận khách từ văn phòng, căn 443 ai cũng được vào, còn lại cấm". Bác có hai cách từ chối: **lặng im không nói gì** (DROP — shipper đứng chờ tới khi bỏ cuộc) hoặc **nói thẳng "không có ai nhận"** (REJECT — shipper biết ngay để quay về).
+
+  Khi đơn hàng không tới, người giỏi không đoán mò. Họ **lần theo từng chặng**: có tra được địa chỉ không (DNS)? Có tới được cổng không (firewall/route)? Có ai ở nhà mở cửa không (port listen)? Có ký nhận được không (TLS)? Người nhận có xử lý đơn không (app)?
+
+  Mỗi thông báo lỗi là **một manh mối chỉ đúng chặng bị hỏng**. Chọn thử từng lỗi bên dưới.
+</Eli5>
+
+Tiêu chí đạt của module này là giải thích được `curl https://example.com` từ DNS lookup tới response. Bài này ghép tất cả lại thành **quy trình khoanh vùng lỗi**: kỹ năng bạn dùng hằng tuần khi on-call.
+
+<NetworkDebuggingScenariosDiagram />
+
+<Technical>
+
+### Firewall trên Linux: 3 lớp tên gọi
+
+| Công cụ | Là gì |
+|---|---|
+| **netfilter** | Framework trong kernel thực sự lọc gói |
+| `iptables` / `nftables` | Công cụ khai báo rule cho netfilter. nftables là thế hệ mới; nhiều distro hiện đại chạy `iptables` như lớp tương thích trên nftables (`iptables-nft`) |
+| `ufw` (Ubuntu), `firewalld` (RHEL) | Giao diện dễ dùng, sinh rule iptables/nftables phía sau |
+
+Firewall Linux là **stateful**: đã cho phép kết nối đi vào thì gói trả lời tự được cho ra (nhờ connection tracking). AWS **Security Group** cũng stateful; còn **Network ACL** là stateless — bạn sẽ gặp lại ở M07.
+
+```bash title="ufw: mặc định chặn vào, cho phép ra"
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow OpenSSH                               # LÀM TRƯỚC khi enable!
+sudo ufw allow 'Nginx Full'                          # 80 + 443
+sudo ufw allow from 10.0.0.0/16 to any port 5432 proto tcp   # Postgres chỉ cho mạng nội bộ
+sudo ufw enable
+```
+
+```text title="Cùng ý tưởng bằng nftables — /etc/nftables.conf (tham khảo)"
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    ct state established,related accept
+    iif lo accept
+    tcp dport { 22, 80, 443 } accept
+  }
+}
+```
+
+### Hộp đồ nghề debug mạng
+
+| Câu hỏi | Công cụ | Lệnh mẫu |
+|---|---|---|
+| Máy có IP gì, route ra sao? | `ip` | `ip -br addr`, `ip route get 1.1.1.1` |
+| Tên có ra IP không? | `dig`, `getent` | `dig +short app.example.com` |
+| Có đường tới máy đích không? Kẹt ở hop nào? | `ping`, `traceroute`, `mtr` | `mtr -rwc 10 app.example.com` (ICMP có thể bị chặn — không trả lời chưa chắc là chết) |
+| Port có mở từ phía mình không? | `nc` | `nc -vz -w 3 10.0.1.25 443` |
+| Trên server, ai đang listen? | `ss` | `sudo ss -tlnp` |
+| TLS/HTTP trả lời gì? | `curl -v`, `openssl s_client` | `curl -v https://app.example.com` |
+| Gói tin thật sự đi thế nào? | `tcpdump` | `sudo tcpdump -i any -nn port 443` |
+
+### Timeout vs refused — hai manh mối quan trọng nhất
+
+| Triệu chứng | Nghĩa ở tầng mạng | Hướng điều tra |
+|---|---|---|
+| **Timeout** (chờ lâu rồi hỏng) | SYN gửi đi nhưng không có gì quay lại | Firewall/SG DROP, NACL, route, máy tắt, sai IP |
+| **Connection refused** (hỏng ngay) | Máy đích trả RST | Không process nào listen port đó, app bind `127.0.0.1`, hoặc firewall REJECT |
+
+### Đọc tcpdump một request HTTP
+
+```text
+# sudo tcpdump -i eth0 -nn 'tcp port 80'
+10.0.1.5.51514 > 10.0.1.25.80: Flags [S], seq 1000, win 64240, length 0        ← SYN
+10.0.1.25.80 > 10.0.1.5.51514: Flags [S.], seq 7000, ack 1001, length 0        ← SYN-ACK
+10.0.1.5.51514 > 10.0.1.25.80: Flags [.], ack 7001, length 0                   ← ACK: xong handshake
+10.0.1.5.51514 > 10.0.1.25.80: Flags [P.], seq 1001:1079, length 78: HTTP: GET / HTTP/1.1
+10.0.1.25.80 > 10.0.1.5.51514: Flags [P.], seq 7001:7613, length 612: HTTP: HTTP/1.1 200 OK
+10.0.1.5.51514 > 10.0.1.25.80: Flags [F.], seq 1079, ack 7613, length 0        ← FIN: đóng
+```
+
+Cờ: `S` SYN, `.` ACK, `P` push (có dữ liệu), `F` FIN, `R` RST. Thực tế tcpdump in số seq tương đối và thêm timestamp, options; ở đây đã rút gọn.
+
+</Technical>
+
+## Thực hành: khoanh vùng từ ngoài vào trong
+
+<Terminal
+  commands={[
+    { comment: "1. DNS: tên có ra IP không?", command: "dig +short app.example.com", output: "203.0.113.10" },
+    { comment: "2. Mạng/firewall: port 443 có mở không? (-w 3 = chờ tối đa 3 giây)", command: "nc -vz -w 3 203.0.113.10 443", output: "Connection to 203.0.113.10 443 port [tcp/https] succeeded!" },
+    { comment: "3. TLS + HTTP: xem chi tiết, chỉ lấy dòng quan trọng", command: "curl -sv https://app.example.com -o /dev/null 2>&1 | grep -E '^\\*\\s+(Connected|SSL cert)|^< HTTP'", output: "* Connected to app.example.com (203.0.113.10) port 443\n*  SSL certificate verify ok.\n< HTTP/2 502" },
+    { comment: "4. Trên server: app có đang listen không?", command: "sudo ss -tlnp | grep -E ':(443|3000)'", output: "LISTEN 0      511          0.0.0.0:443        0.0.0.0:*    users:((\"nginx\",pid=1234,fd=8))" },
+    { comment: "Không thấy :3000 → app chết. Xem vì sao", command: "systemctl status app --no-pager | head -3", output: "× app.service - Sample API\n     Loaded: loaded (/etc/systemd/system/app.service; enabled; preset: enabled)\n     Active: failed (Result: exit-code) since Mon 2026-09-14 10:02:11 UTC; 3min ago" },
+    { comment: "Kiểm tra firewall trên server", command: "sudo ufw status numbered", output: "Status: active\n\n     To                         Action      From\n     --                         ------      ----\n[ 1] OpenSSH                    ALLOW IN    Anywhere\n[ 2] Nginx Full                 ALLOW IN    Anywhere\n[ 3] 5432/tcp                   ALLOW IN    10.0.0.0/16" },
+    { comment: "Lab: bắt gói của một request HTTP, lưu ra file để mở bằng Wireshark", command: "sudo tcpdump -i any -nn -c 20 -w http.pcap 'tcp port 80'", output: "tcpdump: listening on any, link-type LINUX_SLL2 (Linux cooked v2), snapshot length 262144 bytes\n20 packets captured\n20 packets received by filter\n0 packets dropped by kernel" },
+  ]}
+/>
+
+<Callout type="warning" title="Tự khoá mình khỏi server">
+  `sudo ufw enable` khi chưa `ufw allow OpenSSH` trên VM từ xa = mất kết nối SSH ngay lập tức. Luôn thêm rule SSH trước, và giữ một phiên SSH đang mở trong lúc đổi firewall.
+</Callout>
+
+<Callout type="mistake" title="Tưởng ufw chặn được port của Docker">
+  Docker publish port (`-p 5432:5432`) bằng cách tự chèn rule iptables riêng, **đi vòng qua rule của ufw**. Kết quả: database "đã chặn bằng ufw" vẫn mở ra Internet. Hãy publish vào `127.0.0.1:5432:5432` hoặc chặn ở tầng ngoài (Security Group) — kiểm tra tài liệu Docker về packet filtering cho phiên bản bạn dùng.
+</Callout>
+
+<Callout type="tip">
+  Debug theo **một chiều cố định** (ngoài vào trong, hoặc tầng thấp lên cao) và ghi lại mỗi bước đã loại trừ. Đừng nhảy cóc sửa config Nginx khi còn chưa biết DNS có ra đúng IP không.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "firewall", meaning: "Bảo vệ lọc gói theo IP, port, giao thức, trạng thái kết nối." },
+    { term: "DROP vs REJECT", meaning: "Lặng im bỏ gói (client timeout) vs trả lời từ chối (client lỗi ngay)." },
+    { term: "stateful", meaning: "Nhớ kết nối đã cho phép, tự cho gói trả lời đi qua." },
+    { term: "ss", meaning: "Xem socket đang listen/kết nối trên máy (thay netstat)." },
+    { term: "nc (netcat)", meaning: "Mở kết nối TCP/UDP thô để thử một port." },
+    { term: "tcpdump", meaning: "Bắt và in gói tin thật đi qua interface." },
+    { term: "RST", meaning: "Cờ TCP báo 'không có kết nối/không ai nghe' — nguồn gốc lỗi refused." },
+  ]}
+/>
+
+<QuickCheck
+  question="`curl https://10.0.2.40` chờ khoảng 2 phút rồi báo timeout. Trên chính server đó, `curl -k https://127.0.0.1` trả 200. Nghi phạm số một?"
+  options={[
+    "Nginx chưa chạy",
+    "Certificate sai tên miền",
+    "DNS trả sai IP",
+    "Firewall / Security Group đang DROP port 443 từ bên ngoài",
+  ]}
+  answerIndex={3}
+  explanation="App trả lời trong nhà nên người nhận vẫn ở đó; gọi bằng IP nên không liên quan DNS; cert sai sẽ báo lỗi ngay chứ không chờ. Chờ mãi rồi timeout là dấu hiệu bác bảo vệ lặng im bỏ gói (DROP)."
+/>

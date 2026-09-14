@@ -1,0 +1,148 @@
+import { MultiStageBuildDiagram } from "../diagrams/multi-stage-build-diagram";
+
+<Eli5 title="Dockerfile tốt giống bếp trung tâm nấu cơm hộp" emoji="🍱">
+
+Một bếp trung tâm nấu cơm hộp giao văn phòng. Bếp **to, đầy dụng cụ**: nồi hầm, lò nướng, dao thớt, bao bì nguyên liệu. Nhưng khi giao hàng, không ai chở **cả cái bếp** tới công ty khách — chỉ mang **hộp cơm đã đóng gói**.
+
+**Multi-stage build** chính là vậy: stage đầu là bếp lớn (compiler, devDependencies, source), stage cuối chỉ chứa hộp cơm (file đã build + thứ tối thiểu để chạy).
+
+Hộp cơm còn phải **ghi rõ nguồn gốc nguyên liệu** (pin version), **niêm phong** để shipper không mở ra ăn vụng (chạy non-root), và **có tem kiểm tra chất lượng** (HEALTHCHECK).
+
+</Eli5>
+
+### Vì sao DevOps quan tâm?
+
+Image nhỏ **pull nhanh hơn** (autoscale nhanh hơn), **ít package hơn → ít lỗ hổng hơn** để Trivy báo, và tốn ít tiền lưu trữ/băng thông hơn. Chạy non-root giới hạn thiệt hại khi app bị khai thác. Đây là những gì reviewer hỏi đầu tiên khi xem Dockerfile của bạn.
+
+<MultiStageBuildDiagram />
+
+<Technical>
+
+### Dockerfile production cho API Node.js
+
+```dockerfile title="api/Dockerfile"
+# syntax=docker/dockerfile:1
+
+# ---- Stage 1: build (bếp lớn) ----
+FROM node:22-bookworm AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# ---- Stage 2: runtime (hộp cơm) ----
+FROM node:22-alpine AS runtime
+ENV NODE_ENV=production
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY --from=build /app/dist ./dist
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -qO- http://localhost:3000/healthz || exit 1
+CMD ["node", "dist/server.js"]
+```
+
+### Checklist từng dòng
+
+| Thực hành | Vì sao |
+|---|---|
+| **Multi-stage** | Image cuối không có compiler, devDependencies, source |
+| **Pin version base image** (`node:22-alpine`, tốt hơn nữa là pin cả digest `@sha256:…`) | Tránh `latest` âm thầm đổi sang bản khác làm build hôm nay khác hôm qua |
+| **Base nhỏ**: `-alpine`, `-slim`, distroless | Ít package → ít CVE, pull nhanh |
+| **`USER` non-root** | App bị hack cũng không có quyền root trong container |
+| **Exec form** `CMD ["node", "dist/server.js"]` | App là PID 1, nhận được `SIGTERM` để tắt êm. Shell form `CMD node dist/server.js` bọc app trong `/bin/sh` và có thể nuốt tín hiệu |
+| **`HEALTHCHECK`** | Docker/Compose biết app "sống nhưng hỏng" để báo `unhealthy` |
+| **Gộp `apt-get update && install`**, dọn cache cùng layer | Không cache danh sách package cũ, layer nhỏ hơn |
+| **`COPY` cụ thể, hạn chế `ADD`** | `ADD` tự giải nén và tải URL — khó đoán; `COPY` rõ ràng |
+
+### Alpine, slim hay distroless?
+
+- **alpine** (musl libc, ~vài MB): rất nhỏ. Đôi khi lỗi với thư viện native build cho glibc — test kỹ.
+- **slim** (Debian rút gọn): tương thích glibc, lớn hơn alpine một chút. Lựa chọn an toàn cho Python.
+- **distroless** (`gcr.io/distroless/...`): không có shell, không package manager — khó debug nhưng bề mặt tấn công rất nhỏ. Có biến thể `:nonroot`. Rất hợp với Go binary tĩnh:
+
+```dockerfile
+FROM golang:1.24 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/api ./cmd/api
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/api /api
+ENTRYPOINT ["/api"]
+```
+
+Tên tag cụ thể (`golang:1.24`, `static-debian12`) thay đổi theo thời gian — kiểm tra tài liệu mới nhất trước khi dùng.
+
+### Non-root: chi tiết hay bị sót
+
+- Image `node` chính thức có sẵn user `node` (UID 1000). Image khác thì tự tạo: `RUN addgroup -S app && adduser -S app -G app` (alpine).
+- File `COPY` vào mặc định thuộc root — đọc được nhưng user thường **không ghi được**. App cần ghi thư mục nào thì `COPY --chown=node:node` hoặc `chown` đúng thư mục đó.
+- Port dưới 1024 cần quyền đặc biệt → app non-root nên nghe port cao như `3000`, `8080`.
+
+### `HEALTHCHECK` và Kubernetes
+
+`HEALTHCHECK` dùng cho Docker Engine và Compose. **Kubernetes bỏ qua nó** và dùng liveness/readiness probe riêng (M12). Vẫn nên có endpoint `/healthz` trong app để cả hai dùng chung.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Build bản 1 stage để so sánh", command: "docker build -f Dockerfile.single -t api:single ." },
+    { comment: "Build bản multi-stage", command: "docker build -t api:multi ." },
+    { command: "docker images api", output: "REPOSITORY   TAG      IMAGE ID       CREATED          SIZE\napi          multi    7c1d52a0e9f3   10 seconds ago   183MB\napi          single   b44e0f3c21aa   2 minutes ago    1.28GB" },
+    { comment: "Chỉ build tới stage build (debug khi build lỗi)", command: "docker build --target build -t api:build-debug ." },
+    { comment: "Kiểm tra non-root", command: "docker run --rm api:multi id", output: "uid=1000(node) gid=1000(node) groups=1000(node)" },
+    { comment: "Chạy và xem trạng thái healthcheck", command: "docker run -d --name api -p 3000:3000 api:multi && sleep 15 && docker ps --format '{{.Names}}: {{.Status}}'", output: "api: Up 15 seconds (healthy)" },
+    { comment: "Lint Dockerfile bằng hadolint (chạy trong container)", command: "docker run --rm -i hadolint/hadolint < Dockerfile", output: "-:9 DL3018 warning: Pin versions in apk add. Instead of `apk add <package>` use `apk add <package>=<version>`" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Chạy bằng root "vì cho nhanh".** Rồi app bị lỗi RCE, kẻ tấn công có root trong container — cộng thêm một lỗ hổng kernel hoặc một volume mount nhạy cảm (như `/var/run/docker.sock`) là chiếm được cả host. Thêm `USER` tốn một dòng.
+
+</Callout>
+
+<Callout type="mistake">
+
+**Dùng `FROM node:latest` hoặc `FROM python`.** Hôm nay build ra Node 22, tháng sau build lại ra Node 24 — pipeline đỏ mà không ai sửa code. Luôn pin ít nhất major version và biến thể OS.
+
+</Callout>
+
+<Callout type="tip">
+
+Pin digest giúp build **tái lập tuyệt đối**, nhưng bạn sẽ không tự nhận bản vá bảo mật. Kết hợp pin digest với Dependabot/Renovate (M05) để bot tự mở PR khi base image có bản mới.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "multi-stage build", meaning: "Nhiều FROM trong một Dockerfile; image cuối chỉ gồm stage cuối cùng." },
+    { term: "COPY --from", meaning: "Copy file từ một stage (hoặc image) khác vào stage hiện tại." },
+    { term: "distroless", meaning: "Base image không có shell hay package manager, chỉ runtime tối thiểu." },
+    { term: "non-root user", meaning: "Chạy tiến trình bằng UID khác 0 để giảm thiệt hại khi bị khai thác." },
+    { term: "exec form", meaning: "CMD/ENTRYPOINT dạng mảng JSON, app chạy trực tiếp là PID 1." },
+    { term: "HEALTHCHECK", meaning: "Lệnh Docker chạy định kỳ để đánh dấu container healthy/unhealthy." },
+    { term: "digest", meaning: "Hash sha256 cố định định danh chính xác một image." },
+  ]}
+/>
+
+<QuickCheck
+  question="Container của bạn mất 10 giây mới dừng khi `docker stop`, và app không kịp đóng kết nối DB. Dockerfile đang dùng `CMD node server.js`. Nguyên nhân khả dĩ nhất?"
+  options={[
+    "Image quá lớn",
+    "Shell form khiến /bin/sh là PID 1 và không chuyển SIGTERM cho node; hết thời gian chờ Docker gửi SIGKILL",
+    "Thiếu HEALTHCHECK",
+    "Chưa khai báo EXPOSE",
+  ]}
+  answerIndex={1}
+  explanation="Như shipper nhận lệnh 'dừng giao' mà không báo lại cho bếp. Dùng exec form (CMD dạng mảng JSON) để node nhận SIGTERM trực tiếp và tắt êm."
+/>

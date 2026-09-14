@@ -1,0 +1,151 @@
+import { BuildCacheLayersDiagram } from "../diagrams/build-cache-layers-diagram";
+
+<Eli5 title="Build image giống quán phở chuẩn bị nguyên liệu từ sáng" emoji="🍜">
+
+Quán phở không ninh nước dùng mỗi khi có khách. Sáng sớm, bếp làm theo **công thức từng bước**: ninh xương 8 tiếng → thái thịt → trụng bánh → thêm rau. Mỗi bước xong được cất vào **khay trong tủ lạnh**, dán nhãn "làm theo bước X với nguyên liệu Y".
+
+Lần sau nấu, bếp đọc công thức từ đầu: bước nào **y hệt** lần trước và nguyên liệu không đổi → lấy khay có sẵn (**cache**). Nhưng chỉ cần **một bước thay đổi**, mọi bước **sau nó** phải làm lại, vì chúng dựa trên kết quả bước đó.
+
+Vì vậy bếp khôn sẽ đặt việc **lâu và ít đổi** (ninh nước dùng = cài dependency) lên đầu, việc **nhanh và đổi liên tục** (thêm rau = copy code) xuống cuối.
+
+Chỗ ví von bị "gãy": tủ lạnh cache nằm **trên máy build**. Runner CI mới tinh không có tủ lạnh nào — phải chủ động lưu/khôi phục cache (M05 sẽ làm).
+
+</Eli5>
+
+### Vì sao DevOps quan tâm?
+
+Build chậm = pipeline chậm = dev chờ lâu và ngại commit nhỏ. Một Dockerfile sắp xếp đúng có thể giảm thời gian build từ vài phút xuống vài giây. Hiểu layer còn giúp bạn tránh **lộ secret** và giữ image nhỏ.
+
+<BuildCacheLayersDiagram />
+
+<Technical>
+
+### Image là chồng layer chỉ-đọc
+
+- Image = danh sách **layer** (mỗi layer là một tập thay đổi file) + **config** (CMD, ENV, USER, EXPOSE…) + **manifest** mô tả chúng.
+- Mỗi layer được định danh bằng **hash sha256 nội dung** (content-addressable). Hai image dùng chung base `node:22-alpine` chỉ lưu base **một lần** trên disk và trong registry.
+- `RUN`, `COPY`, `ADD` tạo layer filesystem. `ENV`, `CMD`, `EXPOSE`, `USER`, `LABEL` chủ yếu chỉ thay đổi metadata.
+- Khi chạy container, Docker (storage driver `overlay2`) xếp các layer chồng lên nhau và thêm **một writable layer mỏng** trên cùng. Sửa file có sẵn → file được copy lên writable layer (**copy-on-write**). Xoá container = xoá writable layer.
+
+```text
+┌──────────────────────────────┐  writable layer (của container, mất khi rm)
+├──────────────────────────────┤  COPY . .              ← code, đổi liên tục
+├──────────────────────────────┤  RUN npm ci            ← dependency, lâu
+├──────────────────────────────┤  COPY package*.json ./
+├──────────────────────────────┤  node:22-alpine layers ← dùng chung
+└──────────────────────────────┘
+```
+
+### Quy tắc build cache
+
+| Lệnh | Cache bị vô hiệu khi… |
+|---|---|
+| `FROM` | Tag trỏ sang image khác (hoặc bạn `--pull`) |
+| `RUN` | **Chuỗi lệnh** thay đổi — Docker không biết kết quả bên ngoài có đổi hay không |
+| `COPY` / `ADD` | Nội dung (checksum) các file được copy thay đổi |
+| Bất kỳ | Một bước **phía trước** đã bị vô hiệu |
+
+Hệ quả quan trọng:
+
+- `RUN apt-get update` đứng riêng sẽ được cache **mãi mãi** → danh sách package cũ. Luôn gộp: `RUN apt-get update && apt-get install -y --no-install-recommends curl`.
+- Copy file khai báo dependency **trước**, cài dependency, rồi mới copy code:
+
+```dockerfile title="Dockerfile"
+FROM node:22-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+CMD ["node", "dist/server.js"]
+```
+
+Với Python là `requirements.txt` → `pip install`; Go là `go.mod`/`go.sum` → `go mod download`.
+
+### Build context và `.dockerignore`
+
+`docker build .` gửi **cả thư mục** (build context) cho builder. Không có `.dockerignore` thì `node_modules`, `.git`, file `.env` bị gửi đi, làm build chậm, `COPY . .` hay bị vô hiệu cache, và có thể **đưa secret vào image**.
+
+```ini title=".dockerignore"
+node_modules
+dist
+.git
+.env*
+*.log
+Dockerfile
+compose.yaml
+```
+
+### BuildKit: cache mạnh hơn
+
+BuildKit là builder mặc định của Docker Engine hiện đại (từ 23.0). Hai tính năng hay dùng:
+
+```dockerfile
+# Cache mount: thư mục cache của npm được giữ giữa các lần build, không nằm trong image
+RUN --mount=type=cache,target=/root/.npm npm ci
+```
+
+```bash
+# CI: đẩy/kéo cache qua registry để runner mới cũng có "tủ lạnh"
+docker buildx build \
+  --cache-from type=registry,ref=ghcr.io/acme/api:buildcache \
+  --cache-to type=registry,ref=ghcr.io/acme/api:buildcache,mode=max \
+  -t ghcr.io/acme/api:dev .
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Build lần đầu: mọi bước đều chạy", command: "docker build -t api:dev .", output: " => [1/6] FROM docker.io/library/node:22-alpine@sha256:…\n => [2/6] WORKDIR /app\n => [3/6] COPY package.json package-lock.json ./\n => [4/6] RUN npm ci                                  92.4s\n => [5/6] COPY . .\n => [6/6] RUN npm run build                           18.7s" },
+    { comment: "Sửa 1 dòng trong src/, build lại", command: "echo '// tweak' >> src/server.ts && docker build -t api:dev .", output: " => CACHED [2/6] WORKDIR /app\n => CACHED [3/6] COPY package.json package-lock.json ./\n => CACHED [4/6] RUN npm ci\n => [5/6] COPY . .\n => [6/6] RUN npm run build                           18.1s" },
+    { comment: "Xem các layer và kích thước từng layer", command: "docker history api:dev --format 'table {{.CreatedBy}}\\t{{.Size}}' | head -n 6", output: "CREATED BY                                      SIZE\nCMD [\"node\" \"dist/server.js\"]                   0B\nRUN /bin/sh -c npm run build # buildkit         2.1MB\nCOPY . . # buildkit                             1.4MB\nRUN /bin/sh -c npm ci # buildkit                212MB\nCOPY package.json package-lock.json ./          310kB" },
+    { comment: "Bao nhiêu layer filesystem?", command: "docker image inspect api:dev --format '{{len .RootFS.Layers}}'", output: "9" },
+    { comment: "Soi nội dung từng layer bằng giao diện terminal (công cụ dive)", command: "dive api:dev" },
+    { comment: "Dọn build cache khi disk đầy", command: "docker builder prune --filter until=72h" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Tưởng `RUN rm` xoá được file khỏi image.** `COPY secret.pem .` rồi `RUN rm secret.pem` chỉ **che** file ở layer trên — file vẫn nằm nguyên trong layer của `COPY`, ai có image cũng lấy ra được bằng `docker save`. Không bao giờ đưa secret vào build context; khi build cần secret, dùng `RUN --mount=type=secret`.
+
+</Callout>
+
+<Callout type="tip">
+
+Build chậm bất thường? Chạy `docker build --progress=plain .` để xem bước nào **không** có chữ `CACHED`, rồi hỏi: "bước trước nó copy file gì mà hay thay đổi?"
+
+</Callout>
+
+<Callout type="warning">
+
+`--no-cache` không phải cách sửa build chậm — nó tắt hẳn tủ lạnh. Chỉ dùng khi muốn chắc chắn lấy bản vá mới nhất của base image (kèm `--pull`), ví dụ trong build hằng đêm.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "layer", meaning: "Một tập thay đổi filesystem chỉ-đọc, định danh bằng hash nội dung." },
+    { term: "writable layer", meaning: "Lớp ghi mỏng của từng container, mất khi container bị xoá." },
+    { term: "copy-on-write", meaning: "Chỉ copy file lên lớp ghi khi container sửa file đó." },
+    { term: "build cache", meaning: "Kết quả các bước build trước được tái sử dụng nếu bước và đầu vào không đổi." },
+    { term: "build context", meaning: "Thư mục gửi cho builder khi chạy docker build." },
+    { term: ".dockerignore", meaning: "Danh sách file loại khỏi build context." },
+    { term: "BuildKit", meaning: "Builder hiện đại của Docker: build song song, cache mount, secret mount." },
+  ]}
+/>
+
+<QuickCheck
+  question="Dockerfile Python có `COPY . .` rồi `RUN pip install -r requirements.txt`. Sửa README.md cũng làm pip cài lại. Cách sửa đúng nhất?"
+  options={[
+    "Chuyển sang image python:slim",
+    "Thêm --no-cache khi build",
+    "COPY requirements.txt trước, RUN pip install, sau đó mới COPY . . (và thêm .dockerignore)",
+    "Gộp tất cả thành một lệnh RUN duy nhất",
+  ]}
+  answerIndex={2}
+  explanation="Ninh nước dùng trước, thêm rau sau: file dependency ít đổi nằm ở bước sớm, code hay đổi nằm cuối nên sửa README chỉ làm lại bước COPY cuối."
+/>

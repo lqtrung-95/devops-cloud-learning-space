@@ -1,0 +1,107 @@
+import { ContainerVsVmToggleDiagram } from "../diagrams/container-vs-vm-toggle-diagram";
+
+<Eli5 title="VM giống nhà phố riêng, container giống căn hộ chung cư" emoji="🏢">
+  **Máy ảo (VM)** giống một **căn nhà phố riêng**: có móng riêng, đường điện nước riêng, tường riêng. Rất riêng tư, nhưng xây mất nhiều thời gian và tốn đất.
+
+  **Container** giống một **căn hộ trong chung cư**: mọi căn hộ **dùng chung móng và hệ thống điện nước** của toà nhà (chính là **kernel** của máy chủ). Mỗi căn vẫn có cửa khoá riêng, đồng hồ điện nước riêng — nên dọn vào ở gần như ngay lập tức.
+
+  Còn cái tên "container" lấy từ **thùng hàng tiêu chuẩn trên tàu biển**: tàu nào, cảng nào, xe tải nào cũng chở được vì kích thước chuẩn. Image Docker cũng vậy — đóng gói một lần, chạy trên laptop, server hay cloud đều giống nhau.
+
+  Chỗ ví von bị "gãy": tường giữa các căn hộ container **mỏng hơn** nhà phố. Nếu có lỗ hổng ở kernel (móng chung), một căn hộ có thể ảnh hưởng tới căn khác.
+</Eli5>
+
+### Vì sao DevOps cần container?
+
+Trước container, câu kinh điển là "chạy trên máy em được mà!". Container gói app **cùng đúng phiên bản runtime và thư viện** thành một image bất biến. CI build image một lần, rồi chính image đó chạy ở staging và production — Kubernetes, ECS, Cloud Run đều nói chung một "ngôn ngữ" là container image.
+
+<ContainerVsVmToggleDiagram />
+
+<Technical>
+
+### Container thực chất là một tiến trình Linux bị "nhốt"
+
+Container **không phải máy ảo nhẹ**. Nó là tiến trình bình thường trên host, được kernel cô lập bằng hai cơ chế:
+
+| Cơ chế | Làm gì | Ví von chung cư |
+|---|---|---|
+| **namespaces** | Che tầm nhìn: container chỉ thấy tiến trình, mạng, file, hostname của riêng nó | Tường và cửa của căn hộ |
+| **cgroups** | Giới hạn và đo tài nguyên: CPU, RAM, I/O | Đồng hồ điện nước + cầu dao riêng |
+
+Các namespace chính: `pid` (thấy PID riêng, app là PID 1), `net` (card mạng, IP riêng), `mnt` (cây thư mục riêng), `uts` (hostname), `ipc`, `user` (map UID).
+
+### VM vs container
+
+| | Virtual Machine | Container |
+|---|---|---|
+| Cô lập | Phần cứng ảo + kernel riêng | Namespaces + cgroups, **chung kernel** |
+| Khởi động | Vài chục giây – phút | Thường dưới 1 giây |
+| Kích thước | GB | MB – vài trăm MB |
+| Chạy OS khác kernel? | Được (Windows trên host Linux) | Không: container Linux cần kernel Linux |
+| Dùng khi | Cần cô lập mạnh, multi-tenant, OS khác | Đóng gói app, microservices, CI |
+
+Thực tế trên cloud thường **kết hợp cả hai**: container chạy bên trong VM (EC2, node của EKS).
+
+<Callout type="info" title="Docker Desktop trên macOS/Windows">
+
+Kernel macOS không phải Linux, nên Docker Desktop âm thầm chạy **một VM Linux nhỏ** và các container nằm trong VM đó. Đây là lý do bind mount trên Mac chậm hơn trên Linux.
+
+</Callout>
+
+### OCI và các thành phần của Docker
+
+- **OCI** (Open Container Initiative) chuẩn hoá **image format** và **runtime**. Image build bằng Docker chạy được trên containerd, Podman, Kubernetes…
+- Khi bạn gõ `docker run`: **docker CLI** → gọi API của **dockerd** → **containerd** quản lý vòng đời → **runc** gọi kernel tạo namespaces/cgroups rồi chạy tiến trình.
+- Kubernetes hiện nay nói chuyện thẳng với containerd (hoặc CRI-O), không cần dockerd — nhưng image bạn build bằng Docker vẫn dùng bình thường.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra Docker đã cài, client và server (daemon) đều trả lời", command: "docker version --format '{{.Client.Version}} / {{.Server.Version}}'" },
+    { comment: "Chạy nginx ở chế độ nền, map port 8080 của host vào port 80 trong container", command: "docker run -d --name web -p 8080:80 nginx:1.27-alpine", output: "Unable to find image 'nginx:1.27-alpine' locally\n1.27-alpine: Pulling from library/nginx\n...\n3f5c1a9e2b7d8c..." },
+    { command: "curl -s localhost:8080 | head -n 4", output: "<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>" },
+    { comment: "Bên trong container chỉ thấy tiến trình của nó (pid namespace)", command: "docker exec web ps", output: "PID   USER     TIME  COMMAND\n    1 root      0:00 nginx: master process nginx -g daemon off;\n   30 nginx     0:00 nginx: worker process\n   38 root      0:00 ps" },
+    { comment: "Trên host (Linux), cùng tiến trình đó chỉ là một process bình thường", command: "ps aux | grep 'nginx: master'", output: "root  48211  0.0  0.1  9828  5640 ?  Ss  10:02  0:00 nginx: master process nginx -g daemon off;" },
+    { comment: "Giới hạn tài nguyên bằng cgroups", command: "docker run -d --name limited --memory 256m --cpus 0.5 nginx:1.27-alpine" },
+    { command: "docker stats --no-stream limited", output: "CONTAINER ID   NAME      CPU %     MEM USAGE / LIMIT   MEM %\n9b2e41c0aa13   limited   0.00%     3.1MiB / 256MiB     1.21%" },
+    { comment: "Dọn dẹp", command: "docker rm -f web limited" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+**Coi container như VM**: SSH vào container, cài thêm package bằng tay, sửa file cấu hình trực tiếp. Container là **dùng xong vứt (ephemeral)** — lần tạo lại tiếp theo mọi thay đổi tay đều biến mất. Mọi thay đổi phải nằm trong Dockerfile hoặc cấu hình truyền vào lúc chạy.
+
+</Callout>
+
+<Callout type="warning">
+
+Mặc định tiến trình trong container thường chạy bằng **root** (UID 0) — và vì chung kernel, root trong container vẫn là chuyện nghiêm túc nếu có lỗ hổng thoát container. Bài "Dockerfile chuẩn production" sẽ chuyển sang user thường.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "container", meaning: "Tiến trình được cô lập bằng namespaces + cgroups, chạy từ một image." },
+    { term: "image", meaning: "Gói chỉ-đọc chứa app, thư viện và cấu hình chạy; khuôn để tạo container." },
+    { term: "namespaces", meaning: "Cơ chế kernel che tầm nhìn: PID, mạng, filesystem, hostname riêng." },
+    { term: "cgroups", meaning: "Cơ chế kernel giới hạn và đo CPU, RAM, I/O cho nhóm tiến trình." },
+    { term: "hypervisor", meaning: "Phần mềm chia phần cứng thành nhiều máy ảo (KVM, Nitro, VMware)." },
+    { term: "OCI", meaning: "Chuẩn mở cho image và runtime, giúp các công cụ container tương thích nhau." },
+    { term: "containerd / runc", meaning: "Tầng runtime thực sự quản lý và tạo container bên dưới Docker." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team muốn chạy một ứng dụng chỉ có bản Windows trên server Linux. Container Linux có giải quyết được không?"
+  options={[
+    "Được, container chạy mọi hệ điều hành",
+    "Không, container dùng chung kernel host nên cần VM (hoặc host Windows) cho app Windows",
+    "Được, chỉ cần dùng image alpine",
+    "Được nếu thêm --privileged",
+  ]}
+  answerIndex={1}
+  explanation="Căn hộ chung cư phải dùng chung móng của toà nhà. Kernel Linux không chạy được binary Windows — cần VM có kernel Windows."
+/>

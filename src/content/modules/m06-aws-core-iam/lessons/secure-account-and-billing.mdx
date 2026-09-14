@@ -1,0 +1,131 @@
+import { AccountSecurityControlsDiagram } from "../diagrams/account-security-controls-diagram";
+
+<Eli5 title="Tài khoản AWS giống như căn nhà mới mua" emoji="🏠">
+  Nhận nhà xong, việc đầu tiên không phải là bày đồ, mà là **thay ổ khoá**. Chìa khoá gốc của chủ nhà (**root user**) cất vào két, gắn thêm **khoá vân tay** (MFA), và không bao giờ đánh thêm bản sao (root access key).
+
+  Người trong nhà dùng **thẻ ra vào riêng** do một quầy quản lý thống nhất phát (**IAM Identity Center**) — ai nghỉ việc thì khoá thẻ một chỗ là xong.
+
+  Rồi lắp **đồng hồ điện báo động** khi dùng quá số (**AWS Budgets**) và **camera ở cửa** ghi lại ai ra vào lúc nào (**CloudTrail**).
+
+  Ví dụ lệch ở một điểm: đồng hồ báo động chỉ **kêu**, nó không tự ngắt điện. Budgets cũng vậy — cảnh báo thôi, tắt tài nguyên vẫn là việc của bạn.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+Account mới tạo, root chưa MFA, không có cảnh báo chi phí — đó là trạng thái **nguy hiểm nhất**. Access key lộ trên GitHub có thể bị bot khai thác trong vài phút để chạy máy đào coin; hoá đơn cuối tháng có thể lên hàng nghìn đô. Làm lab này **trước** mọi lab khác của Phase 2.
+
+<AccountSecurityControlsDiagram />
+
+<Technical>
+
+### 1. Khoá root user
+
+- Bật **MFA** cho root (ưu tiên passkey/security key hoặc app authenticator). AWS đang dần bắt buộc MFA cho root — kiểm tra trạng thái account của bạn.
+- **Không tạo access key** cho root. Kiểm tra: `AccountAccessKeysPresent` phải bằng 0.
+- Chỉ dùng root cho các việc chỉ root làm được: đổi thông tin/đóng account, một số thiết lập billing, khôi phục khi bị khoá quyền IAM…
+- Email của root nên là email nhóm/alias an toàn, không phải email cá nhân dễ mất.
+
+### 2. IAM Identity Center thay cho IAM user
+
+| | IAM user + access key | IAM Identity Center |
+|---|---|---|
+| Credential | Dài hạn, nằm trong file | Tạm thời, lấy qua đăng nhập SSO |
+| Nhiều account | Mỗi account một user | Một lần đăng nhập, chọn account + permission set |
+| Nghỉ việc | Xoá từng user từng account | Tắt một người ở một chỗ |
+| CLI | `aws configure` với key | `aws configure sso` + `aws sso login` |
+
+Identity Center gắn với **AWS Organizations** (khi bật, AWS hướng dẫn tạo organization). **Permission set** là "mẫu quyền" (ví dụ `AdministratorAccess`, `ReadOnlyAccess`) được triển khai thành role trong từng account.
+
+### 3. AWS Organizations & SCP (khái niệm)
+
+- Gom nhiều account: `management`, `dev`, `staging`, `prod`, `security`… — mỗi môi trường một account là best practice để giới hạn "bán kính nổ".
+- **Consolidated billing**: một hoá đơn cho cả tổ chức.
+- **SCP**: guardrail như "cấm tắt CloudTrail", "chỉ dùng region ap-southeast-1". SCP không áp dụng lên management account.
+
+### 4. Budgets, Cost Explorer, Free Tier
+
+- **AWS Budgets**: ngưỡng theo tháng, cảnh báo theo chi phí **thực tế** (ACTUAL) hoặc **dự báo** (FORECASTED), gửi email/SNS.
+- **Cost Explorer**: xem chi phí theo dịch vụ, region, tag — nơi tìm "thủ phạm".
+- **Free Tier**: chính sách thay đổi theo thời gian và loại account (có thể là credit hoặc hạn mức theo dịch vụ) — **đọc trang Free Tier hiện hành**, đừng dựa vào blog cũ.
+
+```json title="budget.json"
+{
+  "BudgetName": "monthly-10-usd",
+  "BudgetLimit": { "Amount": "10", "Unit": "USD" },
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST"
+}
+```
+
+```json title="notifications.json"
+[
+  {
+    "Notification": {
+      "NotificationType": "ACTUAL",
+      "ComparisonOperator": "GREATER_THAN",
+      "Threshold": 80,
+      "ThresholdType": "PERCENTAGE"
+    },
+    "Subscribers": [{ "SubscriptionType": "EMAIL", "Address": "trung@example.com" }]
+  }
+]
+```
+
+### 5. CloudTrail
+
+- Ghi lại **management events** (ai tạo/xoá/sửa gì qua API/Console): identity, thời gian, IP, tham số.
+- **Event history** trong Console xem được khoảng 90 ngày gần nhất mà không cần cấu hình.
+- Tạo **trail** (nên là multi-region, trong Organizations có thể là organization trail) ghi vào S3 để lưu lâu dài và phân tích. Data events (ví dụ từng lần đọc object S3) phải bật riêng và **có phí**.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Root có access key không? (phải là 0)", command: "aws iam get-account-summary --query 'SummaryMap.{RootKeys:AccountAccessKeysPresent,RootMFA:AccountMFAEnabled}'", output: "{\n    \"RootKeys\": 0,\n    \"RootMFA\": 1\n}" },
+    { comment: "Tạo budget 10 USD, cảnh báo khi vượt 80% (lặp lại với budget 25 USD)", command: "aws budgets create-budget --account-id 123456789012 --budget file://budget.json --notifications-with-subscribers file://notifications.json" },
+    { command: "aws budgets describe-budgets --account-id 123456789012 --query 'Budgets[].[BudgetName,BudgetLimit.Amount]' --output text", output: "monthly-10-usd  10.0\nmonthly-25-usd  25.0" },
+    { comment: "Chi phí tháng này theo dịch vụ", command: "aws ce get-cost-and-usage --time-period Start=2026-09-01,End=2026-09-14 --granularity MONTHLY --metrics UnblendedCost --group-by Type=DIMENSION,Key=SERVICE --query 'ResultsByTime[0].Groups[].[Keys[0],Metrics.UnblendedCost.Amount]' --output text", output: "Amazon Elastic Compute Cloud - Compute  1.84\nAmazon Virtual Private Cloud  0.93\nAmazon Simple Storage Service  0.02" },
+    { comment: "Tạo trail multi-region ghi vào S3 (bucket cần bucket policy cho CloudTrail)", command: "aws cloudtrail create-trail --name org-audit --s3-bucket-name trung-cloudtrail-logs --is-multi-region-trail && aws cloudtrail start-logging --name org-audit" },
+    { comment: "Ai đã đăng nhập Console gần đây?", command: "aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=ConsoleLogin --max-results 3 --query 'Events[].[EventTime,Username]' --output text", output: "2026-09-14T08:02:11+07:00  trung\n2026-09-13T21:40:05+07:00  trung" },
+  ]}
+/>
+
+<Callout type="cost" title="Những “bẫy” chi phí kinh điển khi học AWS">
+  - **NAT Gateway**: tính tiền theo giờ **và** theo GB dữ liệu xử lý — để quên cả tháng là khoản lớn nhất trong hoá đơn lab.
+  - **Public IPv4 / Elastic IP**: AWS tính phí địa chỉ IPv4 public theo giờ, kể cả EIP không gắn vào đâu.
+  - **EKS control plane**, **ALB**, **RDS**: tính theo giờ dù không có traffic.
+  - **Data transfer** ra Internet và giữa AZ/region.
+  - Tài nguyên quên tắt ở **region khác**.
+
+  Giá thay đổi — xem trang pricing chính thức. Thói quen tốt: tag mọi tài nguyên lab (`Project=devops-lab`) và dọn sạch cuối mỗi buổi.
+</Callout>
+
+<Callout type="mistake">
+  Tạo IAM user `admin` với access key rồi dùng key đó cho mọi thứ: laptop, CI, script. Một lần lộ = mất cả account. Người dùng → Identity Center; máy → IAM role; CI → OIDC role (bài sau).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Root user", meaning: "Danh tính gốc tạo account, toàn quyền — khoá lại bằng MFA, không access key." },
+    { term: "MFA", meaning: "Xác thực nhiều yếu tố: mật khẩu + thiết bị/passkey." },
+    { term: "IAM Identity Center", meaning: "Dịch vụ SSO cấp quyền tạm thời cho người dùng vào nhiều account." },
+    { term: "Permission set", meaning: "Mẫu quyền trong Identity Center, triển khai thành role ở từng account." },
+    { term: "AWS Budgets", meaning: "Cảnh báo khi chi phí thực tế hoặc dự báo vượt ngưỡng." },
+    { term: "Cost Explorer", meaning: "Công cụ phân tích chi phí theo dịch vụ, region, tag." },
+    { term: "CloudTrail", meaning: "Nhật ký kiểm toán các lời gọi API trong account." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn tạo AWS Budget 10 USD. Chi phí vượt 10 USD vào ngày 12. Điều gì xảy ra theo mặc định?"
+  options={[
+    "AWS tự dừng mọi EC2 và RDS",
+    "Account bị khoá cho tới khi thanh toán",
+    "Bạn nhận email cảnh báo; tài nguyên vẫn chạy và tiếp tục tính tiền",
+    "Chi phí vượt ngưỡng được AWS miễn",
+  ]}
+  answerIndex={2}
+  explanation="Như đồng hồ điện có chuông báo: nó kêu chứ không tự ngắt cầu dao. Muốn tự hành động phải cấu hình thêm Budget actions hoặc tự viết automation."
+/>

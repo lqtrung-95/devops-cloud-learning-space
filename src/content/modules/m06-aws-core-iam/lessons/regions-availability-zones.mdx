@@ -1,0 +1,97 @@
+import { RegionAzResilienceDiagram } from "../diagrams/region-az-resilience-diagram";
+
+<Eli5 title="Region, AZ, edge giống như chuỗi siêu thị có kho ở nhiều quận" emoji="🏬">
+  Một chuỗi siêu thị lớn chia đất nước thành các **thành phố** — đó là **Region** (Singapore, Tokyo, Virginia…). Hàng hoá, giá cả ở mỗi thành phố tách biệt nhau.
+
+  Trong mỗi thành phố, họ có **vài kho lớn ở các quận khác nhau**, mỗi kho có điện, đường vào, đội bảo vệ riêng — đó là **Availability Zone (AZ)**. Một kho bị ngập thì các kho quận khác vẫn giao hàng.
+
+  Còn **cửa hàng tiện lợi ở đầu ngõ** chỉ giữ vài món bán chạy để giao nhanh — đó là **edge location**. Nó không phải kho chính, chỉ là điểm "cache" gần khách.
+
+  Ví dụ lệch ở chỗ: các AZ trong một region được nối bằng mạng riêng tốc độ cao, độ trễ rất thấp — nhanh hơn nhiều so với xe tải chạy giữa các quận.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+Bạn chọn **region** vì độ trễ tới người dùng, luật lưu trữ dữ liệu, giá và dịch vụ có sẵn. Bạn trải app qua **nhiều AZ** để một sự cố datacenter không làm sập hệ thống. Tiêu chí đạt của M07 ("tắt 1 AZ, app vẫn chạy") bắt đầu từ bài này.
+
+<RegionAzResilienceDiagram />
+
+<Technical>
+
+### Region
+
+- Một vùng địa lý độc lập, ví dụ `ap-southeast-1` (Singapore), `ap-northeast-1` (Tokyo), `us-east-1` (N. Virginia).
+- Hầu hết dịch vụ là **regional**: tạo EC2, VPC, RDS ở Singapore thì chúng chỉ tồn tại ở Singapore.
+- Dữ liệu **không tự rời region** trừ khi bạn cấu hình (replication, copy snapshot…) — quan trọng cho luật về dữ liệu.
+- Một số dịch vụ/tài nguyên là **global**: IAM, Route 53, CloudFront (và certificate ACM cho CloudFront phải nằm ở `us-east-1`).
+- Một số region mới là **opt-in**: phải bật trong account trước khi dùng.
+
+**Chọn region thế nào?** Theo thứ tự thường gặp: yêu cầu pháp lý → độ trễ tới người dùng → dịch vụ/tính năng cần có sẵn → giá (giá khác nhau giữa các region).
+
+### Availability Zone
+
+- Mỗi region có **nhiều AZ** (thường 3 trở lên), mỗi AZ gồm một hoặc nhiều datacenter với nguồn điện, mạng, làm mát riêng.
+- Tên như `ap-southeast-1a` được **ánh xạ ngẫu nhiên theo từng account**. Muốn biết chính xác AZ vật lý, dùng **AZ ID** như `apse1-az1`.
+- Tài nguyên **zonal**: EC2 instance, EBS volume, subnet, NAT Gateway. Tài nguyên **regional** thường tự trải nhiều AZ: S3, DynamoDB, ALB (khi bạn chọn nhiều subnet).
+
+| Kiểu triển khai | Sống sót khi… | Chi phí/độ phức tạp |
+|---|---|---|
+| 1 instance, 1 AZ | Không gì cả | Rẻ nhất |
+| Multi-AZ (ALB + ASG ở 2–3 AZ, RDS Multi-AZ) | Mất 1 AZ | Mức chuẩn cho production |
+| Multi-region | Mất cả region | Đắt, phức tạp — chỉ khi yêu cầu thật sự cần |
+
+### Edge location
+
+- Hàng trăm điểm hiện diện (PoP) ở các thành phố lớn, **ngoài** region.
+- Dùng bởi **CloudFront** (CDN cache nội dung), **Route 53** (DNS), AWS Global Accelerator, Shield.
+- Bạn không chạy EC2 ở edge — edge phục vụ cache và mạng gần người dùng.
+
+Ngoài ra còn **Local Zones** và **Wavelength Zones** (hạ tầng đặt gần thành phố/nhà mạng cho độ trễ cực thấp) — chỉ cần biết tên ở giai đoạn này.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Region mặc định trong cấu hình CLI của bạn", command: "aws configure get region", output: "ap-southeast-1" },
+    { comment: "Liệt kê AZ của region, kèm AZ ID (định danh vật lý)", command: "aws ec2 describe-availability-zones --region ap-southeast-1 --query 'AvailabilityZones[].[ZoneName,ZoneId,State]' --output table", output: "---------------------------------------------\n|         DescribeAvailabilityZones         |\n+------------------+-------------+----------+\n|  ap-southeast-1a |  apse1-az2  | available|\n|  ap-southeast-1b |  apse1-az1  | available|\n|  ap-southeast-1c |  apse1-az3  | available|\n+------------------+-------------+----------+" },
+    { comment: "Ghi đè region cho một lệnh", command: "aws ec2 describe-vpcs --region ap-northeast-1 --query 'Vpcs[].VpcId'", output: "[\n    \"vpc-0a1b2c3d4e5f67890\"\n]" },
+    { comment: "Hoặc đặt region cho cả phiên terminal", command: "export AWS_REGION=ap-southeast-1" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **"Không thấy EC2 đâu cả!"** — 90% trường hợp là Console đang ở **region khác**. Luôn nhìn góc trên bên phải Console trước khi hoảng. Tương tự, tài nguyên quên tắt ở một region lạ vẫn tính tiền hằng tháng.
+</Callout>
+
+<Callout type="cost" title="Data transfer không miễn phí">
+  Dữ liệu đi **giữa các AZ** và **giữa các region** thường có phí theo GB, và dữ liệu ra Internet cũng vậy. Multi-AZ là cần thiết cho production, nhưng hãy để ý các luồng "chat" nhiều giữa AZ (ví dụ app ở AZ a gọi DB ở AZ b liên tục). Xem bảng giá mới nhất trước khi thiết kế.
+</Callout>
+
+<Callout type="info">
+  AZ `ap-southeast-1a` của bạn và của đồng nghiệp ở account khác **có thể là hai datacenter khác nhau**. Khi phối hợp giữa các account (ví dụ VPC endpoint service, chia sẻ subnet), hãy nói chuyện bằng **AZ ID**.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Region", meaning: "Vùng địa lý độc lập chứa nhiều AZ, ví dụ ap-southeast-1." },
+    { term: "Availability Zone (AZ)", meaning: "Một hoặc nhiều datacenter độc lập về điện, mạng trong một region." },
+    { term: "AZ ID", meaning: "Định danh vật lý của AZ (apse1-az1), giống nhau giữa các account." },
+    { term: "Edge location", meaning: "Điểm hiện diện gần người dùng cho CloudFront, Route 53." },
+    { term: "Zonal vs regional", meaning: "Tài nguyên gắn với 1 AZ (EC2, EBS, subnet) vs trải cả region (S3, ALB)." },
+    { term: "Multi-AZ", meaning: "Chạy bản sao ở ≥2 AZ để chịu được sự cố một AZ." },
+  ]}
+/>
+
+<QuickCheck
+  question="App chạy 2 EC2 trong cùng ap-southeast-1a, phía trước là ALB. AZ này mất điện. Chuyện gì xảy ra?"
+  options={[
+    "ALB tự chuyển EC2 sang AZ khác",
+    "App sập, vì mọi instance đều nằm trong một AZ",
+    "Không ảnh hưởng, vì ALB là dịch vụ regional",
+    "AWS tự khởi động lại EC2 ở region khác",
+  ]}
+  answerIndex={1}
+  explanation="Như hai kho cùng một quận bị ngập: ALB không 'bê' được server đi đâu. Muốn sống sót phải đặt instance ở ≥2 AZ (thường qua Auto Scaling Group)."
+/>

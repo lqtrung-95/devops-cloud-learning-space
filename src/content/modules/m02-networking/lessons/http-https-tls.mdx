@@ -1,0 +1,134 @@
+import { TlsHandshakeDiagram } from "../diagrams/tls-handshake-diagram";
+
+<Eli5 title="HTTP là bưu thiếp, HTTPS là phong bì niêm phong có con dấu công chứng" emoji="✉️">
+  **HTTP** giống **bưu thiếp**: bưu tá, người phân loại thư, ai cầm trên tay cũng đọc được — và có thể sửa chữ trước khi giao.
+
+  **HTTPS** = HTTP bỏ vào **phong bì niêm phong** (TLS). Trước khi gửi thư, hai bên gặp nhau thoả thuận một **ổ khoá chung** mà người đứng giữa không đoán ra được.
+
+  Nhưng làm sao biết người nhận đúng là "ngân hàng thật" chứ không phải kẻ giả danh? Họ trình **giấy chứng nhận** (certificate) có **con dấu của phòng công chứng** (Certificate Authority) mà máy bạn đã tin sẵn. Chỗ ví dụ gãy: phong bì che nội dung thư, nhưng **địa chỉ ngoài phong bì** (IP, tên miền trong SNI) vẫn nhìn thấy được.
+</Eli5>
+
+DevOps là người **cấu hình HTTPS** cho mọi thứ: Nginx, load balancer, ingress Kubernetes. Cert hết hạn là một trong những nguyên nhân sập dịch vụ phổ biến và "xấu hổ" nhất — hoàn toàn tránh được bằng tự động hoá. Bấm qua từng bước bên dưới, thử cả chế độ HTTP để thấy kẻ nghe lén đọc được gì.
+
+<TlsHandshakeDiagram />
+
+<Technical>
+
+### Cấu trúc một HTTP request/response
+
+```http
+GET /api/orders?limit=10 HTTP/1.1
+Host: app.example.com
+User-Agent: curl/8.5.0
+Accept: application/json
+Authorization: Bearer eyJhbGciOi...
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+Content-Length: 512
+
+{"orders": [...]}
+```
+
+Header hay gặp khi vận hành: `Host` (virtual host/routing), `X-Forwarded-For` / `X-Forwarded-Proto` (IP & scheme gốc khi đi qua proxy), `Cache-Control`, `Set-Cookie`, `Strict-Transport-Security` (HSTS — ép trình duyệt luôn dùng HTTPS).
+
+### Status code — đọc là biết lỗi của ai
+
+| Nhóm | Ví dụ | Ý nghĩa khi vận hành |
+|---|---|---|
+| 2xx | `200 OK`, `201 Created`, `204 No Content` | Thành công |
+| 3xx | `301`/`308` chuyển vĩnh viễn, `302`/`307` tạm thời, `304 Not Modified` | Redirect, cache |
+| 4xx | `400`, `401` chưa xác thực, `403` không có quyền, `404`, `429 Too Many Requests` | Lỗi phía **client** (hoặc bị rate limit) |
+| 5xx | `500` app lỗi, `502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway Timeout` | Lỗi phía **server**; 502/504 thường là proxy không gọi được/không đợi được upstream |
+
+### HTTP/1.1 vs HTTP/2 vs HTTP/3
+
+| | HTTP/1.1 | HTTP/2 | HTTP/3 |
+|---|---|---|---|
+| Định dạng | Văn bản | Nhị phân, frame | Nhị phân, frame |
+| Nhiều request | Tuần tự trên 1 kết nối (hoặc mở nhiều kết nối) | **Multiplexing** nhiều stream trên 1 kết nối | Multiplexing, không bị nghẽn khi mất 1 gói |
+| Transport | TCP | TCP (thực tế luôn kèm TLS) | **QUIC trên UDP** |
+| Header | Không nén | Nén HPACK | Nén QPACK |
+
+### TLS & certificate chain
+
+- **TLS 1.3** (hiện đại): handshake 1-RTT, bỏ các cipher yếu, mã hoá cả certificate. **TLS 1.2** vẫn phổ biến và chấp nhận được khi cấu hình đúng; **TLS 1.0/1.1** đã bị deprecated — nên tắt.
+- Server gửi **leaf cert** + **intermediate cert**. Client tự có **root CA** trong trust store. Chuỗi phải nối liền: leaf ← ký bởi intermediate ← ký bởi root.
+- Client kiểm tra: tên miền khớp SAN, còn hạn, chuỗi tin cậy, chưa bị thu hồi.
+- **Let's Encrypt** cấp cert miễn phí qua giao thức ACME, thời hạn ngắn (hiện là 90 ngày và đang có lộ trình rút ngắn hơn — kiểm tra tài liệu mới nhất). Ngắn hạn = **bắt buộc tự động gia hạn**.
+
+### Nginx + certbot
+
+```nginx title="/etc/nginx/sites-available/app.conf (ví dụ, certbot sinh config tương tự)"
+server {
+    listen 80;
+    server_name app.example.com;
+    return 301 https://$host$request_uri;   # HTTP → HTTPS
+}
+
+server {
+    listen 443 ssl;
+    http2 on;                               # Nginx ≥ 1.25.1; bản cũ dùng "listen 443 ssl http2;"
+    server_name app.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/app.example.com/fullchain.pem;  # leaf + intermediate
+    ssl_certificate_key /etc/letsencrypt/live/app.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+    }
+}
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem toàn bộ quá trình: DNS → TCP → TLS → HTTP (rút gọn)", command: "curl -v https://app.example.com -o /dev/null", output: "* Host app.example.com:443 was resolved.\n* IPv4: 203.0.113.10\n*   Trying 203.0.113.10:443...\n* Connected to app.example.com (203.0.113.10) port 443\n* ALPN: curl offers h2,http/1.1\n* TLSv1.3 (OUT), TLS handshake, Client hello (1):\n* TLSv1.3 (IN), TLS handshake, Server hello (2):\n* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / X25519 / id-ecPublicKey\n* ALPN: server accepted h2\n* Server certificate:\n*  subject: CN=app.example.com\n*  expire date: Nov 28 08:14:02 2026 GMT\n*  issuer: C=US; O=Let's Encrypt; CN=E6\n*  SSL certificate verify ok.\n> GET / HTTP/2\n> Host: app.example.com\n> User-Agent: curl/8.5.0\n< HTTP/2 200\n< content-type: text/html" },
+    { comment: "Chỉ xem header response", command: "curl -sI http://app.example.com", output: "HTTP/1.1 301 Moved Permanently\nServer: nginx\nLocation: https://app.example.com/" },
+    { comment: "Cài certbot (Ubuntu) và xin cert, certbot tự sửa config Nginx + redirect", command: "sudo apt install -y certbot python3-certbot-nginx && sudo certbot --nginx -d app.example.com", output: "Successfully received certificate.\nCertificate is saved at: /etc/letsencrypt/live/app.example.com/fullchain.pem\nSuccessfully deployed certificate for app.example.com to /etc/nginx/sites-enabled/app.conf\nCongratulations! You have successfully enabled HTTPS on https://app.example.com" },
+    { comment: "Kiểm tra gia hạn tự động chạy được (không cấp thật)", command: "sudo certbot renew --dry-run", output: "Congratulations, all simulated renewals succeeded:\n  /etc/letsencrypt/live/app.example.com/fullchain.pem (success)" },
+    { comment: "Xem chain server gửi và ngày hết hạn", command: "echo | openssl s_client -connect app.example.com:443 -servername app.example.com 2>/dev/null | openssl x509 -noout -subject -issuer -enddate", output: "subject=CN=app.example.com\nissuer=C=US, O=Let's Encrypt, CN=E6\nnotAfter=Nov 28 08:14:02 2026 GMT" },
+  ]}
+/>
+
+<Callout type="mistake" title="Chỉ cấu hình cert lá, thiếu intermediate">
+  Dùng `cert.pem` thay vì `fullchain.pem`. Trình duyệt trên laptop của bạn vẫn vào được (trình duyệt thường tự tải hoặc đã cache intermediate), nhưng `curl`, app mobile, hay service khác báo `unable to get local issuer certificate`. Luôn test bằng `curl` và `openssl s_client`.
+</Callout>
+
+<Callout type="mistake" title="Tắt kiểm tra cert cho nhanh">
+  `curl -k`, `verify=False`, `NODE_TLS_REJECT_UNAUTHORIZED=0` để "chạy tạm" rồi lên production. Như ký nhận phong bì mà không nhìn con dấu — mất hoàn toàn tác dụng chống giả danh.
+</Callout>
+
+<Callout type="tip">
+  Đặt cảnh báo khi cert còn dưới ~14 ngày (Prometheus blackbox exporter, uptime checker). Trên AWS, cert của ACM gắn vào ALB/CloudFront được **tự gia hạn** — bạn sẽ gặp ở M07.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "HTTPS", meaning: "HTTP chạy bên trong kết nối mã hoá TLS, cổng mặc định 443." },
+    { term: "TLS handshake", meaning: "Màn chào hỏi để thống nhất khoá phiên và xác minh certificate." },
+    { term: "certificate", meaning: "Giấy chứng nhận public key thuộc về tên miền, được CA ký." },
+    { term: "CA (Certificate Authority)", meaning: "Phòng công chứng mà máy bạn tin sẵn (root trong trust store)." },
+    { term: "SNI", meaning: "Tên miền client gửi trong ClientHello để server chọn đúng cert." },
+    { term: "HSTS", meaning: "Header bảo trình duyệt chỉ dùng HTTPS cho domain trong một thời gian." },
+    { term: "502 / 504", meaning: "Proxy không kết nối được / chờ quá lâu upstream phía sau." },
+  ]}
+/>
+
+<QuickCheck
+  question="Người dùng báo lỗi `502 Bad Gateway` với trang lỗi có chữ `nginx`. Điều nào ĐÚNG?"
+  options={[
+    "DNS của domain đang trỏ sai",
+    "Certificate đã hết hạn",
+    "Người dùng tới được Nginx, nhưng Nginx không nhận được phản hồi hợp lệ từ app phía sau",
+    "Firewall đang chặn cổng 443",
+  ]}
+  answerIndex={2}
+  explanation="Có trang 502 từ Nginx nghĩa là DNS, firewall, TLS đều đã thông — thư đã tới quầy lễ tân. Lễ tân (Nginx) gọi vào phòng trong (app) thì không ai bắt máy. Xem error.log của Nginx và trạng thái app."
+/>

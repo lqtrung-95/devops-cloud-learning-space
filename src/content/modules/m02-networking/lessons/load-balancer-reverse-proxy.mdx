@@ -1,0 +1,126 @@
+import { LoadBalancerL4L7Diagram } from "../diagrams/load-balancer-l4-l7-diagram";
+
+<Eli5 title="Load balancer giống như lễ tân dẫn khách vào bàn trong nhà hàng đông khách" emoji="💁">
+  Nhà hàng có nhiều đầu bếp. Nếu khách tự đi thẳng vào bếp, người thì dồn một bếp, người thì lạc. Vì vậy có **lễ tân đứng cửa** (reverse proxy / load balancer): khách chỉ biết một cửa, lễ tân **chia khách lần lượt** cho từng bếp (round-robin) và **không dẫn vào bếp đang nghỉ ốm** (health check).
+
+  Có hai kiểu lễ tân. **Lễ tân L4** chỉ nhìn **số bàn đặt** (IP:port), không mở thực đơn — cực nhanh nhưng không biết khách muốn gì. **Lễ tân L7** **đọc order** (HTTP path, header): món nướng đưa qua bếp nướng (`/api`), đồ uống đưa qua quầy bar (`/static`).
+
+  Còn **forward proxy** thì ngược lại: là **người đi chợ hộ** cho nhân viên công ty — đứng phía *người dùng* để đi ra ngoài, không phải đứng phía nhà hàng.
+</Eli5>
+
+Gần như mọi hệ thống production đều có ít nhất một lớp proxy trước app: Nginx trên VM, AWS ALB/NLB, Ingress Controller trong Kubernetes, CDN. Hiểu L4 vs L7 giúp bạn chọn đúng loại, và biết vì sao app thấy IP client là IP của load balancer.
+
+<LoadBalancerL4L7Diagram />
+
+<Technical>
+
+### Forward proxy vs reverse proxy
+
+| | Forward proxy | Reverse proxy |
+|---|---|---|
+| Đứng phía | Client | Server |
+| Ai biết proxy tồn tại | Client cấu hình (`HTTPS_PROXY`) | Client **không biết**, tưởng đang nói chuyện với server |
+| Dùng để | Kiểm soát/ghi log truy cập ra Internet, cache | Load balancing, TLS termination, cache, nén, WAF, ẩn backend |
+| Ví dụ | Squid, proxy công ty | Nginx, HAProxy, Envoy, Traefik, AWS ALB |
+
+### L4 vs L7 load balancing
+
+| | L4 (transport) | L7 (application) |
+|---|---|---|
+| Nhìn thấy | IP, port, TCP/UDP | Toàn bộ HTTP: host, path, header, cookie |
+| Routing theo | 5-tuple | `Host`, path `/api/*`, header, method |
+| TLS | Thường chuyển thẳng (passthrough) hoặc terminate | Terminate TLS để đọc HTTP |
+| Hiệu năng | Rất cao, độ trễ thấp | Tốn CPU hơn nhưng linh hoạt |
+| Giao thức | Mọi thứ trên TCP/UDP (DB, gRPC, game…) | HTTP/HTTPS, gRPC, WebSocket |
+| AWS | Network Load Balancer (NLB) | Application Load Balancer (ALB) |
+
+### Thuật toán & health check
+
+- **Round-robin** (mặc định Nginx): lần lượt. **least_conn**: gửi tới máy ít kết nối nhất (hợp request dài). **ip_hash**/hash: cùng client → cùng backend (sticky, nhưng co giãn kém).
+- **Passive health check** (Nginx mã nguồn mở): request lỗi `max_fails` lần trong `fail_timeout` → tạm loại máy. **Active health check** (gọi `/healthz` định kỳ) có ở HAProxy, Envoy, AWS ELB, Nginx Plus.
+
+### IP client thật ở đâu?
+
+Sau proxy, app thấy kết nối tới từ IP của proxy. Proxy cần gửi thêm header `X-Forwarded-For` (IP gốc), `X-Forwarded-Proto` (http/https); app/framework phải được cấu hình **chỉ tin header này từ proxy của mình** (vd Express `app.set("trust proxy", ...)`).
+
+### Nginx: reverse proxy + round-robin cho 2 backend
+
+```nginx title="/etc/nginx/sites-available/app.conf"
+upstream api_backend {
+    # round-robin mặc định; thêm "least_conn;" nếu muốn đổi thuật toán
+    server 127.0.0.1:3001 max_fails=3 fail_timeout=10s;
+    server 127.0.0.1:3002 max_fails=3 fail_timeout=10s;
+}
+
+server {
+    listen 80;
+    server_name app.example.com;
+
+    location /api/ {
+        proxy_pass http://api_backend;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout    30s;
+    }
+
+    location / {
+        root /var/www/app;
+        try_files $uri /index.html;
+    }
+}
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Giả lập 2 backend: mỗi cái trả về tên của mình", command: "mkdir -p /tmp/b1/api /tmp/b2/api && echo backend-1 > /tmp/b1/api/whoami && echo backend-2 > /tmp/b2/api/whoami" },
+    { command: "(cd /tmp/b1 && python3 -m http.server 3001 --bind 127.0.0.1 &) ; (cd /tmp/b2 && python3 -m http.server 3002 --bind 127.0.0.1 &)" },
+    { comment: "Bật site, kiểm tra cú pháp rồi reload (không làm rớt kết nối đang có)", command: "sudo ln -s /etc/nginx/sites-available/app.conf /etc/nginx/sites-enabled/ && sudo nginx -t", output: "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok\nnginx: configuration file /etc/nginx/nginx.conf test is successful" },
+    { command: "sudo systemctl reload nginx" },
+    { comment: "Gọi 4 lần: thấy round-robin luân phiên", command: "for i in 1 2 3 4; do curl -s -H 'Host: app.example.com' http://127.0.0.1/api/whoami; done", output: "backend-1\nbackend-2\nbackend-1\nbackend-2" },
+    { comment: "Tắt backend-2 rồi gọi lại: Nginx đánh dấu fail và dồn sang backend-1", command: "pkill -f 'http.server 3002'; for i in 1 2 3; do curl -s -H 'Host: app.example.com' http://127.0.0.1/api/whoami; done", output: "backend-1\nbackend-1\nbackend-1" },
+    { comment: "Log lỗi ghi lại lần thử upstream thất bại", command: "sudo tail -n 1 /var/log/nginx/error.log", output: "2026/09/14 10:21:07 [error] 3121#3121: *18 connect() failed (111: Connection refused) while connecting to upstream, client: 127.0.0.1, server: app.example.com, request: \"GET /api/whoami HTTP/1.1\", upstream: \"http://127.0.0.1:3002/api/whoami\", host: \"app.example.com\"" },
+  ]}
+/>
+
+<Callout type="mistake" title="Quên dấu / trong proxy_pass">
+  `proxy_pass http://api_backend;` giữ nguyên URI (`/api/users` → backend nhận `/api/users`). Còn `proxy_pass http://api_backend/;` (có `/` cuối) **thay** phần khớp `location` (`/api/users` → backend nhận `/users`). Một ký tự khác nhau → 404 hàng loạt.
+</Callout>
+
+<Callout type="warning" title="Ghi log sai IP client">
+  Rate limit hoặc chặn IP theo `$remote_addr` ở backend sẽ chặn nhầm **chính load balancer** — tức là chặn tất cả mọi người. Hãy dùng IP từ `X-Forwarded-For` do proxy tin cậy của bạn gắn vào.
+</Callout>
+
+<Callout type="cost">
+  Trên AWS, ALB/NLB tính tiền theo giờ **cộng** theo đơn vị năng lực sử dụng (LCU/NLCU). Mỗi môi trường thử nghiệm tạo một ALB riêng rồi quên xoá là khoản phí âm thầm hàng tháng.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "reverse proxy", meaning: "Lễ tân đứng trước server, nhận request thay và chuyển vào trong." },
+    { term: "forward proxy", meaning: "Người đi chợ hộ đứng phía client để đi ra Internet." },
+    { term: "L4 load balancer", meaning: "Chia tải theo IP:port, không đọc nội dung HTTP (vd NLB)." },
+    { term: "L7 load balancer", meaning: "Đọc HTTP để route theo host/path/header (vd ALB, Nginx)." },
+    { term: "upstream", meaning: "Nhóm backend mà proxy chuyển request tới." },
+    { term: "health check", meaning: "Kiểm tra định kỳ để loại backend hỏng khỏi vòng chia tải." },
+    { term: "X-Forwarded-For", meaning: "Header mang IP gốc của client qua các lớp proxy." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn cần gửi `/api/*` tới cụm API và `/admin/*` tới một service khác, cùng một domain HTTPS. Chọn loại nào?"
+  options={[
+    "L7 load balancer (ALB/Nginx) vì cần đọc path của HTTP",
+    "L4 load balancer (NLB) vì nhanh hơn",
+    "Forward proxy đặt ở máy người dùng",
+    "Chỉ cần thêm hai A record khác nhau cho cùng domain",
+  ]}
+  answerIndex={0}
+  explanation="Chỉ lễ tân L7 mới 'đọc order' để biết khách gọi /api hay /admin. L4 chỉ thấy IP:port và dữ liệu TLS đã mã hoá. DNS không định tuyến theo path."
+/>

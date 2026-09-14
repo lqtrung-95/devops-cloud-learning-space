@@ -1,0 +1,110 @@
+import { ServiceModelResponsibilityDiagram } from "../diagrams/service-model-responsibility-diagram";
+
+<Eli5 title="Cloud giống như chuyện ăn phở: tự nấu, mua gói, hay ra quán" emoji="🍜">
+  Muốn ăn phở, bạn có mấy lựa chọn. **Tự nấu ở nhà** (on-premises): mua bếp, mua nồi, ninh xương từ 4 giờ sáng — ngon nhưng mệt, và bếp hỏng là tự sửa.
+
+  **Thuê bếp có sẵn** (IaaS): bếp ga, nồi niêu đã có, bạn chỉ lo nguyên liệu và nấu. **Mua bộ phở làm sẵn** (PaaS): nước dùng đã ninh, bạn chỉ trụng bánh. **Ra quán** (SaaS): chỉ việc ăn.
+
+  Điểm quan trọng: dù ăn kiểu nào, **giữ ví và chọn ai ngồi cùng bàn** vẫn là việc của bạn. Trên cloud, đó là **dữ liệu và quyền truy cập** — AWS không bao giờ lo phần này thay bạn.
+
+  Chỗ ví dụ "hơi lệch": quán phở không cho bạn thuê nửa cái bếp theo giờ, còn cloud thì có — bạn trả tiền theo **phút/giây sử dụng** và bật thêm 100 cái bếp chỉ trong vài phút.
+</Eli5>
+
+## Vì sao DevOps cần hiểu điều này?
+
+Chọn mô hình dịch vụ = chọn **bạn phải vận hành bao nhiêu thứ**. Dùng EC2 thì bạn phải vá OS, cấu hình scale; dùng Lambda thì không có server để vá nhưng bị giới hạn thời gian chạy. Mỗi lần thiết kế hệ thống, câu hỏi đầu tiên là: "phần nào mình tự lo, phần nào để AWS lo?"
+
+<ServiceModelResponsibilityDiagram />
+
+<Technical>
+
+### Định nghĩa "cloud" theo cách kỹ sư hiểu
+
+Cloud computing = thuê tài nguyên IT (compute, storage, network, database…) **qua API, theo nhu cầu, trả theo mức dùng**. Năm đặc điểm hay được nhắc (theo định nghĩa của NIST):
+
+| Đặc điểm | Nghĩa thực tế |
+|---|---|
+| On-demand self-service | Tự tạo server bằng Console/CLI, không cần gọi điện cho ai |
+| Broad network access | Truy cập qua Internet/API từ mọi nơi |
+| Resource pooling | Nhiều khách hàng chia sẻ hạ tầng vật lý, được cách ly logic |
+| Rapid elasticity | Tăng/giảm tài nguyên trong vài phút |
+| Measured service | Tính tiền theo giờ, giây, GB, request… |
+
+### Các mô hình dịch vụ
+
+| Mô hình | Bạn lo | AWS lo | Ví dụ AWS |
+|---|---|---|---|
+| **IaaS** | OS, runtime, app, dữ liệu | Datacenter, phần cứng, ảo hoá | EC2, EBS, VPC |
+| **PaaS** | Code, dữ liệu, cấu hình | Thêm OS, runtime, vá lỗi | Elastic Beanstalk, RDS |
+| **FaaS** (serverless) | Code của từng function, dữ liệu | Mọi thứ còn lại, scale về 0 | Lambda |
+| **SaaS** | Dữ liệu, ai được dùng | Toàn bộ ứng dụng | WorkMail, (ngoài AWS: Gmail, Slack) |
+
+### Shared responsibility model
+
+AWS tóm gọn: **AWS chịu trách nhiệm "security OF the cloud"**, **khách hàng chịu trách nhiệm "security IN the cloud"**.
+
+- AWS: toà nhà datacenter, phần cứng, hypervisor, mạng toàn cầu, và phần mềm của các dịch vụ managed.
+- Bạn: IAM (ai được làm gì), mã hoá dữ liệu, cấu hình Security Group, vá OS trên EC2, bucket S3 có public hay không…
+
+Ranh giới **dịch chuyển theo dịch vụ**: với EC2 bạn vá OS; với RDS thì AWS vá engine database (trong maintenance window bạn chọn), nhưng bạn vẫn quyết định DB có public hay không.
+
+### AWS ↔ Azure ↔ GCP
+
+Học một cloud kỹ thì chuyển sang cloud khác chủ yếu là **đổi tên gọi**. Bảng tham khảo (tên có thể thay đổi — kiểm tra tài liệu mới nhất):
+
+| Nhu cầu | AWS | Azure | GCP |
+|---|---|---|---|
+| Máy ảo | EC2 | Virtual Machines | Compute Engine |
+| Object storage | S3 | Blob Storage | Cloud Storage |
+| Mạng riêng | VPC | Virtual Network (VNet) | VPC |
+| Danh tính & quyền | IAM / IAM Identity Center | Entra ID + Azure RBAC | Cloud IAM |
+| SQL managed | RDS / Aurora | Azure SQL / Azure Database for PostgreSQL | Cloud SQL / AlloyDB |
+| Function | Lambda | Azure Functions | Cloud Run functions |
+| Kubernetes | EKS | AKS | GKE |
+| Monitoring | CloudWatch | Azure Monitor | Cloud Monitoring |
+| DNS / CDN | Route 53 / CloudFront | Azure DNS / Front Door | Cloud DNS / Cloud CDN |
+
+</Technical>
+
+## Thực hành
+
+Chưa cần tạo gì tốn tiền — hãy làm quen với cách AWS "nói chuyện" qua API. (Cài AWS CLI v2 và cấu hình đăng nhập sẽ học kỹ ở bài cuối module.)
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra đã cài AWS CLI v2", command: "aws --version", output: "aws-cli/2.x.x Python/3.x.x Darwin/24.6.0 exe/arm64" },
+    { comment: "Liệt kê các region đang bật cho account", command: "aws ec2 describe-regions --query 'Regions[].RegionName' --output text", output: "ap-south-1 eu-north-1 eu-west-3 ... ap-southeast-1 us-east-1 us-west-2" },
+    { comment: "Mọi thao tác trên Console thực chất đều là một lời gọi API như thế này", command: "aws s3 ls", output: "2026-09-01 10:12:44 trung-lab-bucket" },
+  ]}
+/>
+
+<Callout type="mistake" title="“Lên cloud là AWS lo bảo mật hết”">
+  Phần lớn sự cố lộ dữ liệu trên cloud đến từ **cấu hình sai của khách hàng**: bucket S3 để public, Security Group mở `0.0.0.0/0` cổng 22, access key commit lên GitHub. Tất cả đều nằm ở phía "security IN the cloud" — phần của bạn.
+</Callout>
+
+<Callout type="tip">
+  Khi so sánh dịch vụ, hãy tự hỏi 3 câu: **Ai vá OS? Ai scale? Ai backup?** Trả lời được 3 câu này là bạn đã biết mình đang dùng IaaS, PaaS hay serverless.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "IaaS", meaning: "Thuê hạ tầng (máy ảo, mạng, ổ đĩa); bạn tự lo OS trở lên." },
+    { term: "PaaS", meaning: "Nền tảng managed; bạn chỉ đưa code/cấu hình, không quản lý OS." },
+    { term: "FaaS / serverless", meaning: "Chạy từng function theo sự kiện, trả tiền theo lần chạy, không có server để quản lý." },
+    { term: "SaaS", meaning: "Phần mềm hoàn chỉnh dùng qua trình duyệt/API." },
+    { term: "Shared responsibility", meaning: "AWS bảo vệ hạ tầng cloud; khách hàng bảo vệ những gì mình đặt và cấu hình trên cloud." },
+    { term: "Elasticity", meaning: "Khả năng tăng/giảm tài nguyên nhanh theo tải." },
+  ]}
+/>
+
+<QuickCheck
+  question="Công ty chạy PostgreSQL trên Amazon RDS. Việc nào vẫn là trách nhiệm của công ty?"
+  options={[
+    "Thay ổ cứng hỏng trong datacenter",
+    "Vá lỗi hệ điều hành của máy chủ database",
+    "Quyết định DB có truy cập public được hay không và ai có mật khẩu",
+    "Bảo vệ vật lý toà nhà datacenter",
+  ]}
+  answerIndex={2}
+  explanation="RDS là PaaS: AWS lo phần cứng, OS và vá engine. Nhưng 'ai được ngồi cùng bàn' — cấu hình truy cập, mật khẩu, mã hoá dữ liệu — luôn là phần của bạn."
+/>
