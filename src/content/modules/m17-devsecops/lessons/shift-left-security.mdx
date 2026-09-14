@@ -1,0 +1,105 @@
+import { CostOfFixShiftLeftDiagram } from "../diagrams/cost-of-fix-shift-left-diagram";
+
+<Eli5 title="Shift-left giống như kiểm tra nguyên liệu ngay ở chợ, không đợi tới bàn ăn" emoji="🥬">
+
+Cách cũ: đầu bếp nấu xong, bưng ra bàn, **khách ăn rồi mới phát hiện** rau bị sâu. Lúc đó phải xin lỗi, đền tiền, và có khi khách không quay lại nữa.
+
+Cách "shift-left": **kiểm tra rau ngay từ lúc mua ở chợ** — trước khi nó vào bếp, trước khi nó lên đĩa. Rau sâu bị loại ngay tại cửa, không ai ngoài người đi chợ biết chuyện đó từng xảy ra.
+
+Trong phần mềm, "chợ" là lúc bạn gõ code trong IDE, "bếp" là pull request/CI, "bàn ăn" là production. Bảo mật kiểu cũ chỉ đứng gác ở cửa nhà hàng (kiểm tra production). **DevSecOps** dịch chuyện kiểm tra dịch chuyển ("shift") sang **bên trái** ("left") của timeline — càng sớm càng rẻ, càng ít người bị ảnh hưởng.
+
+</Eli5>
+
+Nếu bạn từng nghĩ "bảo mật là việc của đội security, tôi chỉ code" — đó chính xác là tư duy DevSecOps muốn xoá bỏ. Người phỏng vấn DevOps/SRE luôn hỏi: *"Bạn tích hợp bảo mật vào pipeline như thế nào?"* — và "chúng tôi có một buổi pentest cuối năm" không phải câu trả lời tốt.
+
+<CostOfFixShiftLeftDiagram />
+
+<Technical>
+
+### Shift-left không thay thế shift-right
+
+| | Shift-left | Shift-right |
+|---|---|---|
+| Khi nào | Trước khi deploy: IDE, code review, CI | Sau khi deploy: production |
+| Công cụ | SAST, SCA, secret scan, IaC scan | GuardDuty, WAF, runtime detection, DAST trên staging/prod |
+| Mục tiêu | Không cho lỗi lọt vào build | Bắt lỗi/tấn công đã lọt qua hoặc lỗi mới xuất hiện lúc runtime |
+
+Hai cái bổ trợ nhau — module này học cả hai (M17 bài 2–5 là shift-left, bài 6 giới thiệu các dịch vụ AWS thiên về shift-right).
+
+### OWASP Top 10 — DevOps cần biết gì
+
+Bản 2021 (kiểm tra bản mới nhất khi bạn đọc, OWASP cập nhật định kỳ):
+
+| Hạng | Rủi ro | Việc DevOps liên quan |
+|---|---|---|
+| A01 | Broken Access Control | Review IAM policy, RBAC Kubernetes theo least privilege |
+| A02 | Cryptographic Failures | TLS everywhere, không tự chế thuật toán mã hoá, dùng KMS |
+| A03 | Injection | SAST bắt SQL injection, command injection trong code |
+| A05 | Security Misconfiguration | IaC scanning (Checkov, Trivy config), CIS benchmark |
+| A06 | Vulnerable and Outdated Components | SCA (Trivy, Dependabot) |
+| A08 | Software and Data Integrity Failures | Ký image (cosign), SBOM, kiểm tra provenance — chủ đề bài 3 |
+| A09 | Security Logging and Monitoring Failures | Nối với M15/M16: logging, alerting cho sự kiện bảo mật |
+
+DevOps không cần thuộc lòng cả 10 mục, nhưng cần biết **loại scanner nào bắt loại lỗi nào** — đó là nội dung bài tiếp theo.
+
+### Threat modeling nhanh: STRIDE
+
+Khi thiết kế một service mới, tự hỏi 6 câu (Microsoft STRIDE):
+
+| Chữ cái | Câu hỏi |
+|---|---|
+| **S**poofing | Ai có thể giả danh người khác? |
+| **T**ampering | Ai có thể sửa dữ liệu trái phép? |
+| **R**epudiation | Có ai chối bỏ hành động đã làm được không (thiếu audit log)? |
+| **I**nformation disclosure | Dữ liệu nhạy cảm có thể bị lộ ở đâu? |
+| **D**enial of service | Điều gì làm service ngừng phục vụ? |
+| **E**levation of privilege | Ai có thể tự nâng quyền? |
+
+Không cần làm bài tập học thuật đầy đủ — chỉ cần dành 15 phút trước khi code một tính năng mới (đặc biệt auth, thanh toán, upload file) để tự hỏi 6 câu này.
+
+### Văn hoá: "security là việc của mọi người"
+
+- Đưa scanner vào CI, không phải một buổi review thủ công cuối kỳ.
+- Kết quả scan hiển thị ngay trong PR — developer thấy và tự sửa, không cần đợi đội security.
+- "You build it, you secure it" nối tiếp tinh thần "you build it, you run it" của DevOps gốc.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chạy Semgrep ngay trong IDE/local trước khi commit", command: "semgrep --config auto ." , output: "Scanning 84 files\n  ✖ 1 finding: hardcoded-jwt-secret in auth/config.js:12" },
+    { comment: "Xem lịch sử OWASP Top 10 hiện hành", command: "curl -s https://owasp.org/Top10/ -o /dev/null -w '%{http_code}\\n'", output: "200" },
+    { comment: "Ước tính nhanh chi phí: bug lọt production tốn bao nhiêu người-giờ so với lúc PR", command: "echo 'Ghi vào retro: X giờ điều tra + Y giờ vá + Z giờ thông báo khách hàng, so với 10 phút sửa ở PR'" },
+  ]}
+/>
+
+<Callout type="mistake" title="Coi shift-left là 'chạy một tool rồi xong'">
+
+Bật Semgrep trong CI mà không ai đọc kết quả, hoặc để tất cả finding ở mức "ignore" cho pipeline xanh — chỉ là ảo giác an toàn. Shift-left cần **quy trình**: ai xem finding, ai quyết định false positive, ai sửa và trong bao lâu.
+
+</Callout>
+
+<Callout type="tip" title="Bắt đầu từ Audit, chuyển dần sang Enforce">
+
+Bật scanner ở chế độ "báo cáo, không chặn" (advisory) một thời gian ngắn để dọn dẹp nợ cũ, rồi mới chuyển sang "chặn pipeline khi có CRITICAL" — giống cách áp dụng Kyverno ở bài 4.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "shift-left security", meaning: "Đưa việc kiểm tra bảo mật lên sớm nhất có thể trong vòng đời phát triển." },
+    { term: "shift-right", meaning: "Bảo vệ và phát hiện ở giai đoạn runtime/production, bổ trợ cho shift-left." },
+    { term: "OWASP Top 10", meaning: "Danh sách 10 rủi ro bảo mật ứng dụng web phổ biến nhất, cập nhật định kỳ." },
+    { term: "STRIDE", meaning: "Khung threat modeling 6 loại rủi ro: Spoofing, Tampering, Repudiation, Information disclosure, DoS, Elevation of privilege." },
+    { term: "you build it, you secure it", meaning: "Đội phát triển chịu trách nhiệm bảo mật sản phẩm của chính mình, không chỉ đội security riêng." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một lỗ hổng SQL injection được phát hiện sau khi đã chạy trên production 2 tuần, dữ liệu khách hàng đã bị truy cập trái phép. Nếu có SAST chạy trong CI từ đầu, khả năng cao điều gì đã khác?"
+  options={["Lỗi vẫn xảy ra y hệt vì SAST không bắt được SQL injection", "Lỗi được gạch đỏ ngay trong PR, sửa trong vài phút, không bao giờ tới production — tiết kiệm chi phí điều tra, vá khẩn cấp và xử lý lộ dữ liệu", "SAST sẽ tự động vá lỗi mà không cần ai xem", "Không có gì khác biệt vì SAST chỉ chạy ở production"]}
+  answerIndex={1}
+  explanation="SAST là công cụ kinh điển để bắt injection ngay trong code, đúng lúc chi phí sửa còn ở mức '1×' thay vì '150×' như biểu đồ minh hoạ."
+/>

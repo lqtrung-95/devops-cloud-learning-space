@@ -1,0 +1,144 @@
+import { PipelineScannerStagesDiagram } from "../diagrams/pipeline-scanner-stages-diagram";
+
+<Eli5 title="5 trạm kiểm tra giống như 5 trạm kiểm dịch trước khi hàng vào siêu thị" emoji="🚛">
+
+Một xe hàng trước khi vào siêu thị phải qua nhiều trạm: **trạm giấy tờ** (có giấy phép giả không — secret scan), **trạm kiểm tra công thức** (nguyên liệu chế biến có độc không — SAST), **trạm nguồn gốc** (nhà cung cấp có nằm trong danh sách đen không — SCA), **trạm nhà kho** (kho chứa có đúng tiêu chuẩn phòng cháy không — IaC scan), **trạm đóng gói** (bao bì có nhiễm bẩn không — image scan), và cuối cùng **trạm nếm thử tại chỗ** khi hàng đã bày lên kệ thật (DAST).
+
+Mỗi trạm nhìn một góc khác nhau. Bỏ qua một trạm không có nghĩa hàng đó an toàn — chỉ là **chưa ai kiểm tra góc đó**.
+
+</Eli5>
+
+Đây là bài thực hành cốt lõi của DevSecOps: biến 5 loại kiểm tra thành các bước tự động trong CI, sao cho code không an toàn **không thể** tới được production, chứ không phải "hy vọng ai đó nhớ chạy scan bằng tay".
+
+<PipelineScannerStagesDiagram />
+
+<Technical>
+
+### Bảng tổng hợp 5 loại scanner
+
+| Loại | Công cụ phổ biến | Quét gì | Chạy khi nào |
+|---|---|---|---|
+| Secret scanning | gitleaks, TruffleHog | Key/token/password lộ trong code & lịch sử Git | Mỗi commit/PR, sớm nhất có thể |
+| SAST | Semgrep, CodeQL | Lỗi trong code nguồn của bạn (injection, hardcoded secret) | Mỗi PR |
+| SCA | Trivy, Dependabot, Snyk | CVE trong dependency bên thứ ba | Mỗi PR + định kỳ (dependency mới lộ CVE sau) |
+| IaC scanning | Checkov, Trivy config, tfsec | Cấu hình sai trong Terraform/Kubernetes manifest | Mỗi PR đổi hạ tầng |
+| Image scanning | Trivy, Grype | CVE trong base image + OS packages đã build | Sau khi build image, trước khi push |
+| DAST | OWASP ZAP, Burp Suite | Lỗi chỉ lộ khi app đang chạy thật (XSS, header thiếu) | Trên staging, sau khi deploy |
+
+### Pipeline mẫu (GitHub Actions)
+
+```yaml title=".github/workflows/security.yml (rút gọn)"
+name: security
+on: [pull_request]
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_linux_x64.tar.gz | tar xz
+          ./gitleaks detect --source . --no-git -v
+
+  sast-sca:
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep
+        run: |
+          pip install semgrep
+          semgrep --config auto --error
+      - name: Trivy filesystem scan (SCA)
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy fs --severity CRITICAL,HIGH --exit-code 1 .
+
+  iac-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infra/
+          quiet: true
+          soft_fail: false   # false = fail pipeline khi có finding nghiêm trọng
+
+  build-and-scan-image:
+    runs-on: ubuntu-latest
+    needs: [sast-sca, iac-scan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t checkout:${{ github.sha }} .
+      - name: Trivy image scan
+        run: trivy image --severity CRITICAL --exit-code 1 checkout:${{ github.sha }}
+```
+
+`soft_fail: false` và `--exit-code 1` là chi tiết dễ quên nhất: mặc định nhiều tool chỉ **in báo cáo** mà không làm build đỏ. Luôn kiểm tra flag "fail on finding" của từng tool.
+
+### DAST — chạy sau khi deploy, không phải trong CI build
+
+```bash title="DAST baseline scan với OWASP ZAP"
+docker run --rm -t owasp/zap2docker-stable zap-baseline.py \
+  -t https://staging.example.com \
+  -r zap-report.html \
+  -I  # không fail pipeline ở baseline scan, chỉ báo cáo — dùng -I khi mới bắt đầu áp dụng
+```
+
+DAST tấn công app **đang chạy thật** nên chỉ chạy trên staging (không phải production, và không phải chỉ đọc code tĩnh).
+
+### Ưu tiên khắc phục — đừng cố sửa hết cùng lúc
+
+1. **CRITICAL đang bị khai thác được** (ví dụ RCE) → chặn merge ngay.
+2. **HIGH có bản vá sẵn** → cập nhật dependency, thường chỉ mất vài phút.
+3. **MEDIUM/LOW không có đường khai thác thực tế** → ghi nhận, xử lý theo lịch, có thể suppress có lý do và ngày hết hạn.
+
+Chặn pipeline vì mọi mức độ (kể cả LOW) khiến team tìm cách tắt scanner hoàn toàn — phản tác dụng.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chạy gitleaks local trước khi push", command: "gitleaks detect --source . --no-git -v", output: "INF no leaks found" },
+    { comment: "Semgrep với ruleset auto (chọn rule theo ngôn ngữ phát hiện được)", command: "semgrep --config auto --error", output: "Scanning 142 files\nfindings: 0\nRan 890 rules." },
+    { comment: "Trivy quét dependency (SCA)", command: "trivy fs --severity CRITICAL,HIGH --exit-code 1 .", output: "Total: 2 (HIGH: 2, CRITICAL: 0)\nlodash@4.17.15 -> CVE-2021-23337 (HIGH)" },
+    { comment: "Checkov quét Terraform", command: "checkov -d infra/ --compact", output: "Passed checks: 48, Failed checks: 1\nCKV_AWS_20: S3 Bucket has an ACL defined which allows public READ access" },
+    { comment: "Trivy quét image đã build", command: "trivy image --severity CRITICAL --exit-code 1 checkout:abc1234", output: "Total: 0 (CRITICAL: 0)" },
+    { comment: "DAST baseline trên staging", command: "zap-baseline.py -t https://staging.example.com -r zap-report.html", output: "PASS: X-Content-Type-Options Header Missing\nWARN-NEW: 2\nFAIL-NEW: 0" },
+  ]}
+/>
+
+<Callout type="mistake" title="Quét image scan thay cho SCA">
+
+Trivy image scan chỉ thấy dependency **đã build vào image cuối cùng**. Dependency dev-only hoặc lỗ hổng build-time (supply chain attack lúc `npm install`) cần quét filesystem (`trivy fs`) từ sớm, không chỉ quét image.
+
+</Callout>
+
+<Callout type="warning" title="soft_fail / exit-code mặc định">
+
+Nhiều action/tool mặc định KHÔNG fail pipeline dù tìm thấy lỗi nghiêm trọng — chỉ in báo cáo đẹp. Luôn đọc kỹ tài liệu flag fail-on-finding của từng tool bạn thêm vào.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "SAST", meaning: "Static Application Security Testing — phân tích code nguồn tĩnh, không cần chạy app." },
+    { term: "SCA", meaning: "Software Composition Analysis — quét dependency bên thứ ba theo cơ sở dữ liệu CVE." },
+    { term: "DAST", meaning: "Dynamic Application Security Testing — tấn công thử app đang chạy thật." },
+    { term: "IaC scanning", meaning: "Quét file hạ tầng dạng code (Terraform, Kubernetes YAML) tìm cấu hình sai." },
+    { term: "CVE", meaning: "Common Vulnerabilities and Exposures — mã định danh chuẩn cho một lỗ hổng đã công bố." },
+    { term: "fail-fast pipeline", meaning: "Thiết kế để dừng ngay ở bước rẻ nhất khi phát hiện lỗi nghiêm trọng." },
+  ]}
+/>
+
+<QuickCheck
+  question="Pipeline có Semgrep, Trivy fs, Trivy image, Checkov nhưng vẫn để lọt một API endpoint thiếu xác thực (bất kỳ ai gọi cũng trả dữ liệu). Loại scanner nào lẽ ra bắt được lỗi này?"
+  options={["SAST — vì đã quét code rồi", "SCA — vì lỗi nằm ở dependency", "DAST — vì lỗi chỉ lộ ra khi gọi thử API thật lúc app đang chạy, không phải lỗi cú pháp code hay dependency", "IaC scanning — vì liên quan hạ tầng"]}
+  answerIndex={2}
+  explanation="Thiếu xác thực logic đôi khi 'đúng cú pháp code' nên SAST có thể bỏ sót; đây là lỗi hành vi runtime — đúng việc của DAST khi thử gọi endpoint không kèm token."
+/>

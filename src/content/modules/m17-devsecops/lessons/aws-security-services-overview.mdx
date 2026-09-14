@@ -1,0 +1,116 @@
+import { AwsSecurityServicesExplorerDiagram } from "../diagrams/aws-security-services-explorer-diagram";
+
+<Eli5 title="4 dịch vụ bảo mật AWS giống như hệ thống an ninh của một toà nhà văn phòng" emoji="🏢">
+
+- **WAF** là **bảo vệ đứng ở cổng chính**: nhìn từng người ra vào, chặn ngay kẻ khả nghi trước khi họ bước chân vào sảnh.
+- **GuardDuty** là **camera an ninh có AI** rải khắp toà nhà: không đứng ở cổng, mà theo dõi hành vi *bên trong* — "sao nhân viên A lúc 3 giờ sáng lại vào phòng server tầng hầm mà chưa từng vào bao giờ?"
+- **KMS** là **két sắt trung tâm** giữ mọi chìa khoá — phòng nào cũng mượn chìa từ đây thay vì tự đúc chìa riêng dễ bị mất kiểm soát.
+- **Security Hub** là **phòng điều hành trung tâm**: nhận báo cáo từ camera, bảo vệ, cảm biến khói, rồi xếp hạng "cái nào cần xử lý gấp nhất hôm nay".
+
+Bốn vai trò này **không thay thế nhau** — thiếu một lớp là còn một cửa hở.
+
+</Eli5>
+
+Đây là bài tổng quan (overview), không đi sâu cấu hình chi tiết từng dịch vụ — mục tiêu là bạn **biết dịch vụ nào giải quyết loại vấn đề gì** để chọn đúng công cụ khi phỏng vấn hỏi "làm sao phát hiện một EC2 bị compromise" hay "làm sao mã hoá dữ liệu ở RDS".
+
+<AwsSecurityServicesExplorerDiagram />
+
+<Technical>
+
+### AWS WAF — chặn ở lớp ứng dụng (L7)
+
+- Gắn vào **CloudFront, Application Load Balancer, API Gateway, AppSync**.
+- **AWS Managed Rules**: bộ rule sẵn cho OWASP Top 10, bot control, rate limiting — không cần tự viết từ đầu.
+- Rate-based rule chặn một IP gửi quá N request/5 phút — phòng vệ cơ bản chống brute-force/DDoS lớp ứng dụng.
+
+```json title="Ví dụ rule rate-based (rút gọn)"
+{
+  "Name": "RateLimitPerIP",
+  "Priority": 1,
+  "Statement": {
+    "RateBasedStatement": { "Limit": 2000, "AggregateKeyType": "IP" }
+  },
+  "Action": { "Block": {} }
+}
+```
+
+### Amazon GuardDuty — phát hiện mối đe doạ
+
+Phân tích liên tục **CloudTrail (API calls), VPC Flow Logs, DNS logs**, và tuỳ chọn thêm **EKS Audit Logs, S3 data events, RDS Protection**. Không cần cài agent — bật là chạy.
+
+Ví dụ finding điển hình:
+
+| Finding type | Ý nghĩa |
+|---|---|
+| `UnauthorizedAccess:EC2/SSHBruteForce` | Có IP đang dò mật khẩu SSH vào instance |
+| `CryptoCurrency:EC2/BitcoinTool.B` | Instance có traffic giống đào tiền ảo — dấu hiệu bị chiếm quyền |
+| `Recon:IAMUser/MaliciousIPCaller` | Một IAM credential được dùng gọi API từ IP nằm trong threat intel xấu |
+
+GuardDuty findings nên được đẩy sang EventBridge → Lambda/SNS để **tự động phản ứng** (ví dụ tự cô lập instance) thay vì chỉ nằm trong console chờ người xem.
+
+### AWS KMS — quản lý khoá mã hoá
+
+- Mọi encryption-at-rest của S3 (SSE-KMS), EBS, RDS, Secrets Manager đều có thể dùng **Customer Managed Key (CMK)** thay vì key mặc định của AWS.
+- **Key policy** kiểm soát ai được `Encrypt`/`Decrypt`/`GenerateDataKey` — tách biệt với IAM policy thông thường, là lớp phòng thủ kép.
+- **Automatic key rotation** (hàng năm cho CMK đối xứng) giảm thời gian một key cũ có giá trị nếu bị lộ.
+- Mọi lệnh gọi KMS được ghi vào **CloudTrail** — biết chính xác ai/dịch vụ nào đã giải mã dữ liệu nào, lúc nào.
+
+### AWS Security Hub — trung tâm tổng hợp
+
+- Gom findings từ **GuardDuty, Inspector (quét lỗ hổng EC2/ECR), IAM Access Analyzer, Config, Macie**, và cả công cụ bên thứ ba.
+- Chấm điểm tuân thủ theo chuẩn: **CIS AWS Foundations Benchmark**, **AWS Foundational Security Best Practices**, **PCI DSS** (nếu áp dụng).
+- Một dashboard duy nhất trả lời: "tài khoản AWS của chúng ta đang có bao nhiêu vấn đề CRITICAL, ưu tiên xử lý cái nào trước?"
+
+### Ghép vào kiến trúc tổng thể
+
+```text
+Internet → CloudFront/ALB (WAF chặn L7)
+         → VPC (GuardDuty giám sát flow logs + CloudTrail)
+         → RDS/S3 (mã hoá bằng KMS)
+         → mọi finding → Security Hub (dashboard tổng, ưu tiên xử lý)
+```
+
+Đây chính là các mảnh ghép hạ tầng bảo mật mà **capstone project** (bài lab cuối module) yêu cầu bạn lắp ráp thành một hệ thống hoàn chỉnh.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Bật GuardDuty cho tài khoản", command: "aws guardduty create-detector --enable", output: "{\n    \"DetectorId\": \"a1b2c3d4e5f6g7h8\"\n}" },
+    { comment: "Liệt kê findings mức HIGH trở lên", command: "aws guardduty list-findings --detector-id a1b2c3d4e5f6g7h8 --finding-criteria '{\"Criterion\":{\"severity\":{\"Gte\":7}}}'", output: "{\n    \"FindingIds\": [\"abc123...\"]\n}" },
+    { comment: "Bật Security Hub và chuẩn CIS Benchmark", command: "aws securityhub enable-security-hub --enabled-standards StandardsSubscriptionArns=arn:aws:securityhub:ap-southeast-1::standards/cis-aws-foundations-benchmark/v/1.4.0", output: "{\n    \"StandardsSubscriptions\": [ { \"StandardsStatus\": \"PENDING\" } ]\n}" },
+    { comment: "Tạo CMK trong KMS cho S3 bucket của app", command: "aws kms create-key --description 'checkout-bucket-key' --tags TagKey=app,TagValue=checkout", output: "{\n    \"KeyMetadata\": { \"KeyId\": \"1234abcd-...\", \"Enabled\": true }\n}" },
+    { comment: "Xem WACL đang gắn vào ALB nào", command: "aws wafv2 list-resources-for-web-acl --web-acl-arn arn:aws:wafv2:...:webacl/checkout-waf --resource-type APPLICATION_LOAD_BALANCER" },
+  ]}
+/>
+
+<Callout type="mistake" title="Bật GuardDuty rồi không ai xem findings">
+
+GuardDuty phát hiện được nhưng không tự động phản ứng. Không có pipeline đẩy finding sang Slack/PagerDuty (giống Alertmanager ở M15/M16), findings CRITICAL có thể nằm im trong console hàng tuần mà không ai biết.
+
+</Callout>
+
+<Callout type="cost" title="Nhiều dịch vụ tính phí theo lượng dữ liệu phân tích">
+
+GuardDuty tính phí theo GB log phân tích (CloudTrail, VPC Flow Logs), Security Hub tính theo số finding + số check. Với tài khoản nhiều traffic, chi phí có thể đáng kể — theo dõi Cost Explorer và cân nhắc bật đúng tính năng cần thiết (vd RDS Protection chỉ khi thực sự dùng RDS).
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "AWS WAF", meaning: "Web Application Firewall — chặn tấn công lớp ứng dụng (SQLi, XSS, bot) tại biên." },
+    { term: "Amazon GuardDuty", meaning: "Dịch vụ phát hiện mối đe doạ dùng machine learning trên log AWS, không cần agent." },
+    { term: "AWS KMS", meaning: "Key Management Service — quản lý encryption key tập trung, có key policy và rotation." },
+    { term: "AWS Security Hub", meaning: "Tổng hợp và chấm điểm tuân thủ findings từ nhiều dịch vụ bảo mật AWS." },
+    { term: "CIS AWS Foundations Benchmark", meaning: "Chuẩn cấu hình bảo mật cơ bản cho tài khoản AWS, dùng để chấm điểm tuân thủ." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một EC2 instance đột nhiên gửi traffic bất thường ra ngoài, giống dấu hiệu bị chiếm quyền để đào tiền ảo. Dịch vụ AWS nào phát hiện đúng loại hành vi này sớm nhất mà không cần cài thêm agent?"
+  options={["AWS WAF, vì nó chặn ở lớp ứng dụng", "Amazon GuardDuty, vì nó phân tích hành vi bất thường từ VPC Flow Logs/CloudTrail bằng machine learning", "AWS KMS, vì nó quản lý khoá mã hoá", "Chỉ phát hiện được bằng cách đọc log thủ công hàng ngày"]}
+  answerIndex={1}
+  explanation="WAF là bảo vệ đứng ở cổng — không nhìn hành vi bên trong. GuardDuty đúng là camera an ninh nội bộ, chuyên phát hiện hành vi bất thường như traffic đào tiền ảo mà không cần cài gì thêm lên instance."
+/>

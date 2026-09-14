@@ -1,0 +1,189 @@
+import { KyvernoAdmissionToggleDiagram } from "../diagrams/kyverno-admission-toggle-diagram";
+
+<Eli5 title="Kyverno giống như bảo vệ ở cổng chung cư kiểm tra xe trước khi cho vào" emoji="🚧">
+
+Chung cư có nội quy: **xe phải có tem đăng ký thật** (image đã ký), **không được chở hàng quá tải trên nóc** (có resource limits), **không được cho người lạ vào bằng cửa sau** (không chạy root), **phải ghi rõ biển số cụ thể** (không dùng tag `:latest` mơ hồ).
+
+Bảo vệ đứng ngay ở cổng — **kiểm tra trước khi mở barie**, không phải đi tuần bắt xe sai luật *sau khi* nó đã đậu trong bãi. Xe không đạt đủ 4 tiêu chí bị **từ chối ngay tại cổng**, không có ngoại lệ, không phụ thuộc bảo vệ hôm đó có nhớ kiểm tra hay không — vì đây là **luật tự động**, không phải quy trình thủ công.
+
+</Eli5>
+
+Scanner ở M17 bài 2 bắt lỗi **trước khi build**. Kyverno là lớp phòng thủ **ngay tại thời điểm chạy trên cluster** — chặn cả trường hợp ai đó cố tình (hoặc vô tình) bỏ qua pipeline và `kubectl apply` thẳng một manifest không an toàn.
+
+<KyvernoAdmissionToggleDiagram />
+
+<Technical>
+
+### Kyverno là gì
+
+Kyverno là một **admission controller** cho Kubernetes: mọi request tạo/sửa resource đi qua API server sẽ được Kyverno kiểm tra trước khi được ghi vào etcd. Khác với OPA Gatekeeper (viết policy bằng ngôn ngữ Rego), Kyverno viết policy bằng **YAML thuần**, dễ tiếp cận hơn cho người quen Kubernetes manifest.
+
+### Ba chế độ hoạt động
+
+| Chế độ | Hành vi |
+|---|---|
+| `Audit` | Ghi nhận vi phạm vào `PolicyReport`, KHÔNG chặn request |
+| `Enforce` | Chặn request ngay tại admission, trả lỗi rõ ràng cho `kubectl apply` |
+| `mutate` | Tự động sửa resource (thêm label, set giá trị mặc định) trước khi lưu |
+
+Luôn triển khai policy mới ở `Audit` trước, dọn hết vi phạm hiện có, rồi mới chuyển `Enforce` — tránh việc bật policy mới làm sập cả loạt deploy đang chạy tốt.
+
+### Policy 1: bắt buộc resource limits
+
+```yaml title="require-resource-limits.yaml"
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-limits
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: check-limits
+      match:
+        any:
+          - resources: { kinds: ["Pod"] }
+      validate:
+        message: "Mỗi container phải khai báo resources.limits.cpu và memory"
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  limits:
+                    cpu: "?*"
+                    memory: "?*"
+```
+
+### Policy 2: cấm tag `:latest`
+
+```yaml title="disallow-latest-tag.yaml"
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources: { kinds: ["Pod"] }
+      validate:
+        message: "Không được dùng image tag :latest hoặc thiếu tag — chỉ định version hoặc digest cụ thể"
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"
+```
+
+### Policy 3: cấm privileged, bắt buộc non-root
+
+```yaml title="disallow-privileged-and-root.yaml"
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-and-root
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: no-privileged
+      match:
+        any:
+          - resources: { kinds: ["Pod"] }
+      validate:
+        message: "Container không được chạy ở chế độ privileged"
+        pattern:
+          spec:
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"
+    - name: require-run-as-nonroot
+      match:
+        any:
+          - resources: { kinds: ["Pod"] }
+      validate:
+        message: "Pod phải đặt securityContext.runAsNonRoot: true"
+        pattern:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+```
+
+### Policy 4: chỉ chấp nhận image đã ký (nối bài trước)
+
+```yaml title="verify-image-signature.yaml"
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signature
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: verify-signature
+      match:
+        any:
+          - resources: { kinds: ["Pod"] }
+      verifyImages:
+        - imageReferences:
+            - "registry.example.com/*"
+          attestors:
+            - entries:
+                - keyless:
+                    subject: "https://github.com/my-org/checkout/.github/workflows/*"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+```
+
+`verifyImages` chính là bước gọi lại logic `cosign verify` ngay trong admission controller — mọi Pod tạo mới đều tự động được kiểm tra, không ai phải nhớ chạy lệnh tay.
+
+### Xem vi phạm ở chế độ Audit
+
+```bash
+kubectl get policyreport -A
+kubectl get clusterpolicyreport
+```
+
+`PolicyReport`/`ClusterPolicyReport` liệt kê mọi resource đang tồn tại vi phạm policy nào — dùng để dọn dẹp trước khi chuyển Enforce.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài Kyverno", command: "helm repo add kyverno https://kyverno.github.io/kyverno/ && helm install kyverno kyverno/kyverno -n kyverno --create-namespace" },
+    { comment: "Áp dụng 4 policy ở chế độ Audit trước", command: "kubectl apply -f require-resource-limits.yaml -f disallow-latest-tag.yaml -f disallow-privileged-and-root.yaml -f verify-image-signature.yaml", output: "clusterpolicy.kyverno.io/require-resource-limits created\nclusterpolicy.kyverno.io/disallow-latest-tag created\nclusterpolicy.kyverno.io/disallow-privileged-and-root created\nclusterpolicy.kyverno.io/verify-image-signature created" },
+    { comment: "Xem vi phạm hiện có trước khi Enforce", command: "kubectl get policyreport -A -o wide" },
+    { comment: "Thử deploy Pod vi phạm (thiếu limits, dùng :latest)", command: "kubectl apply -f bad-pod.yaml", output: "Error from server: admission webhook \"validate.kyverno.svc\" denied the request:\nresource Pod/shop/bad-pod was blocked due to the following policies:\ndisallow-latest-tag: image tag :latest is not allowed\nrequire-resource-limits: validation error: resources.limits required" },
+    { comment: "Sửa lại và deploy thành công", command: "kubectl apply -f good-pod.yaml", output: "pod/checkout-7c9d8f6b5-x2k4q created" },
+  ]}
+/>
+
+<Callout type="mistake" title="Chuyển Enforce ngay không qua Audit">
+
+Bật `Enforce` cho `require-resource-limits` khi 30% Deployment hiện có chưa từng khai báo limits sẽ làm **mọi rollout mới của 30% đó bị chặn ngay lập tức** — kể cả hotfix khẩn cấp. Luôn Audit → dọn dẹp → Enforce.
+
+</Callout>
+
+<Callout type="tip" title="Loại trừ namespace hệ thống">
+
+Thêm `exclude` cho `kube-system`, namespace của chính Kyverno/Prometheus Operator — nhiều workload hệ thống chính đáng chạy privileged hoặc chưa set limits theo thiết kế của nhà cung cấp.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "admission controller", meaning: "Thành phần chặn/sửa request tại API server trước khi resource được lưu vào etcd." },
+    { term: "ClusterPolicy", meaning: "CRD của Kyverno định nghĩa một chính sách áp dụng toàn cluster." },
+    { term: "Audit / Enforce", meaning: "Chế độ chỉ ghi nhận vi phạm / chế độ chặn request thật." },
+    { term: "PolicyReport", meaning: "Báo cáo liệt kê resource đang vi phạm policy, dùng để dọn dẹp trước Enforce." },
+    { term: "verifyImages", meaning: "Rule Kyverno gọi lại logic xác minh chữ ký cosign ngay trong admission." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team mới bật `disallow-latest-tag` ở chế độ Enforce ngay lập tức trên production, và một hotfix khẩn cấp bị chặn giữa sự cố vì image cũ dùng tag `:latest`. Bài học rút ra là gì?"
+  options={["Kyverno bị lỗi, nên gỡ bỏ hoàn toàn", "Nên bắt đầu ở chế độ Audit, dùng PolicyReport dọn sạch vi phạm hiện có, rồi mới chuyển Enforce theo lộ trình", "Chỉ nên áp dụng policy vào ban đêm", "Nên viết policy bằng Rego thay vì YAML"]}
+  answerIndex={1}
+  explanation="Bảo vệ mới nhậm chức không nên khoá cổng ngay lập tức khi chưa biết bao nhiêu xe hiện có còn thiếu giấy tờ. Audit trước giúp thấy rõ tác động trước khi thật sự chặn."
+/>

@@ -15,6 +15,7 @@ import { m13KubernetesProductionEksModule } from "./modules/m13-kubernetes-produ
 import { m14GitopsArgocdModule } from "./modules/m14-gitops-argocd/module-meta";
 import { m15ObservabilityModule } from "./modules/m15-observability/module-meta";
 import { m16SrePracticesModule } from "./modules/m16-sre-practices/module-meta";
+import { m17DevsecopsModule } from "./modules/m17-devsecops/module-meta";
 
 /** All modules in learning order. Add new modules here after they pass `pnpm validate:module`. */
 export const curriculumModules: ModuleDefinition[] = [
@@ -34,4 +35,5 @@ export const curriculumModules: ModuleDefinition[] = [
   m14GitopsArgocdModule,
   m15ObservabilityModule,
   m16SrePracticesModule,
+  m17DevsecopsModule,
 ];

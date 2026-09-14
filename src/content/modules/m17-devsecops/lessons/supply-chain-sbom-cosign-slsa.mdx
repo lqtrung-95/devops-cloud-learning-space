@@ -1,0 +1,130 @@
+import { SbomCosignSlsaPipelineDiagram } from "../diagrams/sbom-cosign-slsa-pipeline-diagram";
+
+<Eli5 title="SBOM, cosign và SLSA giống như nhãn thành phần, tem niêm phong và chứng nhận nhà máy" emoji="🏷️">
+
+Mua một hộp sữa, bạn tin tưởng nó nhờ ba thứ:
+
+1. **Nhãn thành phần** trên hộp — liệt kê chính xác có gì bên trong. Trong phần mềm đó là **SBOM** (Software Bill of Materials): danh sách mọi thư viện và version đã đóng gói vào image.
+2. **Tem niêm phong** trên nắp hộp — nếu tem còn nguyên, bạn tin hộp chưa bị ai mở ra tráo đổi. Trong phần mềm đó là **chữ ký số** (cosign): xác nhận image đúng là cái được build ra, không bị ai chèn thêm mã độc giữa đường.
+3. **Chứng nhận nhà máy đạt chuẩn** — nhà máy có quy trình kiểm soát chất lượng nghiêm ngặt tới đâu. Trong phần mềm đó là **cấp độ SLSA**: build của bạn có cách ly, có ghi lại "ai build, từ commit nào, bằng script nào" hay không.
+
+</Eli5>
+
+Tấn công chuỗi cung ứng phần mềm (supply chain attack) — như vụ SolarWinds — không khai thác lỗi trong code bạn viết, mà **chèn mã độc vào quy trình build hoặc dependency**. SBOM, ký image và SLSA là ba lớp phòng thủ chuẩn ngành cho loại tấn công này.
+
+<SbomCosignSlsaPipelineDiagram />
+
+<Technical>
+
+### SBOM — Software Bill of Materials
+
+Định dạng phổ biến: **CycloneDX** và **SPDX**. Công cụ sinh: **Syft** (Anchore), hoặc `docker sbom`.
+
+```bash title="Sinh SBOM bằng Syft"
+syft checkout:sha256-abc123 -o cyclonedx-json=sbom.json
+```
+
+SBOM trả lời nhanh câu hỏi "chúng ta có đang dùng log4j 2.14 ở đâu không?" mà không cần quét lại toàn bộ hạ tầng — chỉ cần `grep`/truy vấn file SBOM đã lưu sẵn cho mọi image.
+
+### cosign — ký image bằng Sigstore
+
+**Ký bằng key cố định** (truyền thống): tạo cặp khoá, lưu private key an toàn, ký thủ công.
+
+```bash
+cosign generate-key-pair
+cosign sign --key cosign.key checkout:sha256-abc123
+cosign verify --key cosign.pub checkout:sha256-abc123
+```
+
+Vấn đề: private key phải bảo vệ vĩnh viễn, rò rỉ một lần là mất an toàn mãi mãi.
+
+**Ký keyless** (khuyến nghị cho CI hiện đại): không có private key dài hạn nào cả.
+
+```yaml title="Bước ký trong GitHub Actions"
+permissions:
+  id-token: write   # bắt buộc để lấy OIDC token
+  contents: read
+
+steps:
+  - name: Sign image
+    run: cosign sign --yes ${{ env.REGISTRY }}/checkout@${{ steps.build.outputs.digest }}
+```
+
+Luồng keyless: GitHub Actions cấp một **OIDC token ngắn hạn** đại diện cho đúng workflow run này → cosign gửi cho **Fulcio** (Certificate Authority của dự án Sigstore) → Fulcio cấp chứng chỉ X.509 **chỉ sống vài phút** → cosign dùng chứng chỉ đó ký digest image → chữ ký + chứng chỉ được ghi vào **Rekor** (sổ cái minh bạch, dạng transparency log giống Certificate Transparency của TLS).
+
+```bash title="Xác minh image keyless"
+cosign verify checkout@sha256:abc123 \
+  --certificate-identity-regexp 'https://github.com/my-org/checkout/.github/workflows/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Luôn ký theo **digest** (`sha256:...`), không phải theo tag — tag có thể bị trỏ lại sang image khác sau khi ký.
+
+### SLSA — chấm điểm độ tin cậy của build
+
+SLSA (Supply-chain Levels for Software Artifacts, đọc là "salsa") định nghĩa các cấp độ; số cấp và tiêu chí cụ thể có thể thay đổi giữa các phiên bản đặc tả — kiểm tra slsa.dev để có định nghĩa mới nhất. Ý tưởng cốt lõi qua các cấp thường là:
+
+| Mức độ (khái quát) | Ý nghĩa |
+|---|---|
+| Thấp nhất | Có quy trình build tài liệu hoá, không nhất thiết tự động |
+| Trung bình | Build tự động hoá, có sinh **provenance** (bằng chứng: build từ commit nào, bằng workflow nào) |
+| Cao | Build chạy trên nền tảng cách ly, provenance được ký và không thể giả mạo bởi chính người submit code |
+
+Provenance trả lời câu hỏi: *"Image này có đúng là build ra từ commit `abc123` trên nhánh `main`, bằng workflow đã review, hay ai đó build tay rồi push lên?"*
+
+### Ghép ba lớp lại
+
+```text
+commit → CI build (SLSA provenance) → image
+       → Syft sinh SBOM
+       → cosign ký (keyless, ghi Rekor)
+       → push registry
+       → Kyverno verify trước khi admission (bài tiếp theo)
+```
+
+Thiếu một lớp, kẻ tấn công có một cửa: không có SBOM → không biết image chứa gì; không ký → không biết image có bị tráo giữa đường; không có provenance → không biết build có chạy đúng script đã review hay không.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Sinh SBOM định dạng CycloneDX", command: "syft checkout:sha256-abc123 -o cyclonedx-json=sbom.json", output: "✔ Cataloged packages      [312 packages]\n✔ Cataloged file systems  [1 location]" },
+    { comment: "Tra cứu nhanh một package trong SBOM đã lưu", command: "jq '.components[] | select(.name==\"log4j-core\")' sbom.json", output: "{\n  \"name\": \"log4j-core\",\n  \"version\": \"2.17.1\"\n}" },
+    { comment: "Ký image keyless (chạy trong CI có OIDC, hoặc local có đăng nhập Sigstore)", command: "cosign sign --yes registry.example.com/checkout@sha256:abc123", output: "Generating ephemeral keys...\nRetrieving signed certificate...\ntlog entry created with index: 123456789" },
+    { comment: "Xác minh chữ ký và danh tính ký", command: "cosign verify registry.example.com/checkout@sha256:abc123 --certificate-identity-regexp 'https://github.com/my-org/checkout/.*' --certificate-oidc-issuer https://token.actions.githubusercontent.com", output: "Verification for registry.example.com/checkout@sha256:abc123 --\nThe following checks were performed on each of these signatures:\n  - The cosign claims were validated\n  - Existence of the claims in the transparency log was verified" },
+    { comment: "Đính SBOM vào image như một attestation (tuỳ chọn)", command: "cosign attest --yes --predicate sbom.json --type cyclonedx registry.example.com/checkout@sha256:abc123" },
+  ]}
+/>
+
+<Callout type="mistake" title="Ký theo tag thay vì digest">
+
+`cosign sign checkout:latest` ký một cái tên có thể bị trỏ sang image khác ngay sau đó. Luôn resolve và ký theo **digest** (`checkout@sha256:...`) — digest không đổi được.
+
+</Callout>
+
+<Callout type="tip" title="SBOM hữu ích nhất khi có CVE mới">
+
+Giá trị thật của SBOM không phải lúc sinh ra nó, mà **6 tháng sau** khi một CVE zero-day công bố cho một thư viện — lúc đó bạn cần trả lời "chúng ta có bao nhiêu image đang chứa nó" trong vài phút, không phải vài ngày.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "SBOM", meaning: "Software Bill of Materials — danh sách đầy đủ thành phần/phiên bản trong một artifact." },
+    { term: "cosign", meaning: "Công cụ của dự án Sigstore để ký và xác minh chữ ký container image." },
+    { term: "keyless signing", meaning: "Ký bằng chứng chỉ ngắn hạn cấp qua OIDC, không cần quản lý private key dài hạn." },
+    { term: "Fulcio", meaning: "Certificate Authority của Sigstore, cấp chứng chỉ tạm thời dựa trên danh tính OIDC." },
+    { term: "Rekor", meaning: "Sổ cái minh bạch (transparency log) ghi lại mọi lần ký, không thể sửa/xoá." },
+    { term: "SLSA", meaning: "Khung chấm điểm độ tin cậy và khả năng chống giả mạo của quy trình build." },
+    { term: "provenance", meaning: "Bằng chứng có thể kiểm chứng về nguồn gốc: build từ commit nào, bằng quy trình nào." },
+  ]}
+/>
+
+<QuickCheck
+  question="Đồng nghiệp đề xuất: 'Cứ ký image bằng một private key lưu trong GitHub Secret dùng chung cho mọi workflow là đủ rồi.' Vấn đề chính của cách này so với keyless là gì?"
+  options={["Ký bằng key cố định luôn chậm hơn keyless", "Private key dài hạn dùng chung là một điểm rò rỉ duy nhất có giá trị vĩnh viễn — ai lấy được key đó ký giả được image mãi mãi, khác với chứng chỉ keyless chỉ sống vài phút và gắn với đúng một workflow run", "Keyless không tương thích với GitHub Actions", "Không có khác biệt thực tế nào"]}
+  answerIndex={1}
+  explanation="Giống việc dùng chung một con dấu vật lý cho cả công ty so với việc mỗi lô hàng có tem niêm phong gắn liền với đúng ca sản xuất — mất con dấu là thảm hoạ lâu dài, mất một tem chỉ ảnh hưởng đúng lô đó và hết hạn sau vài phút."
+/>
