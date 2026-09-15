@@ -1,6 +1,9 @@
-# DevOps & Cloud Learning Space
+# Learning Space
 
-Nền tảng web học **DevOps & Cloud (AWS-first)** — từ Linux, Docker, CI/CD, AWS, Terraform, Kubernetes đến Observability, SRE và DevSecOps.
+Nền tảng web học công nghệ theo kiểu **ELI5 + sơ đồ tương tác + lab**, hiện có 2 khoá:
+
+- ☁️ **DevOps & Cloud (AWS-first)** — Linux, Docker, CI/CD, AWS, Terraform, Kubernetes, Observability, SRE, DevSecOps.
+- 🏗️ **System Design** — building blocks, distributed systems và case study phỏng vấn.
 
 - 🧸 **ELI5 trước, kỹ thuật sau** — mỗi khái niệm mở đầu bằng ví dụ đời thường
 - 🖼️ **Sơ đồ SVG tương tác** — bấm từng bước, bật/tắt kịch bản, xem gói tin chạy
@@ -8,7 +11,10 @@ Nền tảng web học **DevOps & Cloud (AWS-first)** — từ Linux, Docker, CI
 - 👤 **Tài khoản** (GitHub OAuth / email magic link) và **lưu tiến độ** vào Postgres
 - 📈 **Dashboard**: tiến độ theo chặng, heatmap hoạt động, lịch sử quiz
 
-Chương trình học: [docs/curriculum.md](docs/curriculum.md) · 28 tuần × ~10h/tuần · 17 module · 6 phase.
+Chương trình học:
+
+- DevOps & Cloud: [docs/curriculum.md](docs/curriculum.md) · 28 tuần × ~10h/tuần · 17 module · 6 phase
+- System Design: [docs/system-design-curriculum.md](docs/system-design-curriculum.md) · 24 tuần × ~10h/tuần · 19 module · 5 phase
 
 ## Tech stack
 
@@ -48,7 +54,7 @@ Xem hướng dẫn từng bước tại [docs/deployment-guide.md](docs/deployme
 
 ```
 src/
-├── app/                       # Routes: /, /login, /roadmap, /dashboard, /modules/[slug]/(lessons|quiz)
+├── app/                       # Routes: / (chọn khoá), /courses/[slug], /login, /dashboard, /modules/[slug]/(lessons|quiz)
 │   └── actions/               # Server actions: lưu tiến độ, chấm quiz
 ├── components/
 │   ├── diagrams/              # Bộ vẽ SVG: node, arrow, packet, step-diagram
@@ -56,16 +62,18 @@ src/
 │   ├── progress/              # Checkbox tiến độ, lab checklist, heatmap
 │   └── layout/ ui/ landing/
 ├── content/
-│   ├── curriculum-registry.ts # Danh sách module
-│   └── modules/mXX-<slug>/    # module-meta.ts · lessons/*.mdx · diagrams/*.tsx
+│   ├── course-registry.ts     # Danh sách khoá học + phase của từng khoá
+│   ├── curriculum-registry.ts # Danh sách module (mọi khoá)
+│   └── modules/<id>-<slug>/   # module-meta.ts · lessons/*.mdx · diagrams/*.tsx (m01…, sd01…)
 ├── db/                        # Drizzle schema (auth + progress)
 └── lib/                       # auth, env, progress (pure logic + repository)
-docs/                          # curriculum, authoring guide, architecture
+docs/                          # curriculums, authoring guide, architecture, deployment
 ```
 
 ## Tài liệu
 
-- [Chương trình học](docs/curriculum.md)
+- [Chương trình học DevOps & Cloud](docs/curriculum.md)
+- [Chương trình học System Design](docs/system-design-curriculum.md)
 - [Hướng dẫn viết nội dung module](docs/content-authoring-guide.md)
 - [Kiến trúc hệ thống](docs/system-architecture.md)
 - [Hướng dẫn deploy lên Vercel](docs/deployment-guide.md)

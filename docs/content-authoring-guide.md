@@ -1,14 +1,22 @@
 # Content Authoring Guide
 
-How to write a curriculum module for DevOps Learning Space. **Reference implementation:** `src/content/modules/m01-linux-shell/` — read it fully before writing a new module and match its depth, tone and structure.
+How to write a curriculum module for Learning Space (multi-course). **Reference implementation:** `src/content/modules/m01-linux-shell/` — read it fully before writing a new module and match its depth, tone and structure (for System Design, also skim any already-registered `sdXX-*` module).
 
-Source of truth for topics/labs per module: `docs/curriculum.md`.
+Source of truth for topics/labs per module:
+
+| Course | Curriculum | Module id | Phase ids (file) |
+|---|---|---|---|
+| DevOps & Cloud | `docs/curriculum.md` | `m01`…`m17` | `phase-0`…`phase-5` (`src/content/devops-course-phases.ts`) |
+| System Design | `docs/system-design-curriculum.md` | `sd01`…`sd19` | `sd-phase-0`…`sd-phase-4` (`src/content/system-design-course-phases.ts`) |
+
+A module's course is derived from its `phaseId` — there is no `courseId` field.
 
 ---
 
 ## 1. Audience & voice
 
-- Learner: experienced software developer, new to DevOps. Goal: DevOps/SRE job, AWS-first.
+- DevOps & Cloud learner: experienced software developer, new to DevOps. Goal: DevOps/SRE job, AWS-first.
+- System Design learner: experienced developer (often has done the DevOps course), never designed large-scale systems. Goals: make sound architecture decisions at work **and** pass system design interviews (mid–senior).
 - Language: **Vietnamese**, keep English technical terms as-is (container, pipeline, VPC, pod…). Don't translate commands, flags, service names.
 - Every concept: **ELI5 first** (everyday Vietnamese-life analogy: nhà hàng, chung cư, bưu điện, ship hàng, chợ, xe buýt…), **then** precise technical explanation. The analogy must map correctly onto the real mechanism — call out where the analogy breaks if it matters.
 - Friendly, concrete, short paragraphs. Use real commands with realistic output. No filler.
@@ -17,25 +25,25 @@ Source of truth for topics/labs per module: `docs/curriculum.md`.
 ## 2. Folder layout
 
 ```
-src/content/modules/mXX-<slug>/
+src/content/modules/<id>-<slug>/
 ├── module-meta.ts              # ModuleDefinition export
 ├── lessons/<lesson-slug>.mdx   # 3–6 lessons
 └── diagrams/<name>-diagram.tsx # ≥1 interactive diagram per lesson
 ```
 
-- Folder name = module `slug` = `mXX-kebab-name` (e.g. `m02-networking`). `id` = `mXX`.
+- Folder name = module `slug` = `<id>-kebab-name` (e.g. `m02-networking`, `sd04-caching-cdn`). `id` = `mXX` or `sdXX`. Ids and slugs are unique across **all** courses.
 - Lesson slugs, lab ids, quiz ids: kebab-case ASCII (`[a-z0-9-]`), **never rename after publishing** (they are progress keys stored in DB).
 - File names kebab-case, descriptive (`dns-resolution-flow-diagram.tsx`).
-- Only the lead edits `src/content/curriculum-registry.ts` — authors never touch shared files.
+- Only the lead edits `src/content/curriculum-registry.ts` and `src/content/lesson-content-loaders.ts` — authors never touch shared files (anything outside their own module folder).
 
 ## 3. `module-meta.ts`
 
-Export one `const mXXCamelCaseModule: ModuleDefinition` (see `src/content/content-types.ts`):
+Export one `const <id>CamelCaseModule: ModuleDefinition` (e.g. `sd04CachingCdnModule`) (see `src/content/content-types.ts`):
 
 | Field | Rule |
 |---|---|
-| `phaseId` | `phase-0` … `phase-5` (see `src/content/curriculum-phases.ts`) |
-| `order` | module number (M02 → 2) |
+| `phaseId` | a phase of the module's course (table at top) |
+| `order` | module number within its course (M02 → 2, SD04 → 4) |
 | `weeks` | e.g. `"Tuần 3"`, `"Tuần 5–6"` — from curriculum |
 | `emoji` | one emoji |
 | `eli5Summary` | 1–3 sentences, analogy, no jargon |
@@ -54,7 +62,7 @@ Every lesson MUST contain, in this order:
 
 1. `import { XDiagram } from "../diagrams/x-diagram";` (relative import, top of file)
 2. `<Eli5 title="… giống như …" emoji="…">` analogy (2–4 short paragraphs)
-3. Short "why it matters for DevOps" paragraph (optional heading)
+3. Short "why it matters" paragraph tied to the course goal — DevOps work, or real systems/interviews for System Design (optional heading)
 4. The interactive diagram `<XDiagram />` (can also be placed inside/after Technical)
 5. `<Technical>` … precise explanation with `###` subheadings, tables, fenced code (`bash`, `yaml`, `hcl`, `ini`, `json`, `dockerfile`…; optional `title="path"`) … `</Technical>`
 6. `## Thực hành` + `<Terminal commands={[...]} />` with comment/command/output
@@ -105,19 +113,31 @@ Rules:
 - Keep each diagram file < 200 lines; state with `useState` only; no new dependencies; no `useEffect` state syncing.
 - Never import server-only modules or the registry into a diagram.
 
-## 6. Validate before handing off
+## 6. System Design specifics
+
+Applies to `sdXX` modules, on top of everything above.
+
+- **Trade-offs are the content.** Every lesson that presents a choice ends its `<Technical>` part with a GFM table: `| Lựa chọn | Ưu | Nhược | Dùng khi |`. Say when you would change your mind.
+- **Numbers with assumptions.** Estimates show the assumption first (`DAU 10M, mỗi user 5 lần đọc/ngày ⇒ …`), round like the cheat-sheet in `docs/system-design-curriculum.md` (Phụ lục B), and hedge throughput claims (`cỡ`, `tuỳ workload — cần benchmark`). Never state a vendor's QPS as fact.
+- **Hands-on = the `sd-playground`.** Labs and `## Thực hành` use the Docker Compose playground (Nginx, Node/TypeScript app, Postgres, Redis, Redpanda, MinIO, k6, Toxiproxy) with real commands (`docker compose up -d`, `k6 run`, `redis-cli`, `psql`, `rpk`). Short TypeScript snippets in fenced `ts` blocks are fine; keep them runnable and < 40 lines. Terminal output must be realistic, not invented precision.
+- **Interview angle.** Add one `<Callout type="info" title="Góc phỏng vấn">` per lesson: how the topic shows up in an interview and what a strong answer mentions.
+- **Case-study modules (SD14–SD19)** structure lessons along the framework from SD01: requirements → ước lượng → API & data model → high-level design → deep dives → bottlenecks & trade-offs. At least one lab per module is a design doc using Phụ lục A.
+- **Say things precisely** where people commonly get them wrong: CAP only applies during a partition; "exactly-once" is at-least-once + idempotency; retries need jitter; Redis is not the source of truth unless configured and justified.
+- **Diagram ideas that teach:** step through a request path (LB → app → cache → DB); toggle cache hit vs miss; slider/toggle for replication lag or `N/W/R` quorum; kill-a-node scenario switch (leader election, failover); fan-out push vs pull comparison. `cost` callouts may be used for cloud/egress/storage costs.
+
+## 7. Validate before handing off
 
 ```bash
-pnpm validate:module mXX-slug   # structure, editorial rules, MDX compiles
-pnpm typecheck 2>&1 | grep "modules/mXX-" # must print nothing
-pnpm exec eslint src/content/modules/mXX-slug
+pnpm validate:module <id>-slug   # structure, editorial rules, MDX compiles
+pnpm typecheck 2>&1 | grep "modules/<id>-" # must print nothing
+pnpm exec eslint src/content/modules/<id>-slug
 ```
 
 `validate:module` enforces: 3–6 lessons, ≥2 labs (≥3 steps), 8–12 quiz questions with valid answers, every lesson has `<Eli5>`, `<Technical>`, `<KeyTerms>`, `<QuickCheck>` and imports an existing diagram.
 
-## 7. Checklist
+## 8. Checklist
 
-- [ ] Topics & labs cover the module section in `docs/curriculum.md`
+- [ ] Topics & labs cover the module section in the course's curriculum doc
 - [ ] Every lesson: ELI5 → diagram → technical → hands-on → mistakes → key terms → quick check
 - [ ] Every diagram interactive (steps, toggles or clicks) and readable in light/dark
 - [ ] Commands are real and correct; outputs realistic
