@@ -17,7 +17,7 @@ const envSchema = z
     SMTP_PORT: z.coerce.number().int().default(1025),
     SMTP_USER: z.string().optional(),
     SMTP_PASSWORD: z.string().optional(),
-    EMAIL_FROM: z.string().default("DevOps Learning Space <no-reply@devops-learning.local>"),
+    EMAIL_FROM: z.string().default("Learning Space <no-reply@learning-space.local>"),
     GITHUB_CLIENT_ID: z.string().optional(),
     GITHUB_CLIENT_SECRET: z.string().optional(),
   })

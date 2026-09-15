@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ModuleDefinition } from "@/content/content-types";
-import { calculateModuleProgress, calculateOverallPercent } from "./module-progress-calculator";
+import { calculateModuleProgress, calculateOverallPercent, summarizeCourseProgress } from "./module-progress-calculator";
 import { labItemKey, lessonItemKey, parseItemKey } from "./progress-item-keys";
 
 const sampleModule = {
@@ -40,6 +40,30 @@ describe("calculateOverallPercent", () => {
     const base = calculateModuleProgress(sampleModule, new Set(), null);
     expect(calculateOverallPercent([])).toBe(0);
     expect(calculateOverallPercent([{ ...base, percent: 100 }, { ...base, percent: 50 }])).toBe(75);
+  });
+});
+
+describe("summarizeCourseProgress", () => {
+  it("is empty and not started for no progress", () => {
+    const untouched = calculateModuleProgress(sampleModule, new Set(), null);
+    expect(summarizeCourseProgress([untouched, untouched])).toEqual({
+      percent: 0,
+      modulesDone: 0,
+      modulesTotal: 2,
+      lessonsDone: 0,
+      lessonsTotal: 4,
+      labsDone: 0,
+      labsTotal: 2,
+      hasStarted: false,
+    });
+  });
+
+  it("sums module counts and counts a failed quiz attempt as started", () => {
+    const allKeys = new Set([lessonItemKey("m99", "one"), lessonItemKey("m99", "two"), labItemKey("m99", "lab-a")]);
+    const complete = calculateModuleProgress(sampleModule, allKeys, 100);
+    const quizOnly = calculateModuleProgress(sampleModule, new Set(), 10);
+    expect(summarizeCourseProgress([complete, quizOnly])).toMatchObject({ percent: 50, modulesDone: 1, lessonsDone: 2, labsDone: 1, hasStarted: true });
+    expect(summarizeCourseProgress([quizOnly]).hasStarted).toBe(true);
   });
 });
 

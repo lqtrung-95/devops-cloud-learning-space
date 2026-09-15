@@ -2,13 +2,14 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { ActivityHeatmapGrid } from "@/components/progress/activity-heatmap-grid";
+import { CourseProgressSection } from "@/components/progress/course-progress-section";
 import { buttonClassName } from "@/components/ui/button-styles";
-import { ProgressBar } from "@/components/ui/progress-bar";
-import { getAllModules, getModuleById, getPhasesWithModules } from "@/content/curriculum-lookup";
+import { getAllCourses, getCourseForModule, getModuleById, getModulesForCourse, getPhasesWithModules } from "@/content/curriculum-lookup";
 import { getCurrentSession } from "@/lib/auth/auth-server";
 import { buildActivityHeatmap } from "@/lib/progress/activity-heatmap-builder";
-import { getActivityDates, getRecentQuizAttempts } from "@/lib/progress/learning-progress-repository";
-import { lessonItemKey } from "@/lib/progress/progress-item-keys";
+import { pickContinueCourseId } from "@/lib/progress/continue-course-picker";
+import { getActivityDates, getLatestCompletedItem, getRecentQuizAttempts } from "@/lib/progress/learning-progress-repository";
+import { lessonItemKey, parseItemKey } from "@/lib/progress/progress-item-keys";
 import { QUIZ_PASS_PERCENT, toPercent } from "@/lib/progress/quiz-grader";
 import { getUserProgressSnapshot } from "@/lib/progress/user-progress-snapshot";
 
@@ -23,32 +24,38 @@ export default async function DashboardPage() {
   const userId = session.user.id;
   const today = new Date();
   const since = new Date(today.getTime() - HEATMAP_WEEKS * 7 * 24 * 60 * 60 * 1000);
-  const [snapshot, recentQuizzes, activityDates] = await Promise.all([
+  const [snapshot, recentQuizzes, activityDates, latestItem] = await Promise.all([
     getUserProgressSnapshot(userId),
     getRecentQuizAttempts(userId),
     getActivityDates(userId, since),
+    getLatestCompletedItem(userId),
   ]);
 
-  const modules = getAllModules();
-  const completedModules = modules.filter((learningModule) => snapshot.moduleProgressById.get(learningModule.id)?.isComplete).length;
-  const totalLessons = modules.reduce((sum, learningModule) => sum + learningModule.lessons.length, 0);
-  const lessonsDone = modules.reduce((sum, learningModule) => sum + (snapshot.moduleProgressById.get(learningModule.id)?.lessonsDone ?? 0), 0);
+  const courses = getAllCourses();
+  const courseSummaries = [...snapshot.courseProgressById.values()];
+  const total = (pick: (summary: (typeof courseSummaries)[number]) => number) => courseSummaries.reduce((sum, summary) => sum + pick(summary), 0);
   const heatmap = buildActivityHeatmap(activityDates, today, HEATMAP_WEEKS);
   const activeDays = heatmap.flat().filter((day) => day.count > 0).length;
 
-  // Next step: first unfinished lesson in the first incomplete module.
-  const nextModule = modules.find((learningModule) => !snapshot.moduleProgressById.get(learningModule.id)?.isComplete);
+  // Last touched module = newer of the latest completed item and the latest quiz attempt.
+  const latestQuiz = recentQuizzes[0];
+  const lastActiveModuleId =
+    latestQuiz && (!latestItem || latestQuiz.createdAt > latestItem.at) ? latestQuiz.moduleId : latestItem ? parseItemKey(latestItem.itemKey)?.moduleId : undefined;
+  const lastActiveModule = lastActiveModuleId ? getModuleById(lastActiveModuleId) : undefined;
+  const activeCourseId = pickContinueCourseId(
+    courses.map((course) => course.id),
+    snapshot.courseProgressById,
+    lastActiveModule ? getCourseForModule(lastActiveModule).id : null,
+  );
+  const activeCourse = courses.find((course) => course.id === activeCourseId);
+  const nextModule = activeCourse && getModulesForCourse(activeCourse.id).find((learningModule) => !snapshot.moduleProgressById.get(learningModule.id)?.isComplete);
   const nextLesson = nextModule?.lessons.find((lesson) => !snapshot.completedKeys.has(lessonItemKey(nextModule.id, lesson.slug)));
-  const continueHref = nextModule
-    ? nextLesson
-      ? `/modules/${nextModule.slug}/lessons/${nextLesson.slug}`
-      : `/modules/${nextModule.slug}`
-    : "/roadmap";
+  const continueHref = nextModule && (nextLesson ? `/modules/${nextModule.slug}/lessons/${nextLesson.slug}` : `/modules/${nextModule.slug}`);
 
   const stats = [
-    { label: "Tổng tiến độ", value: `${snapshot.overallPercent}%`, emoji: "📈" },
-    { label: "Module hoàn thành", value: `${completedModules}/${modules.length}`, emoji: "🏅" },
-    { label: "Bài học đã xong", value: `${lessonsDone}/${totalLessons}`, emoji: "📖" },
+    { label: "Module hoàn thành", value: `${total((summary) => summary.modulesDone)}/${total((summary) => summary.modulesTotal)}`, emoji: "🏅" },
+    { label: "Bài học đã xong", value: `${total((summary) => summary.lessonsDone)}/${total((summary) => summary.lessonsTotal)}`, emoji: "📖" },
+    { label: "Lab đã xong", value: `${total((summary) => summary.labsDone)}/${total((summary) => summary.labsTotal)}`, emoji: "🧪" },
     { label: `Ngày học (${HEATMAP_WEEKS} tuần)`, value: String(activeDays), emoji: "🔥" },
   ];
 
@@ -69,10 +76,12 @@ export default async function DashboardPage() {
         ))}
       </div>
 
-      {nextModule && (
+      {nextModule && continueHref && (
         <div className="mt-6 flex flex-wrap items-center justify-between gap-4 rounded-2xl bg-gradient-to-r from-indigo-600 to-violet-600 p-6 text-white">
           <div>
-            <p className="text-sm font-medium text-indigo-100">Tiếp tục học</p>
+            <p className="text-sm font-medium text-indigo-100">
+              {snapshot.courseProgressById.get(activeCourse.id)?.hasStarted ? "Tiếp tục học" : "Bắt đầu học"} · {activeCourse.title}
+            </p>
             <p className="text-xl font-bold">
               {nextModule.emoji} {nextModule.title}
               {nextLesson && <span className="font-medium text-indigo-100"> · {nextLesson.title}</span>}
@@ -85,32 +94,17 @@ export default async function DashboardPage() {
       )}
 
       <div className="mt-8 grid gap-6 lg:grid-cols-[1fr_340px]">
-        <section className="rounded-2xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
-          <h2 className="text-lg font-bold">Tiến độ theo chặng</h2>
-          <div className="mt-4 space-y-5">
-            {getPhasesWithModules().map((phase) => (
-              <div key={phase.id}>
-                <p className="text-sm font-semibold">
-                  {phase.emoji} Phase {phase.order}: {phase.title}
-                </p>
-                <div className="mt-2 space-y-2">
-                  {phase.modules.map((learningModule) => {
-                    const progress = snapshot.moduleProgressById.get(learningModule.id);
-                    return (
-                      <Link key={learningModule.id} href={`/modules/${learningModule.slug}`} className="flex items-center gap-3 rounded-lg px-2 py-1 hover:bg-stone-50 dark:hover:bg-stone-800">
-                        <span className="w-44 shrink-0 truncate text-sm text-stone-700 dark:text-stone-300">
-                          {learningModule.emoji} {learningModule.title}
-                        </span>
-                        <ProgressBar percent={progress?.percent ?? 0} size="sm" label={learningModule.title} />
-                        <span className="w-10 text-right text-xs font-semibold">{progress?.isComplete ? "✅" : `${progress?.percent ?? 0}%`}</span>
-                      </Link>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
+        <div className="space-y-6">
+          {courses.map((course) => (
+            <CourseProgressSection
+              key={course.id}
+              course={course}
+              phases={getPhasesWithModules(course.id)}
+              courseProgress={snapshot.courseProgressById.get(course.id)!}
+              moduleProgressById={snapshot.moduleProgressById}
+            />
+          ))}
+        </div>
 
         <div className="space-y-6">
           <section className="rounded-2xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
@@ -137,8 +131,8 @@ export default async function DashboardPage() {
                 })}
               </ul>
             )}
-            <Link href="/roadmap" className={buttonClassName("secondary", "mt-4 w-full")}>
-              Xem lộ trình
+            <Link href="/#courses" className={buttonClassName("secondary", "mt-4 w-full")}>
+              Các khoá học
             </Link>
           </section>
         </div>

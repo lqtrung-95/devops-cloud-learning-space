@@ -44,6 +44,17 @@ export async function getRecentQuizAttempts(userId: string, limit = 5) {
     .limit(limit);
 }
 
+/** The most recently completed lesson/lab, or null if the user has completed nothing. */
+export async function getLatestCompletedItem(userId: string): Promise<{ itemKey: string; at: Date } | null> {
+  const [row] = await db
+    .select({ itemKey: progressItem.itemKey, at: progressItem.completedAt })
+    .from(progressItem)
+    .where(eq(progressItem.userId, userId))
+    .orderBy(desc(progressItem.completedAt))
+    .limit(1);
+  return row ?? null;
+}
+
 /** Timestamps of all learning activity (completed items + quiz attempts) since `since`. */
 export async function getActivityDates(userId: string, since: Date): Promise<Date[]> {
   const [items, attempts] = await Promise.all([

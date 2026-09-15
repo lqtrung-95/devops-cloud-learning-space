@@ -4,8 +4,24 @@
  * `lessons/<lesson-slug>.mdx` and `diagrams/*.tsx`.
  */
 
-export interface PhaseDefinition {
+export interface CourseDefinition {
   id: string;
+  /** URL segment: `/courses/<slug>`. */
+  slug: string;
+  title: string;
+  emoji: string;
+  /** Short badge line, e.g. "AWS-first · 28 tuần". */
+  tagline: string;
+  description: string;
+  weeksTotal: number;
+  hoursPerWeek: number;
+}
+
+/** A phase belongs to exactly one course; a module's course is derived from its phase. */
+export interface PhaseDefinition {
+  /** Unique across all courses. */
+  id: string;
+  courseId: string;
   order: number;
   title: string;
   weeks: string;
@@ -46,11 +62,12 @@ export interface ResourceLink {
 }
 
 export interface ModuleDefinition {
-  /** Short id used in progress keys, e.g. "m01". */
+  /** Short id used in progress keys, e.g. "m01" or "sd01" — unique across all courses. */
   id: string;
-  /** Folder name and URL segment, e.g. "m01-linux-shell". */
+  /** Folder name and URL segment, e.g. "m01-linux-shell" — unique across all courses. */
   slug: string;
   phaseId: string;
+  /** Learning order within the module's course. */
   order: number;
   weeks: string;
   title: string;

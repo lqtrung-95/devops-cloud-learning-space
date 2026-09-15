@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ModuleDefinition } from "./content-types";
+import { coursePhases } from "./course-registry";
 
 /**
  * Structural + editorial checks for one content module. Used by unit tests and by
@@ -27,7 +28,8 @@ export function validateModuleDefinition(learningModule: ModuleDefinition): stri
   const problems: string[] = [];
   const where = (detail: string) => `[${learningModule.slug}] ${detail}`;
 
-  if (!/^m\d{2}$/.test(learningModule.id)) problems.push(where(`id "${learningModule.id}" must look like m01`));
+  if (!/^[a-z]+\d{2}$/.test(learningModule.id)) problems.push(where(`id "${learningModule.id}" must look like m01 or sd01`));
+  if (!coursePhases.some((phase) => phase.id === learningModule.phaseId)) problems.push(where(`phaseId "${learningModule.phaseId}" does not exist`));
   if (!learningModule.slug.startsWith(`${learningModule.id}-`) || !SLUG_PATTERN.test(learningModule.slug)) {
     problems.push(where(`slug must be kebab-case and start with "${learningModule.id}-"`));
   }

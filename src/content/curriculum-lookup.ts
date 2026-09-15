@@ -1,10 +1,39 @@
-import type { ModuleDefinition, PhaseDefinition, PublicQuizQuestion } from "./content-types";
-import { curriculumPhases } from "./curriculum-phases";
+import type { CourseDefinition, ModuleDefinition, PhaseDefinition, PublicQuizQuestion } from "./content-types";
+import { coursePhases, courses } from "./course-registry";
 import { curriculumModules } from "./curriculum-registry";
 import { labItemKey, lessonItemKey } from "@/lib/progress/progress-item-keys";
 
+export type PhaseWithModules = PhaseDefinition & { modules: ModuleDefinition[] };
+
+export function getAllCourses(): CourseDefinition[] {
+  return courses;
+}
+
+export function getCourseBySlug(slug: string): CourseDefinition | undefined {
+  return courses.find((course) => course.slug === slug);
+}
+
+export function getPhaseById(id: string): PhaseDefinition | undefined {
+  return coursePhases.find((phase) => phase.id === id);
+}
+
+/** Every module belongs to the course of its phase; the registry test guarantees the phase exists. */
+export function getCourseForModule(learningModule: ModuleDefinition): CourseDefinition {
+  const courseId = getPhaseById(learningModule.phaseId)?.courseId;
+  const course = courses.find((candidate) => candidate.id === courseId);
+  if (!course) throw new Error(`Module ${learningModule.id} has no course (phase ${learningModule.phaseId})`);
+  return course;
+}
+
+/** Modules of every course, each course in its own learning order. */
 export function getAllModules(): ModuleDefinition[] {
-  return [...curriculumModules].sort((a, b) => a.order - b.order);
+  return courses.flatMap((course) => getModulesForCourse(course.id));
+}
+
+export function getModulesForCourse(courseId: string): ModuleDefinition[] {
+  return curriculumModules
+    .filter((learningModule) => getPhaseById(learningModule.phaseId)?.courseId === courseId)
+    .sort((a, b) => a.order - b.order);
 }
 
 export function getModuleBySlug(slug: string): ModuleDefinition | undefined {
@@ -15,9 +44,10 @@ export function getModuleById(id: string): ModuleDefinition | undefined {
   return curriculumModules.find((learningModule) => learningModule.id === id);
 }
 
-export function getPhasesWithModules(): Array<PhaseDefinition & { modules: ModuleDefinition[] }> {
-  const modules = getAllModules();
-  return [...curriculumPhases]
+export function getPhasesWithModules(courseId: string): PhaseWithModules[] {
+  const modules = getModulesForCourse(courseId);
+  return coursePhases
+    .filter((phase) => phase.courseId === courseId)
     .sort((a, b) => a.order - b.order)
     .map((phase) => ({ ...phase, modules: modules.filter((learningModule) => learningModule.phaseId === phase.id) }));
 }

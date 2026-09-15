@@ -5,7 +5,7 @@ import { LabChecklistCard } from "@/components/progress/lab-checklist-card";
 import { ProgressItemCheckbox } from "@/components/progress/progress-item-checkbox";
 import { buttonClassName } from "@/components/ui/button-styles";
 import { ProgressBar } from "@/components/ui/progress-bar";
-import { getModuleBySlug } from "@/content/curriculum-lookup";
+import { getCourseForModule, getModuleBySlug } from "@/content/curriculum-lookup";
 import { getCurrentSession } from "@/lib/auth/auth-server";
 import { labItemKey, lessonItemKey } from "@/lib/progress/progress-item-keys";
 import { QUIZ_PASS_PERCENT } from "@/lib/progress/quiz-grader";
@@ -22,6 +22,7 @@ export default async function ModuleOverviewPage({ params }: PageProps<"/modules
   const { moduleSlug } = await params;
   const learningModule = getModuleBySlug(moduleSlug);
   if (!learningModule) notFound();
+  const course = getCourseForModule(learningModule);
 
   const session = await getCurrentSession();
   const snapshot = await getUserProgressSnapshot(session?.user.id ?? null);
@@ -44,8 +45,8 @@ export default async function ModuleOverviewPage({ params }: PageProps<"/modules
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-10">
-      <Link href="/roadmap" className="text-sm text-stone-500 hover:text-indigo-600">
-        ← Lộ trình
+      <Link href={`/courses/${course.slug}`} className="text-sm text-stone-500 hover:text-indigo-600">
+        ← Lộ trình {course.title}
       </Link>
 
       <header className="mt-4 rounded-3xl border border-stone-200 bg-white p-6 sm:p-8 dark:border-stone-800 dark:bg-stone-900">

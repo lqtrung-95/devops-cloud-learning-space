@@ -1,12 +1,12 @@
 import "server-only";
-import { getAllModules } from "@/content/curriculum-lookup";
+import { getAllCourses, getAllModules, getModulesForCourse } from "@/content/curriculum-lookup";
 import { getBestQuizPercentByModule, getCompletedItemKeys } from "./learning-progress-repository";
-import { calculateModuleProgress, calculateOverallPercent, type ModuleProgress } from "./module-progress-calculator";
+import { calculateModuleProgress, summarizeCourseProgress, type CourseProgressSummary, type ModuleProgress } from "./module-progress-calculator";
 
 export interface UserProgressSnapshot {
   completedKeys: Set<string>;
   moduleProgressById: Map<string, ModuleProgress>;
-  overallPercent: number;
+  courseProgressById: Map<string, CourseProgressSummary>;
 }
 
 /** Loads everything needed to render progress for one user (null user → empty snapshot). */
@@ -19,9 +19,12 @@ export async function getUserProgressSnapshot(userId: string | null): Promise<Us
     getAllModules().map((learningModule) => [learningModule.id, calculateModuleProgress(learningModule, completedKeys, bestQuizByModule.get(learningModule.id) ?? null)]),
   );
 
-  return {
-    completedKeys,
-    moduleProgressById,
-    overallPercent: calculateOverallPercent([...moduleProgressById.values()]),
-  };
+  const courseProgressById = new Map(
+    getAllCourses().map((course) => [
+      course.id,
+      summarizeCourseProgress(getModulesForCourse(course.id).map((learningModule) => moduleProgressById.get(learningModule.id)!)),
+    ]),
+  );
+
+  return { completedKeys, moduleProgressById, courseProgressById };
 }

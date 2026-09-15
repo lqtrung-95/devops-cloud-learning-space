@@ -45,3 +45,30 @@ export function calculateOverallPercent(moduleProgressList: ModuleProgress[]): n
   const sum = moduleProgressList.reduce((total, progress) => total + progress.percent, 0);
   return Math.round(sum / moduleProgressList.length);
 }
+
+export interface CourseProgressSummary {
+  percent: number;
+  modulesDone: number;
+  modulesTotal: number;
+  lessonsDone: number;
+  lessonsTotal: number;
+  labsDone: number;
+  labsTotal: number;
+  /** Any lesson, lab or quiz attempt recorded in the course. */
+  hasStarted: boolean;
+}
+
+/** Rolls up the progress of one course's modules. */
+export function summarizeCourseProgress(moduleProgressList: ModuleProgress[]): CourseProgressSummary {
+  const sum = (pick: (progress: ModuleProgress) => number) => moduleProgressList.reduce((total, progress) => total + pick(progress), 0);
+  return {
+    percent: calculateOverallPercent(moduleProgressList),
+    modulesDone: moduleProgressList.filter((progress) => progress.isComplete).length,
+    modulesTotal: moduleProgressList.length,
+    lessonsDone: sum((progress) => progress.lessonsDone),
+    lessonsTotal: sum((progress) => progress.lessonsTotal),
+    labsDone: sum((progress) => progress.labsDone),
+    labsTotal: sum((progress) => progress.labsTotal),
+    hasStarted: moduleProgressList.some((progress) => progress.lessonsDone > 0 || progress.labsDone > 0 || progress.bestQuizPercent !== null),
+  };
+}

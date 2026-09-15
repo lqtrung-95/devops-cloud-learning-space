@@ -17,8 +17,8 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: { default: "DevOps Learning Space", template: "%s · DevOps Learning Space" },
-  description: "Học DevOps & Cloud (AWS) từ con số 0 — giải thích dễ hiểu, hình minh hoạ tương tác, lab thực hành.",
+  title: { default: "Learning Space", template: "%s · Learning Space" },
+  description: "Học DevOps, Cloud và System Design — giải thích dễ hiểu, hình minh hoạ tương tác, lab thực hành.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
@@ -31,7 +31,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         <SiteHeader />
         <main className="flex-1">{children}</main>
         <footer className="border-t border-stone-200 py-6 text-center text-xs text-stone-500 dark:border-stone-800">
-          DevOps Learning Space · Học mỗi ngày một chút 🌱
+          Learning Space · Học mỗi ngày một chút 🌱
         </footer>
       </body>
     </html>

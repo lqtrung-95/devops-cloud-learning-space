@@ -18,11 +18,11 @@ export async function sendMagicLinkEmail({ email, url }: { email: string; url: s
   await transporter.sendMail({
     from: env.EMAIL_FROM,
     to: email,
-    subject: "Link đăng nhập DevOps Learning Space",
+    subject: "Link đăng nhập Learning Space",
     text: `Bấm vào link sau để đăng nhập (hết hạn sau 10 phút):\n\n${url}\n\nNếu bạn không yêu cầu, hãy bỏ qua email này.`,
     html: `
       <div style="font-family:sans-serif;max-width:480px;margin:auto">
-        <h2>🚀 Đăng nhập DevOps Learning Space</h2>
+        <h2>🚀 Đăng nhập Learning Space</h2>
         <p>Bấm nút bên dưới để đăng nhập. Link hết hạn sau 10 phút.</p>
         <p><a href="${escapeHtmlAttribute(url)}" style="display:inline-block;padding:12px 20px;background:#4f46e5;color:#fff;border-radius:8px;text-decoration:none">Đăng nhập</a></p>
         <p style="color:#666;font-size:13px">Nếu bạn không yêu cầu, hãy bỏ qua email này.</p>

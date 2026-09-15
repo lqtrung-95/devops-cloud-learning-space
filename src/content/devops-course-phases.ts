@@ -1,8 +1,9 @@
 import type { PhaseDefinition } from "./content-types";
 
-export const curriculumPhases: PhaseDefinition[] = [
+export const devopsCoursePhases: PhaseDefinition[] = [
   {
     id: "phase-0",
+    courseId: "devops-cloud",
     order: 0,
     title: "Nền tảng",
     weeks: "Tuần 1–4",
@@ -11,6 +12,7 @@ export const curriculumPhases: PhaseDefinition[] = [
   },
   {
     id: "phase-1",
+    courseId: "devops-cloud",
     order: 1,
     title: "Containers & CI/CD",
     weeks: "Tuần 5–9",
@@ -19,6 +21,7 @@ export const curriculumPhases: PhaseDefinition[] = [
   },
   {
     id: "phase-2",
+    courseId: "devops-cloud",
     order: 2,
     title: "AWS Cloud",
     weeks: "Tuần 10–15",
@@ -27,6 +30,7 @@ export const curriculumPhases: PhaseDefinition[] = [
   },
   {
     id: "phase-3",
+    courseId: "devops-cloud",
     order: 3,
     title: "Infrastructure as Code",
     weeks: "Tuần 16–18",
@@ -35,6 +39,7 @@ export const curriculumPhases: PhaseDefinition[] = [
   },
   {
     id: "phase-4",
+    courseId: "devops-cloud",
     order: 4,
     title: "Kubernetes & GitOps",
     weeks: "Tuần 19–23",
@@ -43,6 +48,7 @@ export const curriculumPhases: PhaseDefinition[] = [
   },
   {
     id: "phase-5",
+    courseId: "devops-cloud",
     order: 5,
     title: "Observability, SRE & DevSecOps",
     weeks: "Tuần 24–26",

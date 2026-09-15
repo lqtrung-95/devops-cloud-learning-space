@@ -14,11 +14,11 @@ export async function SiteHeader() {
           <span className="text-xl" aria-hidden>
             🚀
           </span>
-          <span className="hidden sm:inline">DevOps Learning Space</span>
+          <span className="hidden sm:inline">Learning Space</span>
         </Link>
         <nav className="flex items-center gap-1 text-sm font-medium">
-          <Link href="/roadmap" className={buttonClassName("ghost", "px-3")}>
-            Lộ trình
+          <Link href="/#courses" className={buttonClassName("ghost", "px-3")}>
+            Khoá học
           </Link>
           {session && (
             <Link href="/dashboard" className={buttonClassName("ghost", "px-3")}>
