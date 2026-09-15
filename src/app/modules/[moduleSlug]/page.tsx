@@ -27,8 +27,20 @@ export default async function ModuleOverviewPage({ params }: PageProps<"/modules
   const snapshot = await getUserProgressSnapshot(session?.user.id ?? null);
   const progress = snapshot.moduleProgressById.get(learningModule.id)!;
   const isSignedIn = Boolean(session);
-  const firstUnfinishedLesson =
-    learningModule.lessons.find((lesson) => !snapshot.completedKeys.has(lessonItemKey(learningModule.id, lesson.slug))) ?? learningModule.lessons[0];
+  const firstUnfinishedLesson = learningModule.lessons.find(
+    (lesson) => !snapshot.completedKeys.has(lessonItemKey(learningModule.id, lesson.slug)),
+  );
+  const firstUnfinishedLab = learningModule.labs.find((lab) => !snapshot.completedKeys.has(labItemKey(learningModule.id, lab.id)));
+
+  // "Học tiếp" moves to whatever's next: a lesson, then a lab (same page, so just
+  // scroll to it), then the quiz — not back to lesson 1 once lessons are all done.
+  const primaryCta = firstUnfinishedLesson
+    ? { href: `/modules/${learningModule.slug}/lessons/${firstUnfinishedLesson.slug}`, label: progress.lessonsDone > 0 ? "Học tiếp →" : "Bắt đầu học →" }
+    : firstUnfinishedLab
+      ? { href: "#labs", label: "Làm lab →" }
+      : !progress.quizPassed
+        ? { href: `/modules/${learningModule.slug}/quiz`, label: "Làm quiz →" }
+        : null;
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-10">
@@ -58,10 +70,12 @@ export default async function ModuleOverviewPage({ params }: PageProps<"/modules
             <span className="text-sm font-semibold">{progress.percent}%</span>
           </div>
         )}
-        {learningModule.lessons.length > 0 && (
-          <Link href={`/modules/${learningModule.slug}/lessons/${firstUnfinishedLesson.slug}`} className={buttonClassName("primary", "mt-5")}>
-            {progress.lessonsDone > 0 ? "Học tiếp →" : "Bắt đầu học →"}
+        {primaryCta ? (
+          <Link href={primaryCta.href} className={buttonClassName("primary", "mt-5")}>
+            {primaryCta.label}
           </Link>
+        ) : (
+          isSignedIn && <p className="mt-5 font-semibold text-emerald-600 dark:text-emerald-400">🎉 Module đã hoàn thành!</p>
         )}
       </header>
 
@@ -100,7 +114,7 @@ export default async function ModuleOverviewPage({ params }: PageProps<"/modules
         </ol>
       </section>
 
-      <section className="mt-10">
+      <section id="labs" className="mt-10 scroll-mt-20">
         <h2 className="text-xl font-bold">
           🧪 Lab thực hành <span className="text-base font-medium text-stone-500">({progress.labsDone}/{progress.labsTotal})</span>
         </h2>
