@@ -1,0 +1,148 @@
+import { SyncVsAsyncLoadSpikeDiagram } from "../diagrams/sync-vs-async-load-spike-diagram";
+
+<Eli5 title="Hàng đợi giống như bảng ghim phiếu order ở quán phở" emoji="🍜">
+  Quán phở nhỏ, một người vừa thu tiền vừa nấu vừa rửa bát: khách thứ hai phải **đứng chờ** khách thứ nhất ăn xong bát phở. Đó là **sync** — mỗi bước chờ bước trước xong hẳn.
+
+  Quán lớn làm khác: thu ngân nhận tiền, viết phiếu, **ghim lên bảng** rồi quay sang khách tiếp theo. Bếp cứ nhìn bảng mà nấu dần. Giờ cao điểm phiếu dồn kín bảng, nhưng thu ngân **vẫn nhận khách đều tay**. Đó là **async** với một **hàng đợi** ở giữa.
+
+  Chỗ ví von bị "gãy": bảng ghim phiếu không làm bếp nấu nhanh hơn. Nếu 30 phút liền khách đến nhiều hơn sức bếp, phiếu cứ dồn và khách chờ món rất lâu. Hàng đợi **dời việc sang sau**, không làm việc biến mất.
+</Eli5>
+
+Hầu như mọi hệ thống lớn — đặt hàng, thanh toán, notification, news feed — đều có ít nhất một hàng đợi. Ở công việc thật, câu hỏi không phải "có dùng Kafka không" mà là **bước nào được phép chậm hơn người dùng**, và bạn trả giá gì cho sự tách rời đó. Ở vòng phỏng vấn, "thêm một queue" là câu nói quá dễ; người phỏng vấn sẽ hỏi tiếp: mất message thì sao, trùng thì sao, lag bao nhiêu thì chấp nhận được.
+
+<SyncVsAsyncLoadSpikeDiagram />
+
+<Technical>
+
+### Sync vs async — khác nhau ở chỗ "ai chờ ai"
+
+- **Sync (request/response):** caller gửi request và **giữ thread/connection** tới khi callee trả lời. Latency của caller = tổng latency chuỗi phía sau; lỗi của callee lan thẳng về caller.
+- **Async (message/event):** caller ghi một message vào **broker** (queue, topic) rồi đi tiếp. Consumer đọc và xử lý khi có sức. Caller chỉ phụ thuộc vào broker, không phụ thuộc vào consumer còn sống hay không.
+
+Chuỗi sync làm availability **nhân** với nhau. Giả định mỗi service đạt 99,9% và độc lập:
+
+```text
+Order API gọi sync Payment, Email, Analytics
+⇒ availability ≈ 0,999 × 0,999 × 0,999 ≈ 99,7%
+⇒ downtime/tháng: ~43,8 phút (1 service) → ~2,2 giờ (cả chuỗi)
+```
+
+### Ba lý do chính để dùng hàng đợi
+
+| Lý do | Nghĩa là | Ví dụ |
+|---|---|---|
+| **Buffer tải** (load leveling) | Hấp thụ spike, cho consumer xử lý ở tốc độ ổn định | Flash sale, cron gửi 1 triệu email |
+| **Tách service** (decoupling) | Producer không cần biết ai nghe, consumer mới thêm vào không sửa producer | OrderPlaced → Email, Analytics, Loyalty |
+| **Retry & chịu lỗi** | Consumer chết thì message vẫn nằm đó, chạy lại là xử lý tiếp | Email provider down 10 phút |
+
+Thêm một lý do hay bị quên: **chia việc nặng** (resize ảnh, transcode video) ra worker pool riêng để web server không bị chiếm CPU.
+
+### Ước lượng backlog — nói giả định trước
+
+Giả định: tải thường 200 đơn/s, flash sale 2.000 đơn/s trong 10 phút, email consumer xử lý tối đa cỡ 1.000 event/s (con số giả định — cần benchmark).
+
+```text
+Tốc độ dồn    = 2.000 − 1.000 = 1.000 event/s
+Backlog đỉnh  ≈ 1.000 × 600 s = 600.000 event
+Tốc độ rút    = 1.000 − 200   = 800 event/s (sau sale)
+Thời gian rút ≈ 600.000 / 800 ≈ 750 s ≈ 12,5 phút
+```
+
+Vậy email cuối đợt sale đến trễ cỡ 10–15 phút. Nếu business nói "email xác nhận phải tới trong 1 phút", bạn cần **tăng consumer** (và đủ partition — bài 3) chứ queue một mình không cứu được.
+
+### Khi nào **không** nên async
+
+- Người dùng **cần kết quả ngay** để đi tiếp: thanh toán thành công chưa, còn hàng không, đăng nhập đúng không.
+- Bạn cần **read-your-writes** tức thì: user vừa sửa profile mà trang reload vẫn hiện dữ liệu cũ vì consumer chưa chạy.
+- Hệ thống nhỏ, một team, tải thấp: thêm broker = thêm một thứ phải vận hành, giám sát, backup.
+
+### Cái giá của async
+
+- **Eventual consistency:** trong vài giây (hoặc vài phút khi lag) các service nhìn thấy trạng thái khác nhau.
+- **Khó debug hơn:** một luồng nghiệp vụ trải qua nhiều process; cần correlation id / tracing.
+- **Mất & trùng message** là bài toán thật (bài 4, 5).
+- **Vận hành:** retention, disk, consumer lag, DLQ, schema của message.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Gọi sync (HTTP/gRPC) | Đơn giản, có kết quả ngay, dễ debug | Latency cộng dồn, lỗi lan truyền, không chịu được spike | Caller cần kết quả để trả lời user; tải vừa phải |
+| Async qua queue/topic | Buffer spike, tách service, retry tự nhiên | Eventual consistency, lag, mất/trùng message, thêm hạ tầng | Việc chạy nền, fan-out cho nhiều service, tải không đều |
+| Sync + timeout/circuit breaker | Giữ mô hình đơn giản nhưng giảm lỗi lan | Vẫn không chịu spike, vẫn phụ thuộc callee | Dependency quan trọng buộc phải sync (SD11) |
+
+**Khi nào đổi ý:** nếu backlog thường xuyên vượt SLA mà không scale consumer được (bị giới hạn bởi DB phía sau), async chỉ đang che vấn đề capacity — hãy xem lại bottleneck thật.
+
+</Technical>
+
+## Thực hành
+
+Thêm Redpanda vào `sd-playground` (các module sau — search sync, saga — sẽ dùng lại service này):
+
+```yaml title="docker-compose.yml (thêm vào services)"
+  redpanda:
+    image: redpandadata/redpanda:latest   # dùng thật thì pin tag cụ thể
+    command:
+      - redpanda
+      - start
+      - --mode dev-container
+      - --smp 1
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"   # Kafka API cho script chạy trên host
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      retries: 10
+# nhớ khai báo `redpanda-data:` trong mục volumes ở cuối file
+```
+
+Service trong Compose (app, relay, worker) kết nối `redpanda:9092`; script chạy trên laptop dùng `localhost:19092`.
+
+<Terminal
+  commands={[
+    { comment: "Bật Redpanda", command: "docker compose up -d redpanda" },
+    { command: "docker compose exec redpanda rpk cluster health", output: "CLUSTER HEALTH OVERVIEW\n=======================\nHealthy:                          true\nUnhealthy reasons:                []\nControlling broker ID:            0\nAll nodes:                        [0]\nNodes down:                       []" },
+    { comment: "Tạo topic cho event đặt hàng", command: "docker compose exec redpanda rpk topic create orders -p 3", output: "TOPIC   STATUS\norders  OK" },
+    { comment: "Consumer 'bếp' đang nghỉ: bắn 5 phiếu vào bảng", command: "for i in 1 2 3 4 5; do echo \"order-$i\"; done | docker compose exec -T redpanda rpk topic produce orders -k user-1", output: "Produced to partition 1 at offset 0 with timestamp 1757923201114.\n...\nProduced to partition 1 at offset 4 with timestamp 1757923201119." },
+    { comment: "Bếp mở cửa: đọc với group email-svc — 5 phiếu vẫn nằm chờ", command: "docker compose exec redpanda rpk topic consume orders -g email-svc -n 5 -f '%p %o %k %v\\n'", output: "1 0 user-1 order-1\n1 1 user-1 order-2\n1 2 user-1 order-3\n1 3 user-1 order-4\n1 4 user-1 order-5" },
+    { comment: "Group đã đọc hết → LAG = 0", command: "docker compose exec redpanda rpk group describe email-svc", output: "GROUP        email-svc\nSTATE        Empty\nTOTAL-LAG    0\n\nTOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG\norders  1          5               5               0" },
+  ]}
+/>
+
+<Callout type="mistake" title="Async để 'cho nhanh' mà quên đo lag">
+  Chuyển email sang async, p99 của API đẹp hẳn — rồi không ai theo dõi **consumer lag**. Ba tuần sau consumer chết âm thầm, 2 triệu email nằm trong topic, và retention 7 ngày xoá mất phần cũ nhất. Async luôn đi kèm alert trên lag và trên tuổi của message cũ nhất chưa xử lý.
+</Callout>
+
+<Callout type="tip" title="Câu hỏi quyết định">
+  Với mỗi bước trong luồng, hỏi: "Nếu bước này chạy trễ 5 phút, user có phàn nàn không?" Không → ứng viên async. Có → giữ sync, bảo vệ bằng timeout và circuit breaker.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi thiết kế luồng ghi (đặt hàng, đăng bài, upload), người phỏng vấn thích nghe bạn **tách phần phải trả lời ngay khỏi phần chạy nền** và nói rõ lý do: buffer spike, fan-out, retry. Câu trả lời mạnh kèm theo con số backlog có giả định, nêu cái giá (eventual consistency, lag) và chủ động nói "tiếp theo ta cần xử lý mất/trùng message" thay vì đợi bị hỏi.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "sync / async", meaning: "Caller chờ callee trả lời / caller ghi message rồi đi tiếp, xử lý diễn ra sau." },
+    { term: "broker", meaning: "Hệ thống trung gian giữ message: RabbitMQ, SQS, Kafka, Redpanda…" },
+    { term: "producer / consumer", meaning: "Bên ghi message / bên đọc và xử lý message." },
+    { term: "load leveling", meaning: "Dùng hàng đợi hấp thụ spike để consumer chạy ở tốc độ ổn định." },
+    { term: "consumer lag", meaning: "Số message đã vào topic nhưng consumer group chưa xử lý (commit)." },
+    { term: "eventual consistency", meaning: "Các bên sẽ nhất quán sau một khoảng trễ, không phải ngay lập tức." },
+    { term: "decoupling", meaning: "Producer và consumer không cần biết nhau, không cần cùng lúc sống." },
+  ]}
+/>
+
+<QuickCheck
+  question="API đăng ký tài khoản đang gọi sync: tạo user trong DB → gửi email chào mừng → đồng bộ CRM. Email provider chập chờn làm đăng ký lỗi 5%. Thay đổi hợp lý nhất?"
+  options={[
+    "Tăng timeout gọi email provider lên 60 giây",
+    "Tạo user trong DB rồi phát event UserRegistered; email và CRM consume async",
+    "Gửi email trước, tạo user sau",
+    "Chuyển cả bước tạo user sang async",
+  ]}
+  answerIndex={1}
+  explanation="User cần biết tài khoản đã tạo (giữ sync), còn email chào mừng và CRM trễ vài giây không sao — ghim phiếu cho bếp làm sau. Provider chập chờn thì consumer retry, đăng ký không còn lỗi theo."
+/>

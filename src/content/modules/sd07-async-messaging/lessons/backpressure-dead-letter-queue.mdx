@@ -1,0 +1,157 @@
+import { PoisonMessageDeadLetterQueueDiagram } from "../diagrams/poison-message-dead-letter-queue-diagram";
+
+<Eli5 title="Bưu cục mùa Tết: kho đầy thì báo chậm lại, gói hỏng thì lên kệ thất lạc" emoji="📦">
+  Mùa Tết hàng về bưu cục nhiều hơn sức shipper giao. Bưu cục tốt không nhận vô tội vạ rồi để hàng chất ra đường: họ **báo các shop "tạm gửi chậm lại"**, gọi thêm shipper, và theo dõi **số gói tồn kho** mỗi giờ. Đó là **backpressure** — tín hiệu "tôi đang quá tải" truyền ngược về phía gửi.
+
+  Thỉnh thoảng có gói **ghi sai địa chỉ**. Nếu shipper cứ cố giao đi giao lại gói đó cả ngày, **mọi gói xếp sau trên tuyến bị kẹt**. Bưu cục khôn ngoan thử lại vài lần, rồi đặt gói lên **kệ hàng thất lạc** kèm ghi chú lý do, và tiếp tục giao phần còn lại. Kệ đó là **dead-letter queue (DLQ)**; gói hỏng là **poison message**.
+
+  Chỗ ví von bị "gãy": trong Kafka, "tuyến" là một partition — gói hỏng chỉ chặn đúng partition của nó, các partition khác vẫn chạy.
+</Eli5>
+
+Hàng đợi hấp thụ spike (bài 1), nhưng không có giới hạn thì spike biến thành backlog hàng triệu message, đĩa đầy, hoặc message hết retention trước khi được xử lý. Còn một message hỏng không được cách ly có thể làm một phần hệ thống ngừng hẳn trong khi mọi dashboard CPU/RAM vẫn xanh. Hai chủ đề này quyết định luồng async của bạn **vận hành được** hay chỉ **chạy được trên slide**.
+
+<PoisonMessageDeadLetterQueueDiagram />
+
+<Technical>
+
+### Backpressure: khi tốc độ vào lớn hơn tốc độ xử lý
+
+Gọi λ là tốc độ message đến, μ là tổng tốc độ xử lý của consumer. Nếu λ > μ kéo dài, backlog tăng tuyến tính: `lag(t) ≈ (λ − μ) × t`. Không có cấu hình nào sửa được phép tính này — chỉ có tăng μ, giảm λ, hoặc chấp nhận trễ/bỏ bớt.
+
+Tín hiệu cần theo dõi:
+
+- **Consumer lag** theo partition (`rpk group describe`, exporter Prometheus).
+- **Tuổi message cũ nhất chưa xử lý** — gắn thẳng với SLA ("email trong 5 phút") hơn là số message.
+- **Thời gian còn lại trước retention:** lag × thời gian mỗi message có tiến gần `retention.ms` không? Vượt qua là **mất dữ liệu âm thầm**.
+
+Consumer Kafka **pull** dữ liệu theo sức mình, nên broker không "đè chết" consumer — backpressure giữa broker và consumer là tự nhiên. Nhưng áp lực dồn về **broker (đĩa)** và về **SLA**, nên vẫn phải có chiến lược:
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Scale consumer ngang | Tăng μ trực tiếp | Bị chặn bởi số partition và bởi DB/API phía sau | Bottleneck là CPU của consumer |
+| Batch xử lý (`eachBatch`, bulk insert) | Throughput cao hơn nhiều cho ghi DB | Latency từng message tăng; retry theo batch phức tạp | Ghi DB/search index, analytics |
+| Tạm dừng consume (`pause`/`resume`) | Bảo vệ dependency đang yếu | Lag tăng trong lúc dừng | DB phía sau quá tải, circuit breaker mở |
+| Giới hạn phía producer (rate limit, 429/503 + Retry-After) | Chặn quá tải từ gốc | Người dùng/đối tác bị từ chối | Ingest API công khai, đối tác gửi dồn |
+| Load shedding / sampling | Hệ thống sống sót | Mất dữ liệu có chủ ý | Telemetry, event ưu tiên thấp |
+
+**Khi nào đổi ý:** nếu lag chỉ tăng trong vài đợt spike ngắn và rút kịp trong SLA, đừng vội autoscale phức tạp — một ngưỡng alert trên tuổi message là đủ. Nếu lag tăng đều mỗi ngày, đó là thiếu capacity, không phải spike.
+
+Ví dụ ước lượng (giả định): lag hiện 1,2 triệu message, λ = 400/s, mỗi consumer cỡ 300/s, 6 partition.
+
+```text
+6 consumer ⇒ μ ≈ 1.800/s ⇒ rút ≈ 1.400/s ⇒ 1,2M / 1.400 ≈ 860 s ≈ 14 phút
+Thêm consumer thứ 7 không giúp gì — chỉ có 6 partition
+```
+
+### Poison message: lỗi tạm thời vs lỗi vĩnh viễn
+
+- **Transient** (timeout DB, 503 từ provider, deadlock): **retry** với exponential backoff + jitter có thể thành công.
+- **Permanent** (JSON hỏng, sai schema, tham chiếu entity không tồn tại, bug logic): retry vô ích — càng retry càng kẹt.
+
+Consumer throw với KafkaJS ⇒ offset không được resolve, client retry rồi consumer có thể restart và **đọc lại đúng message đó** ⇒ vòng lặp vô hạn, partition kẹt.
+
+### Dead-letter queue
+
+Kafka/Redpanda **không có DLQ dựng sẵn cho consumer thường** — đó là pattern bạn tự làm (Kafka Connect có `errors.deadletterqueue.topic.name`; SQS có redrive policy với `maxReceiveCount`; RabbitMQ có dead-letter exchange).
+
+```ts title="src/workers/email-worker-with-dlq.ts"
+const MAX_ATTEMPTS = 3;
+
+await consumer.run({
+  eachMessage: async ({ topic, partition, message }) => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await handleOrderEvent(message); // idempotent (bài 4)
+        return; // KafkaJS resolve offset sau khi eachMessage kết thúc
+      } catch (error) {
+        const permanent = error instanceof SyntaxError || error instanceof ValidationError;
+        if (!permanent && attempt < MAX_ATTEMPTS) {
+          const backoffMs = 200 * 2 ** (attempt - 1) * (0.5 + Math.random()); // jitter
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          continue;
+        }
+        await producer.send({
+          topic: "orders.dlq",
+          messages: [{
+            key: message.key,
+            value: message.value,
+            headers: {
+              ...message.headers,
+              "dlq-error": String(error),
+              "dlq-source": `${topic}/${partition}/${message.offset}`,
+              "dlq-attempts": String(attempt),
+            },
+          }],
+        });
+        return; // chỉ bỏ qua message SAU KHI DLQ đã ack
+      }
+    }
+  },
+});
+```
+
+Nguyên tắc:
+
+- Gửi DLQ **thành công rồi** mới commit offset gốc; gửi DLQ lỗi ⇒ throw để thử lại, không nuốt lỗi.
+- Retry **tại chỗ** phải ngắn (tổng vài giây) — backoff dài giữ partition đứng yên và có thể vượt `session timeout` gây rebalance.
+- Retry dài (phút, giờ) dùng **retry topic** riêng (`orders.retry.1m`, …) — nhưng message đã rời partition gốc nên **mất thứ tự theo key**. Nếu thứ tự quan trọng, cân nhắc dừng cả key đó hoặc chuyển thẳng DLQ.
+- **Alert** khi DLQ có message mới; DLQ không ai nhìn là thùng rác.
+- **Replay** sau khi sửa: đọc `orders.dlq` và publish lại vào `orders`; consumer idempotent nên an toàn.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Retry vô hạn tại chỗ | Giữ thứ tự tuyệt đối, không mất | Một message hỏng chặn cả partition | Gần như không bao giờ; chỉ khi thứ tự quan trọng hơn availability |
+| Retry có hạn + DLQ | Cách ly message xấu, partition chạy tiếp | Message trong DLQ bị trễ và ra khỏi thứ tự | Mặc định cho hầu hết consumer |
+| Retry topic nhiều tầng + DLQ | Chịu được lỗi tạm thời kéo dài mà không chặn partition | Phức tạp, mất thứ tự theo key | Dependency ngoài hay chập chờn (email, SMS, webhook đối tác) |
+| Bỏ qua + log | Đơn giản | Mất dữ liệu âm thầm | Event không quan trọng, có nguồn khác bù |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo topic DLQ", command: "docker compose exec redpanda rpk topic create orders.dlq -p 1", output: "TOPIC       STATUS\norders.dlq  OK" },
+    { comment: "Bắn một poison message (không phải JSON)", command: "echo 'not-json' | docker compose exec -T redpanda rpk topic produce orders -k user-7", output: "Produced to partition 1 at offset 208 with timestamp 1757926002433." },
+    { comment: "Worker cũ: lag partition 1 tăng mãi, các partition khác vẫn 0", command: "docker compose exec redpanda rpk group describe email-svc", output: "GROUP        email-svc\nSTATE        Stable\nTOTAL-LAG    1843\n\nTOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG\norders  0          412             412             0\norders  1          208             2051            1843\norders  2          398             398             0" },
+    { comment: "Deploy worker có DLQ, rồi xem message trong kệ thất lạc", command: "docker compose exec redpanda rpk topic consume orders.dlq -n 1 -f '%k %v | %h{%k=%v }\\n'", output: "user-7 not-json | dlq-error=SyntaxError: Unexpected token 'o', \"not-json\" is not valid JSON dlq-source=orders/1/208 dlq-attempts=1" },
+    { comment: "Partition 1 chạy tiếp, lag rút về 0", command: "docker compose exec redpanda rpk group describe email-svc", output: "GROUP        email-svc\nSTATE        Stable\nTOTAL-LAG    0\n\nTOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG\norders  0          412             412             0\norders  1          2051            2051            0\norders  2          398             398             0" },
+    { comment: "Tạo backlog để đo: dừng worker, bắn tải, bật lại và đo thời gian rút lag", command: "docker compose stop email-worker && docker compose run --rm k6 run /scripts/orders-burst.js && docker compose up -d --scale email-worker=3 email-worker" },
+  ]}
+/>
+
+<Callout type="mistake" title="Commit offset rồi mới gửi DLQ (hoặc nuốt lỗi gửi DLQ)">
+  Nếu gửi sang `orders.dlq` thất bại mà offset gốc đã commit, message hỏng biến mất khỏi cả topic gốc lẫn DLQ — đúng loại mất dữ liệu bạn dựng DLQ để tránh. Thứ tự đúng: DLQ ack ⇒ rồi mới bỏ qua message gốc.
+</Callout>
+
+<Callout type="warning" title="Lag vượt retention = mất dữ liệu không báo lỗi">
+  Topic giữ 7 ngày, consumer chết từ thứ Sáu, thứ Sáu tuần sau mới phát hiện: phần cũ nhất đã bị xoá khỏi log, consumer bật lại sẽ nhảy tới offset sớm nhất còn tồn tại (tuỳ `auto.offset.reset`). Alert trên **tuổi message chưa xử lý**, đặt ngưỡng xa trước retention.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Sau khi vẽ queue, câu hỏi tiếp theo thường là "consumer không theo kịp thì sao?" và "một message làm consumer crash thì sao?". Câu trả lời mạnh: theo dõi **consumer lag + tuổi message**, scale consumer tới **số partition**, batch hoặc pause khi dependency yếu, giới hạn ở producer khi cần; phân loại lỗi **transient vs permanent**, retry có backoff + jitter, **DLQ** kèm metadata, alert và quy trình **replay** dựa trên consumer idempotent.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "backpressure", meaning: "Tín hiệu quá tải truyền ngược về phía gửi để giảm tốc hoặc từ chối bớt." },
+    { term: "poison message", meaning: "Message làm consumer lỗi mỗi lần xử lý, có thể chặn cả partition." },
+    { term: "dead-letter queue (DLQ)", meaning: "Nơi cách ly message xử lý thất bại để điều tra và replay sau." },
+    { term: "transient / permanent error", meaning: "Lỗi có thể tự hết khi thử lại / lỗi thử bao nhiêu lần cũng vậy." },
+    { term: "exponential backoff + jitter", meaning: "Thời gian chờ giữa các lần retry tăng dần, cộng ngẫu nhiên để tránh dồn cục." },
+    { term: "retry topic", meaning: "Topic trung gian để retry trễ mà không chặn partition gốc (đổi lại mất thứ tự)." },
+    { term: "load shedding", meaning: "Chủ động bỏ bớt việc ưu tiên thấp để hệ thống không sập." },
+  ]}
+/>
+
+<QuickCheck
+  question="Consumer gọi webhook của đối tác; đối tác down 2 giờ. Consumer đang retry tại chỗ vô hạn nên các event của những đối tác khác cùng partition cũng bị treo. Thiết kế nào hợp lý hơn?"
+  options={[
+    "Tăng MAX_ATTEMPTS lên 10.000",
+    "Commit offset trước khi gọi webhook",
+    "Thêm consumer vào group để các event khác được xử lý",
+    "Retry ngắn tại chỗ, sau đó chuyển message sang retry topic có độ trễ (rồi DLQ nếu vẫn lỗi), chấp nhận mất thứ tự cho các event bị chuyển",
+  ]}
+  answerIndex={3}
+  explanation="Shipper không nên đứng chờ trước một nhà vắng chủ cả buổi làm kẹt cả tuyến: thử vài lần rồi đưa gói vào kho chờ giao lại, cuối cùng lên kệ thất lạc. Thêm consumer không giúp vì partition đó vẫn chỉ một consumer; commit trước thì mất event."
+/>

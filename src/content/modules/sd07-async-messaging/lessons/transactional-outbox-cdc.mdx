@@ -1,0 +1,161 @@
+import { TransactionalOutboxRelayDiagram } from "../diagrams/transactional-outbox-relay-diagram";
+
+<Eli5 title="Transactional outbox giống viết phiếu order bằng giấy than" emoji="🧾">
+  Nhà hàng cần hai việc khi khách gọi món: **ghi vào sổ bán hàng** và **báo xuống bếp**. Nếu nhân viên ghi sổ xong rồi mới chạy xuống bếp, lỡ bị gọi đi giữa đường thì sổ có món mà bếp không biết — khách chờ mãi.
+
+  Cách khôn hơn: viết order bằng **giấy than**. Một lần viết ra hai liên: liên trắng vào **sổ bán hàng**, liên hồng thả vào **hộp "phiếu chờ gửi bếp"** ngay cạnh sổ. Không thể có liên này mà thiếu liên kia. Đó là **outbox**: ghi đơn và ghi event trong **cùng một transaction**.
+
+  Một **người chạy bàn** (relay) cứ vài giây mở hộp, mang phiếu xuống bếp rồi đóng dấu "đã gửi". Nếu anh ấy ngã sau khi đưa phiếu mà chưa kịp đóng dấu, người thay ca sẽ mang phiếu đó xuống **lần nữa** — nên bếp phải nhận ra **số phiếu trùng**. Còn **CDC** giống gắn camera đọc thẳng cuốn sổ bán hàng, khỏi cần hộp phiếu và người chạy bàn.
+</Eli5>
+
+Đây là lỗi thiết kế phổ biến nhất trong hệ thống event-driven: code "ghi DB rồi publish" chạy ổn hàng tháng, cho tới ngày deploy/OOM/network blip làm **mất event** — đơn đã trừ tiền mà kho không bao giờ biết. Transactional outbox là lời giải chuẩn, và các module sau (đồng bộ search ở SD08, saga ở SD12) đều dựng trên chính bảng `outbox` và relay trong bài này.
+
+<TransactionalOutboxRelayDiagram />
+
+<Technical>
+
+### Dual-write problem
+
+```ts
+await db.query("INSERT INTO orders ...");   // ① Postgres commit
+await producer.send(orderPlacedEvent);        // ② Redpanda
+```
+
+Postgres và Redpanda **không chung transaction** (không có 2PC giữa chúng). Crash giữa ① và ② ⇒ đơn có, event mất. Đảo thứ tự ⇒ event có, đơn rollback ⇒ event "ma". Retry `send` không cứu được trường hợp process chết hẳn.
+
+### Bảng outbox (dùng chung cho các module sau)
+
+```sql title="sql/outbox.sql"
+CREATE TABLE outbox (
+  id           bigserial   PRIMARY KEY,         -- dùng làm event-id ổn định
+  aggregate_id text        NOT NULL,            -- vd order id; dùng làm Kafka key
+  type         text        NOT NULL,            -- vd 'OrderPlaced'
+  payload      jsonb       NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  published_at timestamptz                      -- NULL = chưa gửi
+);
+
+-- partial index: relay chỉ quét phần chưa gửi, bảng lớn dần vẫn nhanh
+CREATE INDEX outbox_unpublished_idx ON outbox (id) WHERE published_at IS NULL;
+```
+
+Ghi đơn và event **trong cùng một transaction**:
+
+```sql
+BEGIN;
+INSERT INTO orders (id, user_id, total) VALUES ('1001', 'user-42', 350000);
+INSERT INTO outbox (aggregate_id, type, payload)
+VALUES ('1001', 'OrderPlaced', '{"orderId":"1001","userId":"user-42","total":350000}');
+COMMIT;
+```
+
+### Relay kiểu polling
+
+```ts title="src/relay/outbox-relay.ts"
+async function publishBatch(): Promise<number> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT id, aggregate_id, type, payload FROM outbox
+       WHERE published_at IS NULL ORDER BY id LIMIT 100
+       FOR UPDATE SKIP LOCKED`,
+    );
+    if (rows.length > 0) {
+      await producer.send({
+        topic: "orders",
+        messages: rows.map((row) => ({
+          key: row.aggregate_id,
+          value: JSON.stringify(row.payload),
+          headers: { "event-id": String(row.id), "event-type": row.type },
+        })),
+      });
+      await client.query("UPDATE outbox SET published_at = now() WHERE id = ANY($1)", [rows.map((row) => row.id)]);
+    }
+    await client.query("COMMIT");
+    return rows.length;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+// vòng lặp: publishBatch(); nếu trả về 0 thì chờ ~500 ms rồi poll tiếp
+```
+
+Những điểm phải nói rõ:
+
+- **At-least-once:** crash sau `send` và trước `COMMIT` ⇒ gửi lại. Consumer **bắt buộc** idempotent theo `event-id` (bài 4).
+- **Đừng poll kiểu `WHERE id > last_id`:** `bigserial` cấp id lúc INSERT, nhưng transaction id nhỏ có thể **commit sau** transaction id lớn ⇒ bỏ sót. Lọc `published_at IS NULL` thì không sót.
+- **Thứ tự:** một relay + `ORDER BY id` + key = `aggregate_id` giữ thứ tự theo aggregate trong đa số trường hợp. Nhiều relay song song với `SKIP LOCKED` tăng throughput nhưng có thể đảo thứ tự hai event của cùng một đơn — consumer nên kiểm tra version nếu thứ tự quan trọng.
+- **Dọn bảng:** xoá dòng đã publish sau N ngày (`DELETE ... WHERE published_at < now() - interval '7 days'`, hoặc partition bảng theo ngày).
+- **Latency:** chu kỳ poll quyết định độ trễ event (cỡ 100 ms–1 s). Có thể dùng `LISTEN/NOTIFY` để đánh thức relay sớm, nhưng vẫn giữ polling làm lưới an toàn.
+
+### Change Data Capture (CDC)
+
+Thay vì relay tự poll, một công cụ CDC như **Debezium** đọc **WAL** của Postgres qua logical replication (`wal_level=logical`, replication slot) và phát mỗi thay đổi thành event:
+
+- **CDC trên bảng outbox** (Debezium có *Outbox Event Router*): vẫn giữ outbox làm hợp đồng event rõ ràng, nhưng bỏ polling — độ trễ thấp, ít tải query.
+- **CDC trên bảng nghiệp vụ** (`orders`): không cần sửa code ghi, nhưng event lộ **schema nội bộ** của DB ra ngoài; đổi cột là vỡ consumer.
+- Chi phí: vận hành Kafka Connect/Debezium, theo dõi **replication slot** (slot bị treo giữ WAL lại ⇒ đĩa Postgres đầy).
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Dual write (DB rồi publish) | Đơn giản nhất | Mất event hoặc event "ma" khi crash | Chỉ khi mất event chấp nhận được (hiếm) |
+| Outbox + relay polling | Chỉ cần Postgres + code nhỏ; dễ hiểu, dễ debug | Latency theo chu kỳ poll; query liên tục; phải dọn bảng | Mặc định cho team nhỏ/vừa, throughput vừa phải |
+| Outbox + CDC (Debezium) | Latency thấp, không poll; hợp đồng event vẫn rõ | Thêm Kafka Connect, replication slot phải giám sát | Throughput cao, nhiều service dùng outbox, đã có nền tảng Kafka |
+| CDC trực tiếp bảng nghiệp vụ | Không sửa code ghi; bắt được cả thay đổi ngoài app | Lộ schema nội bộ; event thiếu ngữ nghĩa nghiệp vụ | Đồng bộ dữ liệu sang search/warehouse (SD08), hệ thống legacy |
+
+**Khi nào đổi ý:** nếu relay polling bắt đầu gây tải đáng kể cho primary hoặc độ trễ event vượt yêu cầu, chuyển relay sang CDC mà **không đổi bảng outbox** — consumer không phải biết.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo bảng outbox (file sql mount vào container postgres)", command: "docker compose exec postgres psql -U app -d app -f /sql/outbox.sql", output: "CREATE TABLE\nCREATE INDEX" },
+    { comment: "Bắn 1.000 đơn qua Nginx", command: "for i in $(seq 1 1000); do curl -s -o /dev/null -X POST localhost:8080/orders -H 'content-type: application/json' -d \"{\\\"userId\\\":\\\"user-$((i % 50))\\\",\\\"total\\\":100000}\"; done" },
+    { comment: "Trong lúc đang bắn: giết relay rồi bật lại", command: "docker compose kill relay && sleep 5 && docker compose up -d relay" },
+    { comment: "Không còn dòng nào chưa publish", command: "docker compose exec postgres psql -U app -d app -c \"SELECT count(*) AS pending FROM outbox WHERE published_at IS NULL;\"", output: " pending\n---------\n       0\n(1 row)" },
+    { comment: "Số message trên topic ≥ số đơn — phần dư là bản gửi lại do relay crash", command: "docker compose exec redpanda rpk topic describe orders -p", output: "PARTITION  LEADER  EPOCH  REPLICAS  LOG-START-OFFSET  HIGH-WATERMARK\n0          0       1      [0]       0                 341\n1          0       1      [0]       0                 329\n2          0       1      [0]       0                 367" },
+    { comment: "Nhưng event-id distinct đúng bằng 1.000 (1037 = tổng HIGH-WATERMARK; cần jq trên máy)", command: "docker compose exec -T redpanda rpk topic consume orders -o start -n 1037 | jq -r '.headers[] | select(.key == \"event-id\") | .value' | sort -u | wc -l", output: "    1000" },
+  ]}
+/>
+
+<Callout type="mistake" title="Publish Kafka bên trong transaction DB và nghĩ vậy là 'atomic'">
+  Gọi `producer.send()` giữa `BEGIN` và `COMMIT` của transaction nghiệp vụ không làm hai hệ thống nguyên tử: send thành công rồi COMMIT lỗi ⇒ event "ma"; còn transaction bị giữ mở trong lúc chờ broker làm tăng lock và cạn connection pool. Chỉ INSERT vào outbox trong transaction; gửi broker là việc của relay.
+</Callout>
+
+<Callout type="warning" title="Replication slot bị bỏ quên">
+  Khi dùng CDC, nếu connector dừng mà slot vẫn còn, Postgres **giữ lại WAL** để chờ nó — đĩa primary đầy dần và database có thể ngừng ghi. Alert trên dung lượng WAL giữ lại bởi slot, và xoá slot khi gỡ connector.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi thiết kế có "ghi DB rồi bắn event", người phỏng vấn gần như chắc chắn hỏi "nếu service chết giữa hai bước?". Câu trả lời mạnh: gọi tên **dual-write problem**, đề xuất **transactional outbox** (event ghi cùng transaction), relay polling hoặc **CDC (Debezium đọc WAL)**, nói rõ outbox là **at-least-once** nên consumer phải idempotent theo event-id, và nêu cách giữ thứ tự theo aggregate.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "dual-write problem", meaning: "Ghi hai hệ thống không chung transaction; crash giữa chừng làm chúng lệch nhau." },
+    { term: "transactional outbox", meaning: "Ghi event vào bảng outbox trong cùng transaction với dữ liệu nghiệp vụ." },
+    { term: "relay", meaning: "Tiến trình đọc outbox chưa publish, gửi lên broker rồi đánh dấu published_at." },
+    { term: "FOR UPDATE SKIP LOCKED", meaning: "Khoá các dòng đang lấy, bỏ qua dòng đã bị relay khác khoá." },
+    { term: "CDC", meaning: "Change Data Capture: bắt thay đổi từ log của database và phát thành event." },
+    { term: "WAL / replication slot", meaning: "Nhật ký ghi của Postgres / điểm đánh dấu giữ WAL cho một consumer CDC." },
+    { term: "Debezium", meaning: "Nền tảng CDC mã nguồn mở, chạy trên Kafka Connect, có Outbox Event Router." },
+  ]}
+/>
+
+<QuickCheck
+  question="Relay poll outbox bằng `WHERE id > $lastPublishedId ORDER BY id`. Thỉnh thoảng có event không bao giờ được gửi dù dòng outbox tồn tại. Nguyên nhân khả dĩ nhất?"
+  options={[
+    "Transaction có id nhỏ commit muộn hơn transaction id lớn, relay đã vượt qua id đó trước khi nó commit",
+    "Redpanda từ chối message có key trùng",
+    "bigserial bị reset sau mỗi lần restart Postgres",
+    "SKIP LOCKED xoá dòng khỏi bảng",
+  ]}
+  answerIndex={0}
+  explanation="Số phiếu được cấp lúc bắt đầu viết, nhưng phiếu số 41 có thể thả vào hộp sau phiếu 42. Người chạy bàn chỉ nhớ 'đã mang tới số 42' sẽ bỏ sót phiếu 41. Lọc theo published_at IS NULL (dấu 'đã gửi' trên từng phiếu) thì không sót."
+/>

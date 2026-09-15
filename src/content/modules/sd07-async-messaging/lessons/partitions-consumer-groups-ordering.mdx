@@ -1,0 +1,155 @@
+import { PartitionConsumerGroupRebalanceDiagram } from "../diagrams/partition-consumer-group-rebalance-diagram";
+
+<Eli5 title="Partition giống các quầy thu ngân chia theo số thẻ thành viên" emoji="🛒">
+  Siêu thị có 3 **quầy thu ngân** (partition). Quy định: khách xếp vào quầy theo **số cuối thẻ thành viên** (key). Nhờ vậy mọi hoá đơn của **cùng một gia đình** luôn đi qua **cùng một quầy**, đúng thứ tự trước sau.
+
+  Mỗi **nhân viên** (consumer) trông một hoặc vài quầy. Thêm nhân viên thì quản lý **chia lại quầy** (rebalance) — trong vài giây đổi ca, quầy đang bàn giao tạm ngừng tính tiền. Có 3 quầy mà gọi tới 4 nhân viên thì **một người đứng chơi**.
+
+  Chỗ ví von bị "gãy": giữa hai quầy khác nhau không có thứ tự chung — khách quầy 1 có thể thanh toán xong trước khách quầy 2 dù đến sau. Kafka cũng vậy.
+</Eli5>
+
+Partition là "núm vặn" quan trọng nhất khi thiết kế với Kafka/Redpanda: nó quyết định **thứ tự**, **mức song song** và **cách scale**. Chọn key sai thì hoặc mất thứ tự nghiệp vụ (Paid xử lý trước Created), hoặc dồn hết tải vào một partition nóng. Và số partition rất khó giảm về sau — gần như là quyết định một chiều.
+
+<PartitionConsumerGroupRebalanceDiagram />
+
+<Technical>
+
+### Key → partition
+
+Producer chọn partition cho mỗi message:
+
+- **Có key:** `partition = hash(key) % số_partition` (Java client và KafkaJS v2 mặc định dùng murmur2). Cùng key ⇒ cùng partition.
+- **Không key:** client rải đều (round-robin / sticky theo batch) ⇒ không có thứ tự giữa các message liên quan.
+
+**Thứ tự chỉ được đảm bảo trong một partition**, không phải trên toàn topic. Muốn các event của một đơn đúng thứ tự thì key = `order_id`; của một user thì key = `user_id`.
+
+```ts title="src/messaging/publish-order-event.ts"
+import { Kafka } from "kafkajs";
+
+const kafka = new Kafka({ clientId: "order-api", brokers: ["redpanda:9092"] });
+const producer = kafka.producer();
+
+export async function publishOrderEvent(orderId: string, type: string, payload: object) {
+  await producer.send({
+    topic: "orders",
+    acks: -1, // chờ tất cả replica in-sync xác nhận
+    messages: [{ key: orderId, value: JSON.stringify({ type, ...payload }) }],
+  });
+}
+
+// gọi `await producer.connect()` một lần lúc app khởi động
+```
+
+### Consumer group & giới hạn song song
+
+- Trong một group, **mỗi partition được giao cho tối đa 1 consumer**. Một consumer có thể giữ nhiều partition.
+- ⇒ **Số consumer làm việc thật ≤ số partition.** 12 partition thì consumer thứ 13 idle.
+- Các group khác nhau đọc độc lập, không chia partition với nhau.
+
+```ts title="src/workers/email-worker.ts"
+import { Kafka } from "kafkajs";
+
+const kafka = new Kafka({ clientId: "email-worker", brokers: ["redpanda:9092"] });
+const consumer = kafka.consumer({ groupId: "email-svc" });
+
+async function main() {
+  await consumer.connect();
+  await consumer.subscribe({ topics: ["orders"], fromBeginning: true });
+  await consumer.run({
+    eachMessage: async ({ partition, message }) => {
+      console.log(`p=${partition} offset=${message.offset} key=${message.key?.toString()}`);
+      // tuần tự trong một partition; các partition khác chạy song song
+    },
+  });
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+```
+
+### Rebalance
+
+Khi consumer **join/leave**, hoặc bị coi là chết (không heartbeat trong `session.timeout`, hoặc xử lý lâu quá `max.poll.interval.ms` với Java client), **group coordinator** chia lại partition.
+
+- Protocol *eager* cũ: mọi consumer **thả hết** partition rồi nhận lại → cả group dừng một nhịp.
+- *Cooperative/incremental* rebalancing chỉ chuyển những partition cần chuyển; Kafka bản mới còn có protocol consumer group thế hệ mới (KIP-848) giảm gián đoạn hơn — kiểm tra client và broker bạn dùng có hỗ trợ không.
+- Partition bị chuyển có thể **xử lý lại** các message sau offset commit cuối → một nguồn trùng lặp nữa (bài 4).
+
+### Chọn số partition — nói giả định
+
+Giả định: peak 3.000 event/s; một consumer xử lý cỡ 250 event/s (bị giới hạn bởi lời gọi DB/API phía sau — cần benchmark thật).
+
+```text
+Consumer cần    = 3.000 / 250 = 12
+Headroom ~1,5×  ⇒ ~18 → chọn 18–24 partition
+```
+
+Đừng chọn 1.000 partition "cho chắc": mỗi partition tốn file handle, bộ nhớ, thời gian leader election và làm rebalance chậm hơn.
+
+### Những bẫy thường gặp
+
+- **Thêm partition làm đổi mapping** `hash(key) % N`: key cũ có thể nhảy sang partition mới ⇒ trong giai đoạn chuyển, event mới của một key có thể được xử lý trước event cũ còn nằm ở partition cũ.
+- **Hot partition:** key lệch (một seller chiếm 40% đơn) ⇒ một partition quá tải, consumer của nó lag trong khi các consumer khác rảnh. Cách xử lý: key chi tiết hơn (`seller_id:order_id` nếu chỉ cần thứ tự theo đơn), hoặc tách seller lớn ra topic riêng.
+- **Xử lý song song bên trong một partition** (vd `Promise.all` cả batch) phá thứ tự mà partition đã giữ cho bạn.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Key = entity id (`order_id`) | Đúng thứ tự theo entity; tải thường khá đều | Không có thứ tự giữa các entity | Event vòng đời của đơn, tài khoản, thiết bị |
+| Key = tenant/user id | Thứ tự theo cả tenant | Dễ hot partition khi tenant lệch tải | Cần thứ tự mọi thao tác của một user (số dư, chat 1-1) |
+| Không key | Tải đều nhất, throughput tốt | Không có thứ tự | Log/metric độc lập, event không liên quan nhau |
+| 1 partition | Thứ tự toàn cục | Chỉ 1 consumer làm việc; không scale | Tải rất thấp và thật sự cần thứ tự toàn cục |
+
+**Khi nào đổi ý:** nếu thấy mình cần thứ tự toàn cục ở throughput cao, hãy xem lại yêu cầu — thường chỉ cần thứ tự theo entity, cộng với version/sequence trong payload để consumer bỏ qua event cũ.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Làm lại topic cho sạch (chỉ trong playground!)", command: "docker compose exec redpanda rpk topic delete orders && docker compose exec redpanda rpk topic create orders -p 3", output: "TOPIC   STATUS\norders  OK\nTOPIC   STATUS\norders  OK" },
+    { comment: "Produce cho 2 key; mỗi dòng stdin là một message", command: "printf 'created\\npaid\\nshipped\\n' | docker compose exec -T redpanda rpk topic produce orders -k order-1001", output: "Produced to partition 2 at offset 0 with timestamp 1757924410021.\nProduced to partition 2 at offset 1 with timestamp 1757924410022.\nProduced to partition 2 at offset 2 with timestamp 1757924410022." },
+    { command: "printf 'created\\npaid\\n' | docker compose exec -T redpanda rpk topic produce orders -k order-1002", output: "Produced to partition 0 at offset 0 with timestamp 1757924415310.\nProduced to partition 0 at offset 1 with timestamp 1757924415311." },
+    { comment: "Cùng key luôn cùng partition, đúng thứ tự offset", command: "docker compose exec redpanda rpk topic consume orders -o start -n 5 -f '%p %o %k %v\\n'", output: "0 0 order-1002 created\n0 1 order-1002 paid\n2 0 order-1001 created\n2 1 order-1001 paid\n2 2 order-1001 shipped" },
+    { comment: "Chạy 2 worker (mỗi lệnh ở một terminal riêng)", command: "docker compose exec app npx tsx src/workers/email-worker.ts" },
+    { comment: "Xem partition nào thuộc member nào", command: "docker compose exec redpanda rpk group describe email-svc", output: "GROUP        email-svc\nSTATE        Stable\nBALANCER     RoundRobinAssigner\nMEMBERS      2\nTOTAL-LAG    0\n\nTOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  MEMBER-ID\norders  0          2               2               0    email-worker-3f9c…\norders  1          0               0               0    email-worker-b21a…\norders  2          3               3               0    email-worker-3f9c…" },
+    { comment: "Số partition hiện tại (chỉ tăng được, không giảm)", command: "docker compose exec redpanda rpk topic describe orders -p", output: "PARTITION  LEADER  EPOCH  REPLICAS  LOG-START-OFFSET  HIGH-WATERMARK\n0          0       1      [0]       0                 2\n1          0       1      [0]       0                 0\n2          0       1      [0]       0                 3" },
+  ]}
+/>
+
+<Callout type="mistake" title="Scale consumer lên 20 pod mà topic chỉ có 6 partition">
+  HPA tăng pod theo CPU, lag không giảm, 14 pod ngồi không mà vẫn tốn tiền. Parallelism của consumer group bị chặn bởi **số partition**. Tính số partition từ throughput mục tiêu ngay khi tạo topic, và đặt `maxReplicas` của autoscaler không vượt số partition.
+</Callout>
+
+<Callout type="tip" title="KafkaJS trong bài này">
+  Ví dụ dùng `kafkajs` vì phổ biến và dễ đọc. Thư viện này ít được cập nhật trong thời gian gần đây; cho production hãy so sánh thêm các client khác (vd client JavaScript chính thức của Confluent) và kiểm tra tài liệu mới nhất.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi kinh điển: "Làm sao đảm bảo thứ tự event?" Câu trả lời mạnh: thứ tự chỉ có **trong partition**, nên chọn **partition key** theo entity cần thứ tự; parallelism tối đa = số partition; nêu rủi ro hot partition và việc thêm partition làm đổi mapping key. Điểm cộng: consumer vẫn nên kiểm tra version/sequence để chịu được event trùng hoặc đến muộn.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "partition", meaning: "Một log con của topic; đơn vị thứ tự và đơn vị song song." },
+    { term: "partition key", meaning: "Giá trị được hash để chọn partition; cùng key ⇒ cùng partition." },
+    { term: "group coordinator", meaning: "Broker quản lý thành viên và phân partition cho một consumer group." },
+    { term: "rebalance", meaning: "Chia lại partition khi consumer vào/ra hoặc bị coi là chết." },
+    { term: "hot partition", meaning: "Partition nhận tải lệch lớn do phân bố key không đều." },
+    { term: "acks=all (-1)", meaning: "Producer chờ mọi replica in-sync xác nhận trước khi coi là ghi thành công." },
+  ]}
+/>
+
+<QuickCheck
+  question="Topic payments có 4 partition, key = user_id. Bạn tăng lên 8 partition để scale. Rủi ro nào cần xử lý?"
+  options={[
+    "Toàn bộ message cũ bị xoá khi thêm partition",
+    "Nhiều user_id sẽ được hash sang partition khác, nên event mới của một user có thể được xử lý trước event cũ còn tồn ở partition cũ",
+    "Consumer group phải đổi tên",
+    "Không có rủi ro vì Kafka tự di chuyển message cũ sang partition mới",
+  ]}
+  answerIndex={1}
+  explanation="Siêu thị mở thêm quầy và đổi luật chia theo số thẻ: một gia đình có thể bị chuyển sang quầy mới trong khi hoá đơn cũ vẫn đang xếp ở quầy cũ. Kafka không di chuyển message cũ; cần drain trước khi đổi, hoặc consumer kiểm tra sequence/version."
+/>

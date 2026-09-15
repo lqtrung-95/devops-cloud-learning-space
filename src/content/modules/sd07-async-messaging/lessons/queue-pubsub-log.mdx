@@ -1,0 +1,121 @@
+import { MessagingModelsComparisonDiagram } from "../diagrams/messaging-models-comparison-diagram";
+
+<Eli5 title="Thùng thư, loa phường và cuốn sổ nhật ký ở sảnh chung cư" emoji="🏢">
+  **Queue** giống **thùng thư của tổ giao hàng**: mỗi lá thư chỉ một shipper lấy đi giao. Có 3 shipper thì họ chia nhau, lá nào đã lấy thì không còn trong thùng.
+
+  **Pub/sub** giống **loa phường**: phát một lần, nhà nào đang nghe cũng nhận được thông báo. Nhưng loa kiểu cũ không ghi âm lại — ai đi vắng là **lỡ** (một số dịch vụ pub/sub hiện đại thì có "hộp thư" giữ lại cho từng người đăng ký).
+
+  **Log** giống **cuốn sổ nhật ký dán ở sảnh chung cư**: ai có tin gì thì **ghi thêm một dòng ở cuối**, không ai xoá dòng cũ. Mỗi hộ tự kẹp **thẻ đánh dấu** đã đọc tới dòng số mấy. Hộ nào đi du lịch về thì đọc tiếp từ chỗ thẻ — thậm chí lật lại đọc từ đầu tháng. Sổ chỉ được xé bớt trang cũ theo quy định (retention).
+</Eli5>
+
+Chọn sai mô hình là lỗi thiết kế tốn kém: dùng Redis Pub/Sub cho event thanh toán thì consumer restart là mất event; dùng queue cổ điển cho event mà 5 service cần nghe thì phải nhân 5 queue và producer phải biết hết. Trong phỏng vấn, câu "dùng Kafka" chỉ có giá trị khi bạn giải thích được **vì sao log** chứ không phải queue.
+
+<MessagingModelsComparisonDiagram />
+
+<Technical>
+
+### Message queue (point-to-point)
+
+- Mỗi message được giao cho **một** consumer trong nhóm worker (**competing consumers**).
+- Consumer **ack** → broker xoá message. Không ack trong thời gian quy định → giao lại cho người khác (SQS gọi là *visibility timeout*, RabbitMQ requeue khi channel đóng mà chưa ack).
+- Không đọc lại được message đã ack. Thứ tự thường **không** được bảo đảm khi có nhiều consumer (SQS FIFO có thứ tự theo *message group id*, đổi lại giới hạn throughput — kiểm tra tài liệu mới nhất).
+- Hợp với: **task/job** — "resize ảnh này", "gửi email này" — việc cần làm đúng một lần bởi ai đó.
+
+### Pub/sub (fan-out)
+
+- Publisher gửi vào **topic**; mỗi **subscription** nhận một bản.
+- Độ bền **tuỳ sản phẩm**: Redis Pub/Sub là fire-and-forget (subscriber offline là mất); SNS đẩy tới endpoint và hay được ghép **SNS → nhiều SQS** để mỗi service có hàng đợi bền riêng; Google Cloud Pub/Sub giữ message cho từng subscription.
+- Hợp với: **event** — "đơn đã được đặt" — nhiều service độc lập cùng quan tâm.
+
+### Log (Kafka, Redpanda, Kinesis)
+
+Topic là một (hoặc nhiều) **append-only log** nằm trên đĩa:
+
+```text
+topic orders, partition 0
+offset:   0      1      2      3      4
+        [m1]  [m2]  [m3]  [m4]  [m5]   ← producer luôn ghi vào cuối
+               ▲                  ▲
+   group analytics ở offset 1     group email-svc ở offset 4
+```
+
+- Đọc **không xoá** message. Mỗi **consumer group** lưu **offset** của riêng mình (Kafka lưu trong topic nội bộ `__consumer_offsets`).
+- **Trong một group:** partition được chia cho các consumer → hành xử như queue.
+- **Giữa các group:** mỗi group đọc đủ → hành xử như pub/sub.
+- **Retention** theo thời gian hoặc dung lượng (`retention.ms`, `retention.bytes`; mặc định thường cỡ 7 ngày — kiểm tra cấu hình cluster của bạn). **Log compaction** (`cleanup.policy=compact`) giữ bản mới nhất cho mỗi key — hữu ích cho event dạng "trạng thái hiện tại".
+- **Replay:** reset offset của group về thời điểm cũ để xử lý lại (sửa bug, dựng lại read model, thêm service mới đọc từ đầu).
+- Consumer **pull** (tự kéo theo sức mình) — tạo backpressure tự nhiên (bài 6).
+
+### Ước lượng dung lượng log — nói giả định
+
+Giả định: 5 triệu đơn/ngày, mỗi đơn sinh 3 event, mỗi event ~1 KB, retention 7 ngày, replication factor 3.
+
+```text
+Event/ngày   = 5M × 3            = 15M event
+Dữ liệu/ngày ≈ 15M × 1 KB        ≈ 15 GB
+Retention    ≈ 15 GB × 7         ≈ 105 GB
+× RF 3       ≈ 315 GB đĩa (chưa tính nén, index, headroom ~30–50%)
+Throughput TB ≈ 15M / 10⁵ s      ≈ 150 event/s; peak giả định 3× ≈ 450 event/s
+```
+
+### Bảng trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Queue (RabbitMQ, SQS) | Đơn giản; ack/retry từng message; routing linh hoạt (RabbitMQ); SQS gần như không phải vận hành | Không replay; fan-out phải thêm queue; thứ tự yếu | Job/task cho worker pool; mỗi việc do một nơi xử lý |
+| Pub/sub (SNS, Redis Pub/Sub, Cloud Pub/Sub) | Fan-out dễ, publisher không biết subscriber | Độ bền khác nhau rất xa giữa sản phẩm; Redis Pub/Sub mất message khi offline | Notification realtime chấp nhận mất (Redis), hoặc fan-out sang queue bền (SNS → SQS) |
+| Log (Kafka, Redpanda, Kinesis) | Replay; nhiều group đọc độc lập; thứ tự theo partition; throughput cao | Vận hành phức tạp hơn; parallelism bị giới hạn bởi số partition; retry từng message khó hơn queue | Event stream cho nhiều service, event sourcing, CDC, analytics, cần đọc lại |
+
+**Khi nào đổi ý:** nếu bạn chỉ có một loại job, một consumer, không cần replay — một queue managed (SQS) rẻ và đơn giản hơn nhiều so với tự vận hành Kafka. Ngược lại, khi thấy mình tạo queue thứ ba cho cùng một event, đó là tín hiệu nên chuyển sang log.
+
+</Technical>
+
+## Thực hành
+
+Chứng minh "log không xoá khi đọc" và "mỗi group có offset riêng":
+
+<Terminal
+  commands={[
+    { comment: "Group email-svc đọc 3 message đầu", command: "docker compose exec redpanda rpk topic consume orders -g email-svc-demo -o start -n 3 -f '%p %o %v\\n'", output: "1 0 order-1\n1 1 order-2\n1 2 order-3" },
+    { comment: "Group analytics đọc lại TỪ ĐẦU — message vẫn còn", command: "docker compose exec redpanda rpk topic consume orders -g analytics-demo -o start -n 5 -f '%p %o %v\\n'", output: "1 0 order-1\n1 1 order-2\n1 2 order-3\n1 3 order-4\n1 4 order-5" },
+    { comment: "Hai group, hai offset khác nhau", command: "docker compose exec redpanda rpk group list", output: "BROKER  GROUP           STATE\n0       analytics-demo  Empty\n0       email-svc       Empty\n0       email-svc-demo  Empty" },
+    { comment: "Replay: đưa offset của email-svc-demo về đầu topic", command: "docker compose exec redpanda rpk group seek email-svc-demo --to start", output: "TOPIC   PARTITION  PRIOR-OFFSET  CURRENT-OFFSET\norders  1          3             0" },
+    { comment: "Xem retention của topic", command: "docker compose exec redpanda rpk topic describe orders -c | grep retention", output: "retention.bytes                      -1         DEFAULT_CONFIG\nretention.ms                         604800000  DEFAULT_CONFIG" },
+  ]}
+/>
+
+<Callout type="mistake" title="Dùng Redis Pub/Sub như một message broker bền">
+  Redis Pub/Sub không lưu message: consumer deploy lại 20 giây là 20 giây event biến mất, không log, không lỗi. Cần bền thì dùng **Redis Streams** (có consumer group, pending list), một queue, hoặc log.
+</Callout>
+
+<Callout type="warning" title="Replay là con dao hai lưỡi">
+  Replay topic `orders` cho group `email-svc` nghĩa là **gửi lại toàn bộ email** — trừ khi consumer idempotent (bài 4). Trước khi `rpk group seek`, luôn hỏi: side effect của consumer này có chạy lại an toàn không?
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi nêu "đặt một topic Kafka ở đây", hãy nói luôn: event gì, **key** gì, **bao nhiêu consumer group** đọc, retention bao lâu và vì sao cần log (fan-out + replay) thay vì queue. Người phỏng vấn đánh giá cao ứng viên biết SQS/RabbitMQ đủ tốt cho job queue đơn giản và không "Kafka hoá" mọi thứ.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "competing consumers", meaning: "Nhiều worker cùng đọc một queue, mỗi message chỉ một worker xử lý." },
+    { term: "ack", meaning: "Consumer báo broker đã xử lý xong; với queue thì message bị xoá." },
+    { term: "topic / subscription", meaning: "Kênh để publish / một đường nhận riêng của subscriber." },
+    { term: "append-only log", meaning: "Chuỗi bản ghi chỉ ghi thêm vào cuối, đọc theo offset." },
+    { term: "offset", meaning: "Vị trí của message trong một partition; group lưu offset đã xử lý." },
+    { term: "consumer group", meaning: "Tập consumer chia nhau partition; mỗi group có offset riêng." },
+    { term: "retention / compaction", meaning: "Xoá dữ liệu cũ theo thời gian/dung lượng / chỉ giữ bản mới nhất mỗi key." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team muốn thêm service Fraud Detection đọc lại toàn bộ event thanh toán 3 ngày qua để train rule mới, trong khi service Ledger vẫn chạy bình thường. Mô hình nào làm việc này dễ nhất?"
+  options={[
+    "Queue: tạo queue mới rồi yêu cầu Payment gửi lại",
+    "Redis Pub/Sub: subscribe channel payments",
+    "Log (Kafka/Redpanda) với retention đủ dài: tạo group fraud mới đọc từ offset 3 ngày trước",
+    "Gọi API của Ledger để lấy lịch sử",
+  ]}
+  answerIndex={2}
+  explanation="Cuốn sổ ở sảnh vẫn giữ các trang cũ: hộ mới dọn đến chỉ cần kẹp thẻ đánh dấu ở trang 3 ngày trước mà đọc, không làm phiền thẻ của Ledger. Queue đã xoá message sau ack, Redis Pub/Sub không giữ gì."
+/>

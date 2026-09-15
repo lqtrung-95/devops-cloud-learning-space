@@ -1,0 +1,158 @@
+import { CommitStrategyCrashPointDiagram } from "../diagrams/commit-strategy-crash-point-diagram";
+
+<Eli5 title="Shipper gạch sổ trước hay sau khi giao hàng?" emoji="🛵">
+  Shipper cầm danh sách đơn. Cách 1: **gạch sổ trước** rồi mới đi giao. Nếu ngã xe giữa đường, hôm sau nhìn sổ thấy "đã gạch" → **đơn bị bỏ quên**. Đó là **at-most-once**: tối đa một lần, có thể mất.
+
+  Cách 2: **giao xong mới gạch**. Nếu điện thoại hết pin đúng lúc vừa giao mà chưa kịp gạch → hôm sau **giao lại lần nữa**. Đó là **at-least-once**: không mất, nhưng có thể trùng.
+
+  Không có cách gạch sổ nào tránh được cả hai, vì "giao hàng" và "gạch sổ" là **hai việc ở hai nơi**. Lời giải thực tế: vẫn **giao xong mới gạch**, nhưng nhờ **lễ tân toà nhà giữ danh sách mã vận đơn đã nhận**. Đơn trùng mã thì lễ tân từ chối. Mã vận đơn đó chính là **idempotency key**.
+</Eli5>
+
+Mọi hệ thống có message queue sớm muộn đều gặp email gửi hai lần, tiền cộng hai lần, hoặc đơn "biến mất". Nguyên nhân không phải broker kém mà là **crash có thể xảy ra giữa bất kỳ hai dòng code nào**. Đây là chủ đề người phỏng vấn dùng để phân biệt người "đã đọc về Kafka" với người đã vận hành nó.
+
+<CommitStrategyCrashPointDiagram />
+
+<Technical>
+
+### Ba mức delivery semantics
+
+| Mức | Cách làm | Crash thì | Ví dụ hợp lý |
+|---|---|---|---|
+| **At-most-once** | Commit offset / ack **trước** khi xử lý | Có thể **mất** | Metric, log debug, vị trí GPS mỗi giây |
+| **At-least-once** | Xử lý xong **rồi** commit | Có thể **trùng** | Mặc định cho hầu hết nghiệp vụ |
+| **Exactly-once** (hiệu ứng) | At-least-once **+ idempotency** | Không mất, không có hiệu ứng trùng | Thanh toán, số dư, email xác nhận |
+
+"Exactly-once delivery" qua mạng không bảo đảm được một cách tổng quát; cái làm được là **exactly-once effect** (hay *effectively-once*): message có thể đến nhiều lần nhưng **tác động chỉ xảy ra một lần**.
+
+### Trùng lặp đến từ đâu?
+
+1. **Producer retry:** broker đã ghi nhưng ack bị mất trên mạng → producer gửi lại.
+2. **Consumer crash** sau khi xử lý, trước khi commit offset.
+3. **Rebalance:** partition chuyển sang consumer khác, đọc lại từ offset commit cuối.
+4. **Outbox relay crash** (bài 5), **replay** thủ công, hoặc producer phía trên tự gửi trùng.
+
+### "Exactly-once" của Kafka thực chất là gì
+
+- **Idempotent producer:** mỗi producer có *producer id* + *sequence number* theo partition; broker bỏ bản retry trùng. Từ Kafka 3.0 Java client bật mặc định (`enable.idempotence=true`, `acks=all`).
+- **Transactions:** ghi vào nhiều partition **và** commit offset của consumer trong **một transaction**; consumer đọc với `isolation.level=read_committed` chỉ thấy dữ liệu đã commit.
+- ⇒ Exactly-once cho luồng **đọc từ Kafka → xử lý → ghi lại Kafka** (Kafka Streams: `processing.guarantee=exactly_once_v2`).
+- **Không** bao gồm side effect **ngoài Kafka**: gửi email, gọi API thanh toán, ghi Postgres. Crash sau khi gọi API và trước khi transaction commit ⇒ gọi lại. Những chỗ đó vẫn cần idempotency.
+
+Redpanda cũng hỗ trợ idempotent producer và transactions qua Kafka API — kiểm tra tài liệu phiên bản bạn dùng.
+
+### Idempotent consumer: bảng dedup trong cùng transaction
+
+Nếu side effect nằm trong **cùng database** với bảng dedup, bạn đạt exactly-once effect thật sự:
+
+```sql title="sql/idempotent-consumer.sql"
+CREATE TABLE processed_messages (
+  consumer     text        NOT NULL,
+  message_id   text        NOT NULL,   -- event-id từ header, KHÔNG dùng offset
+  processed_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (consumer, message_id)
+);
+
+CREATE TABLE emails_sent (
+  order_id text PRIMARY KEY,
+  sent_at  timestamptz NOT NULL DEFAULT now()
+);
+```
+
+```ts title="src/workers/email-worker-idempotent.ts"
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    const eventId = message.headers?.["event-id"]?.toString() ?? `${topic}-${partition}-${message.offset}`;
+    const { orderId } = JSON.parse(message.value!.toString());
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const inserted = await client.query(
+        "INSERT INTO processed_messages (consumer, message_id) VALUES ('email-svc', $1) ON CONFLICT DO NOTHING",
+        [eventId],
+      );
+      if (inserted.rowCount === 1) {
+        await client.query("INSERT INTO emails_sent (order_id) VALUES ($1)", [orderId]);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error; // không commit offset → message sẽ được đọc lại
+    } finally {
+      client.release();
+    }
+    await consumer.commitOffsets([{ topic, partition, offset: (BigInt(message.offset) + 1n).toString() }]);
+  },
+});
+```
+
+Lưu ý: offset commit là **offset tiếp theo cần đọc** (offset + 1). Dùng offset làm id chỉ là phương án dự phòng — cùng một event được produce hai lần sẽ có hai offset khác nhau.
+
+### Khi side effect nằm ngoài database
+
+Gửi email/SMS thật, gọi cổng thanh toán: không thể gói chung transaction. Lựa chọn:
+
+- **Idempotency key ở phía nhận:** gửi kèm key (vd header `Idempotency-Key` — cách Stripe API làm); bên nhận tự bỏ request trùng trong một khoảng thời gian.
+- **Ghi ý định trước, đối soát sau:** lưu `pending` → gọi API → cập nhật `sent`; job đối soát xử lý các bản ghi `pending` quá lâu bằng cách hỏi lại bên nhận.
+- **Chấp nhận trùng hiếm** khi hậu quả nhỏ (email marketing) — nhưng nói rõ đó là quyết định có chủ ý.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| At-most-once | Đơn giản, không trùng, nhanh | Mất message khi crash | Dữ liệu mất vài bản không sao (metric, telemetry) |
+| At-least-once, không dedup | Không mất, dễ làm | Side effect trùng | Thao tác tự nhiên idempotent (`SET status='paid'`, upsert theo id) |
+| At-least-once + dedup table | Exactly-once effect khi cùng DB | Thêm write mỗi message; bảng dedup cần dọn theo TTL | Ghi DB nghiệp vụ, cộng điểm, trừ kho |
+| Kafka transactions (EOS) | Exactly-once cho read-process-write trong Kafka | Chỉ trong Kafka; thêm latency và độ phức tạp | Stream processing Kafka → Kafka |
+
+**Khi nào đổi ý:** nếu throughput cực cao và bảng dedup trở thành bottleneck, hãy thiết kế lại để thao tác **tự nhiên idempotent** (upsert theo khoá tự nhiên, cập nhật có điều kiện theo version) thay vì ghi thêm một bảng.
+
+</Technical>
+
+## Thực hành
+
+Tái hiện email trùng rồi sửa (lab 3):
+
+<Terminal
+  commands={[
+    { comment: "Worker phiên bản lỗi: crash sau khi ghi email, trước khi commit offset", command: "docker compose exec -e CRASH_AFTER_SEND=1 app npx tsx src/workers/email-worker-naive.ts", output: "email-svc: sent order 1001 (p=2 offset=0)\ncrash simulated before commitOffsets" },
+    { comment: "Chạy lại bình thường — message được đọc lại từ offset cũ", command: "docker compose exec app npx tsx src/workers/email-worker-naive.ts", output: "email-svc: sent order 1001 (p=2 offset=0)" },
+    { comment: "Đếm email trùng", command: "docker compose exec postgres psql -U app -d app -c \"SELECT order_id, count(*) FROM emails_sent_naive GROUP BY 1 HAVING count(*) > 1;\"", output: " order_id | count\n----------+-------\n 1001     |     2\n(1 row)" },
+    { comment: "Phiên bản idempotent: crash (exit 1) rồi chạy lại — dùng ; vì lệnh đầu thoát lỗi", command: "docker compose exec -e CRASH_AFTER_SEND=1 app npx tsx src/workers/email-worker-idempotent.ts; docker compose exec app npx tsx src/workers/email-worker-idempotent.ts", output: "email-svc: sent order 1001 (event 42)\ncrash simulated before commitOffsets\nemail-svc: event 42 already processed, skip" },
+    { command: "docker compose exec postgres psql -U app -d app -c \"SELECT count(*) FROM emails_sent WHERE order_id = '1001';\"", output: " count\n-------\n     1\n(1 row)" },
+  ]}
+/>
+
+<Callout type="mistake" title="Tin rằng bật 'exactly-once' là xong">
+  Bật `enable.idempotence` và transactions rồi bỏ dedup ở consumer gọi API bên ngoài. Kafka chỉ bảo đảm trong phạm vi Kafka; lễ tân toà nhà (idempotency key) vẫn là người duy nhất chặn được shipper giao lần hai.
+</Callout>
+
+<Callout type="warning" title="Dedup theo offset hoặc theo payload">
+  Offset thay đổi khi cùng event được produce lại (relay retry, replay sang topic khác). Hash payload thì hai đơn hợp lệ giống hệt nhau bị coi là trùng. Hãy sinh **event-id ổn định tại nguồn** (vd `outbox.id` hoặc UUID) và mang theo trong header.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi được hỏi "làm sao không gửi trùng thông báo/không trừ tiền hai lần", câu trả lời mạnh: dùng **at-least-once** (commit sau khi xử lý) + **idempotent consumer** (event-id + unique constraint trong cùng transaction), giải thích vì sao "exactly-once" của Kafka không bao trùm side effect bên ngoài, và nêu idempotency key cho API thanh toán. Nói rõ nguồn trùng: producer retry, consumer crash, rebalance.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "at-most-once", meaning: "Commit trước khi xử lý: không trùng nhưng có thể mất." },
+    { term: "at-least-once", meaning: "Xử lý rồi mới commit: không mất nhưng có thể trùng." },
+    { term: "exactly-once effect", meaning: "Message có thể đến nhiều lần nhưng tác động chỉ xảy ra một lần." },
+    { term: "idempotent producer", meaning: "Broker dùng producer id + sequence để bỏ bản retry trùng." },
+    { term: "Kafka transactions", meaning: "Ghi nhiều partition + commit offset nguyên tử; đọc bằng read_committed." },
+    { term: "idempotency key", meaning: "Id ổn định của một thao tác để bên nhận nhận ra và bỏ bản trùng." },
+    { term: "dedup table", meaning: "Bảng lưu id đã xử lý, có unique constraint, ghi cùng transaction với side effect." },
+  ]}
+/>
+
+<QuickCheck
+  question="Consumer cộng điểm thưởng: `UPDATE users SET points = points + 10 WHERE id = $1` rồi commit offset. Rebalance xảy ra ngay sau UPDATE, trước commit. Cách sửa tốt nhất?"
+  options={[
+    "Chuyển sang commit offset trước khi UPDATE",
+    "Tăng session timeout để không bao giờ rebalance",
+    "Ghi event-id vào bảng dedup có unique constraint trong cùng transaction với UPDATE, bỏ qua nếu đã tồn tại",
+    "Dùng Kafka transactions cho producer",
+  ]}
+  answerIndex={2}
+  explanation="Shipper sẽ giao lại khi chưa kịp gạch sổ — chuyện đó không tránh được. Lễ tân (bảng dedup cùng transaction) nhận ra mã vận đơn cũ nên điểm chỉ cộng một lần. Commit trước thì chuyển sang nguy cơ mất điểm; Kafka transactions không bao trùm Postgres."
+/>
