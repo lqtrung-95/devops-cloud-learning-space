@@ -1,0 +1,160 @@
+import { BtreeIndexLookupDiagram } from "../diagrams/btree-index-lookup-diagram";
+import { LsmTreeWriteReadPathDiagram } from "../diagrams/lsm-tree-write-read-path-diagram";
+
+<Eli5 title="Index giống danh bạ điện thoại, LSM giống sổ nháp của quầy thu ngân" emoji="📇">
+
+Tìm số điện thoại của "Nguyễn Văn An" trong một chồng giấy lộn xộn thì phải lật từng tờ. **Danh bạ** sắp theo họ rồi tên: mở giữa cuốn, thấy chữ "L" thì lật về trước, vài lần là tới đúng trang. Đó là **B-tree index**. Cái giá: mỗi khi có người mới, phải chen đúng chỗ trong danh bạ — đôi khi trang đầy thì phải tách trang.
+
+Quầy thu ngân đông khách thì làm khác: ghi vội mọi giao dịch vào **sổ nháp** (nhanh, chỉ viết nối đuôi). Hết trang thì xé ra, sắp xếp lại rồi cất vào **hộp**. Cuối ngày gộp các hộp thành một tập gọn, bỏ các dòng đã bị sửa. Đó là **LSM-tree**: ghi cực nhanh, nhưng muốn tìm một giao dịch có khi phải lục vài hộp, và việc gộp hộp tốn công.
+
+Chỗ ví von hụt: database không "xé trang" theo nghĩa đen — B-tree chia *page* 8KB, còn LSM ghi *file* bất biến và không bao giờ sửa file cũ.
+
+</Eli5>
+
+Query chậm ở production phần lớn là do **thiếu index đúng** hoặc **có index sai thứ tự cột**. Ngược lại, đội nào "thêm index cho chắc" sẽ thấy ghi chậm dần. Hiểu index là hiểu trade-off đọc ↔ ghi — và biết vì sao Cassandra/RocksDB chịu ghi tốt còn Postgres/MySQL (InnoDB) mặc định dùng B-tree.
+
+<BtreeIndexLookupDiagram />
+
+<Technical>
+
+### Không có index: Seq Scan
+
+Database đọc tuần tự mọi page của bảng rồi lọc — chi phí tỉ lệ với **kích thước bảng**, không phải với số dòng trả về. Với bảng vài triệu dòng, một query trả 20 dòng vẫn đọc hàng chục nghìn page.
+
+### B-tree
+
+- Cây cân bằng gồm các **page** (PostgreSQL: 8KB). Mỗi page chứa hàng trăm khoá ⇒ fanout lớn ⇒ cây vài triệu tới vài trăm triệu dòng thường chỉ sâu cỡ 3–4 tầng. Tìm một khoá = đọc cỡ 3–4 page.
+- Leaf chứa khoá đã sắp xếp + con trỏ tới dòng (PostgreSQL gọi là TID), và nối với leaf kế bên ⇒ **range scan** và `ORDER BY` theo khoá gần như miễn phí.
+- Ghi: tìm đúng leaf, chèn vào; page đầy thì **page split**. Mọi thay đổi cũng được ghi vào WAL. Đây là cấu trúc **cập nhật tại chỗ** (in-place).
+- `CREATE INDEX` trong PostgreSQL mặc định là B-tree. Hash, GIN (cho `jsonb`, full-text), GiST, BRIN phục vụ các nhu cầu khác.
+
+### Composite index & quy tắc leftmost prefix
+
+Index `(customer_id, created_at)` sắp theo `customer_id` trước, trong cùng `customer_id` mới sắp theo `created_at` — như danh bạ sắp theo họ rồi tên.
+
+| Query | Dùng index hiệu quả? |
+|---|---|
+| `WHERE customer_id = 42` | ✅ đúng cột đầu |
+| `WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 20` | ✅ nhảy tới khách 42, đọc 20 entry đã sắp — không cần Sort |
+| `WHERE customer_id = 42 AND created_at >= '2026-09-01'` | ✅ bằng trước, range sau |
+| `WHERE created_at >= '2026-09-01'` | ❌ thiếu cột đầu (như tìm theo *tên* trong danh bạ sắp theo *họ*) |
+
+Quy tắc ngón tay cái: **cột so sánh bằng đứng trước, cột range/sort đứng sau**. (PostgreSQL 18 bổ sung *skip scan* cho B-tree nhiều cột trong một số trường hợp; playground dùng PostgreSQL 17 nên chưa có — đừng dựa vào nó khi thiết kế.)
+
+### Covering index & Index Only Scan
+
+Nếu mọi cột query cần đều nằm trong index, PostgreSQL có thể trả kết quả **không cần đọc heap**:
+
+```sql
+CREATE INDEX idx_orders_customer_cover
+  ON orders (customer_id, created_at DESC) INCLUDE (id, total_cents);
+```
+
+Điều kiện kèm theo: visibility map phải đánh dấu page là "all-visible" (nhờ `VACUUM`), nếu không plan vẫn hiện `Heap Fetches` lớn hơn 0.
+
+### Chi phí của index
+
+- Mỗi `INSERT` phải thêm entry vào **mọi** index của bảng; mỗi `UPDATE` cột có index cũng vậy (và làm mất tối ưu HOT update của PostgreSQL).
+- Index chiếm disk và RAM (shared buffers), sinh thêm WAL ⇒ replica phải replay nhiều hơn.
+- Tìm index thừa: `SELECT indexrelname, idx_scan FROM pg_stat_user_indexes WHERE idx_scan = 0;` (thống kê tính từ lần reset gần nhất — xem đủ lâu trước khi xoá).
+
+</Technical>
+
+<LsmTreeWriteReadPathDiagram />
+
+<Technical title="LSM-tree và ba loại amplification">
+
+### Đường ghi và đường đọc
+
+1. **Ghi**: append vào WAL/commit log (tuần tự) → chèn vào **memtable** (cấu trúc đã sắp trong RAM) → trả lời client.
+2. **Flush**: memtable đầy → ghi thành **SSTable** bất biến, key đã sắp.
+3. **Compaction** chạy nền: merge nhiều SSTable, giữ bản mới nhất, bỏ bản cũ và **tombstone** (xoá cũng là một lần ghi dấu xoá).
+4. **Đọc**: memtable → các SSTable từ mới tới cũ; **bloom filter** cho biết "chắc chắn không có" để bỏ qua file.
+
+Dùng trong: RocksDB, LevelDB, Cassandra, ScyllaDB, HBase; nhiều hệ khác nhúng RocksDB làm storage engine.
+
+### Amplification — cách so sánh công bằng
+
+| Loại | Nghĩa | B-tree | LSM-tree |
+|---|---|---|---|
+| Write amplification | Byte thực ghi xuống disk / byte app ghi | Ghi cả page + WAL cho thay đổi nhỏ | Compaction ghi lại cùng dữ liệu nhiều lần |
+| Read amplification | Số chỗ phải đọc cho một lookup | Thấp, ổn định (~chiều cao cây) | Có thể phải xem nhiều SSTable; bloom filter giảm bớt |
+| Space amplification | Dung lượng thực / dữ liệu sống | Page không đầy, bloat cần `VACUUM` | Bản cũ + tombstone tồn tại tới khi compaction |
+
+Không có con số "LSM ghi nhanh gấp N lần": nó phụ thuộc chiến lược compaction (leveled ưu tiên đọc/space, size-tiered ưu tiên ghi), phần cứng và tỉ lệ đọc/ghi — **cần benchmark với workload của bạn**.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Không index | Ghi rẻ nhất, không tốn disk | Mỗi query quét cả bảng | Bảng nhỏ, hoặc query chỉ chạy batch hiếm |
+| B-tree index | Đọc point/range nhanh, latency ổn định | Mỗi index làm chậm ghi, tốn disk/WAL | Mặc định cho OLTP: lọc, join, sort theo cột |
+| Composite / covering index | Một index phục vụ đúng query nóng, có thể bỏ đọc heap | Index to hơn, chỉ hợp vài query; sai thứ tự cột là vô dụng | Query chạy rất nhiều với hình dạng cố định |
+| Storage LSM (Cassandra, RocksDB) | Ghi tuần tự, throughput ghi cao, nén tốt | Read/space amp, compaction ăn CPU/IO, p99 đọc dao động | Ghi áp đảo đọc: event, metric, log |
+
+**Khi nào đổi ý:** khi `EXPLAIN` cho thấy index không được dùng (sai thứ tự cột, selectivity thấp), hoặc khi lượng ghi tăng tới mức index/WAL trở thành nút cổ chai.
+
+</Technical>
+
+## Thực hành
+
+Trong session psql của playground (`docker compose exec postgres psql -U app -d app`):
+
+<Terminal
+  title="psql — app"
+  prompt="app=#"
+  commands={[
+    { command: "\\timing on", output: "Timing is on." },
+    { command: "CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, customer_id int NOT NULL, status text NOT NULL, total_cents int NOT NULL, created_at timestamptz NOT NULL);", output: "CREATE TABLE" },
+    { comment: "5 triệu dòng, ~100.000 khách ⇒ trung bình ~50 đơn/khách", command: "INSERT INTO orders (customer_id, status, total_cents, created_at) SELECT (random() * 99999)::int + 1, (ARRAY['pending','paid','shipped','cancelled'])[floor(random() * 4)::int + 1], (random() * 500000)::int, now() - random() * interval '365 days' FROM generate_series(1, 5000000);", output: "INSERT 0 5000000" },
+    { command: "ANALYZE orders;", output: "ANALYZE" },
+    { comment: "COSTS OFF cho plan gọn; số thời gian trên máy bạn sẽ khác", command: "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) SELECT id, total_cents, created_at FROM orders WHERE customer_id = 4242 ORDER BY created_at DESC LIMIT 20;", output: " Limit (actual time=180.2..184.9 rows=20 loops=1)\n   Buffers: shared hit=40010\n   ->  Gather Merge (actual time=180.2..184.9 rows=20 loops=1)\n         Workers Planned: 2\n         Workers Launched: 2\n         ->  Sort (actual time=176.4..176.4 rows=17 loops=3)\n               Sort Key: created_at DESC\n               ->  Parallel Seq Scan on orders (actual time=1.1..176.1 rows=17 loops=3)\n                     Filter: (customer_id = 4242)\n                     Rows Removed by Filter: 1666650\n Execution Time: 185.0 ms" },
+    { command: "CREATE INDEX CONCURRENTLY idx_orders_customer_created ON orders (customer_id, created_at DESC);", output: "CREATE INDEX" },
+    { command: "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) SELECT id, total_cents, created_at FROM orders WHERE customer_id = 4242 ORDER BY created_at DESC LIMIT 20;", output: " Limit (actual time=0.05..0.12 rows=20 loops=1)\n   Buffers: shared hit=4 read=20\n   ->  Index Scan using idx_orders_customer_created on orders (actual time=0.05..0.11 rows=20 loops=1)\n         Index Cond: (customer_id = 4242)\n         Buffers: shared hit=4 read=20\n Execution Time: 0.2 ms" },
+    { comment: "Kích thước bảng và index", command: "SELECT pg_size_pretty(pg_relation_size('orders')) AS heap, pg_size_pretty(pg_relation_size('idx_orders_customer_created')) AS idx;" },
+  ]}
+/>
+
+Đọc plan: trước index là `Parallel Seq Scan` + `Rows Removed by Filter` khổng lồ và cỡ 40.000 buffer; sau index chỉ cỡ 20–30 buffer (vài page index + khoảng 20 page heap vì 20 dòng nằm rải rác) và không còn node `Sort`. Muốn thấy chi phí ghi, làm tiếp phần đo INSERT trong lab.
+
+<Callout type="mistake">
+
+**Tạo index `(created_at, customer_id)` cho query lọc `customer_id = ?`** — sai thứ tự cột, planner vẫn chọn Seq Scan hoặc quét index rất dài. Và **tạo index trên production bằng `CREATE INDEX` thường**: lệnh này chặn ghi vào bảng tới khi xong. Dùng `CREATE INDEX CONCURRENTLY` (chậm hơn, không chạy được trong transaction block, nếu lỗi sẽ để lại index `INVALID` cần xoá).
+
+</Callout>
+
+<Callout type="tip" title="Đọc plan nhanh">
+
+Nhìn 4 thứ: loại node (`Seq Scan`, `Index Scan`, `Index Only Scan`, `Bitmap Heap Scan`), `rows` ước lượng vs thực tế (lệch nhiều ⇒ thống kê cũ, chạy `ANALYZE`), `Rows Removed by Filter`, và `Buffers`. Dán plan vào explain.dalibo.com để xem dạng cây.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi thiết kế data model, hãy tự nói index đi kèm từng access pattern: "query timeline dùng composite index `(user_id, created_at DESC)`". Nếu được hỏi "sao không dùng Cassandra cho write-heavy?", câu trả lời mạnh nhắc LSM vs B-tree, ba loại amplification và nói rõ **ngưỡng** — ước lượng lượng ghi trước, vì Postgres chịu được nhiều hơn người ta nghĩ.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Seq Scan", meaning: "Đọc tuần tự toàn bộ bảng rồi lọc; chi phí theo kích thước bảng." },
+    { term: "B-tree", meaning: "Cây cân bằng các page đã sắp xếp; tìm point/range với vài lần đọc page." },
+    { term: "composite index", meaning: "Index nhiều cột, sắp theo cột đầu rồi mới tới cột sau (leftmost prefix)." },
+    { term: "covering index / Index Only Scan", meaning: "Index chứa đủ cột query cần nên có thể không phải đọc bảng." },
+    { term: "LSM-tree", meaning: "Ghi vào memtable + WAL, flush thành SSTable bất biến, compaction gộp nền." },
+    { term: "SSTable / tombstone", meaning: "File key đã sắp, không sửa được / bản ghi đánh dấu một key đã bị xoá." },
+    { term: "write / read / space amplification", meaning: "Ghi thừa, đọc thừa, chiếm chỗ thừa so với dữ liệu thật — thước đo để so storage engine." },
+  ]}
+/>
+
+<QuickCheck
+  question="Query `SELECT email FROM users WHERE country = 'VN' AND signup_date >= '2026-01-01'` chạy rất nhiều. Index nào hợp lý nhất?"
+  options={[
+    "`(signup_date, country)`",
+    "`(email)`",
+    "`(country, signup_date) INCLUDE (email)`",
+    "Hai index riêng `(country)` và `(email)`",
+  ]}
+  answerIndex={2}
+  explanation="Như danh bạ: cột so sánh bằng `country` đứng trước, cột range `signup_date` đứng sau; `INCLUDE (email)` để có thể Index Only Scan, không phải mở 'cuốn sổ gốc' (heap)."
+/>

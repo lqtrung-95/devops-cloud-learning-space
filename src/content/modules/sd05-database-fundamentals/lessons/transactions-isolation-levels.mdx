@@ -1,0 +1,181 @@
+import { IsolationAnomalyTimelineDiagram } from "../diagrams/isolation-anomaly-timeline-diagram";
+
+<Eli5 title="Isolation level giống cách nhân viên kho nhìn số lượng hàng" emoji="📸">
+
+Kho có hai nhân viên cùng xử lý đơn. **Transaction** là một phiếu công việc "làm trọn hoặc không làm gì": lấy hàng, trừ tồn kho, ghi sổ — hỏng giữa chừng thì trả lại mọi thứ như cũ.
+
+Vấn đề là hai người làm **cùng lúc**. Mức cách ly thấp giống **nhìn bảng tồn kho dán ở cửa** mỗi lần đi ngang: lần nào cũng thấy bản mới nhất người khác vừa dán (**READ COMMITTED**). Mức cao hơn giống **chụp một tấm ảnh bảng tồn kho lúc bắt đầu ca** rồi chỉ nhìn ảnh (**REPEATABLE READ** — snapshot). Cao nhất là có **trọng tài** kiểm tra: "kết quả cuối có giống như hai người làm lần lượt không?" — nếu không, bắt một người làm lại (**SERIALIZABLE**).
+
+Chỗ ví von hụt: tấm ảnh không ngăn hai người *cùng quyết định dựa trên ảnh cũ* rồi làm hỏng luật chung — đó chính là write skew, thứ chỉ trọng tài mới bắt được.
+
+</Eli5>
+
+Bug concurrency hiếm khi lộ ra lúc test với một user; nó xuất hiện ở production dưới tải, dưới dạng "số dư âm", "bán vượt tồn kho", "hai người cùng đặt một ghế". Interview về payment, booking, inventory gần như luôn hỏi: *isolation level nào, anomaly gì, xử lý ra sao?* Biết gọi đúng tên anomaly là nửa lời giải.
+
+<IsolationAnomalyTimelineDiagram />
+
+<Technical>
+
+### ACID — nói cho chính xác
+
+| Chữ | Nghĩa thật | Hay bị hiểu nhầm |
+|---|---|---|
+| **A**tomicity | Transaction commit trọn hoặc rollback trọn | Không liên quan tới concurrency |
+| **C**onsistency | Dữ liệu thoả các bất biến sau transaction | Phần lớn là trách nhiệm của app + constraint, không phải "phép màu" của DB |
+| **I**solation | Transaction chạy song song không làm hỏng nhau — *ở mức nào* thì do isolation level quyết định | Mặc định hiếm khi là serializable |
+| **D**urability | Đã commit thì không mất khi crash (nhờ WAL + fsync) | Replica chưa kịp nhận vẫn có thể mất khi failover |
+
+### Các anomaly
+
+| Anomaly | Chuyện gì xảy ra | Ví dụ |
+|---|---|---|
+| Dirty read | Đọc dữ liệu transaction khác **chưa commit** | Thấy số dư mà sau đó bị rollback |
+| Non-repeatable read | Đọc cùng một dòng hai lần ra hai giá trị | Báo cáo tính tổng lệch giữa chừng |
+| Phantom read | Chạy lại cùng điều kiện, **tập dòng** thay đổi | `count(*)` đơn pending tăng lên giữa transaction |
+| Lost update | Hai bên read-modify-write cùng dòng, bên sau ghi đè | Hai lần rút tiền, chỉ một lần được trừ |
+| Write skew | Hai bên đọc cùng điều kiện, sửa **hai dòng khác nhau**, cùng phá một luật | Hai bác sĩ cùng nghỉ, ca không còn ai trực |
+
+### Chuẩn SQL vs PostgreSQL thực tế
+
+| Level | Dirty read | Non-repeatable | Phantom | Lost update (read-modify-write) | Write skew |
+|---|---|---|---|---|---|
+| READ UNCOMMITTED | PG xử lý như READ COMMITTED | có thể | có thể | có thể | có thể |
+| **READ COMMITTED** (mặc định PG) | không | có thể | có thể | có thể | có thể |
+| REPEATABLE READ (PG = snapshot isolation) | không | không | **không** (chuẩn SQL cho phép) | bị phát hiện → lỗi `40001` | **có thể** |
+| SERIALIZABLE (PG = SSI) | không | không | không | lỗi `40001` | lỗi `40001` |
+
+Engine khác dùng cùng tên nhưng khác hành vi — ví dụ MySQL InnoDB mặc định là REPEATABLE READ với cơ chế riêng. Luôn đọc tài liệu của đúng engine và phiên bản bạn dùng.
+
+### READ COMMITTED chi tiết
+
+- Mỗi **câu lệnh** lấy snapshot mới ⇒ non-repeatable read và phantom là chuyện bình thường.
+- `UPDATE accounts SET balance = balance - 50 WHERE id = 1` vẫn an toàn: nếu dòng đang bị transaction khác sửa, lệnh chờ, rồi tính lại trên **phiên bản mới nhất** của dòng. Nguy hiểm là kiểu **đọc lên app, tính, rồi ghi giá trị tuyệt đối**.
+
+### REPEATABLE READ = snapshot isolation
+
+- Snapshot chụp ở câu lệnh đầu tiên của transaction và giữ tới hết.
+- Nếu bạn `UPDATE`/`DELETE`/`SELECT … FOR UPDATE` một dòng đã bị transaction khác sửa và commit sau snapshot, PostgreSQL báo `could not serialize access due to concurrent update` ⇒ app phải retry cả transaction.
+- **Không** chặn write skew vì hai bên sửa hai dòng khác nhau.
+
+### SERIALIZABLE = Serializable Snapshot Isolation (SSI)
+
+- Vẫn đọc từ snapshot, không khoá chặn nhau khi đọc; PostgreSQL theo dõi **phụ thuộc đọc–ghi** (predicate lock kiểu `SIReadLock`, không gây chờ).
+- Khi phát hiện vòng phụ thuộc có thể dẫn tới kết quả không tuần tự hoá được, huỷ một transaction với SQLSTATE `40001`. Có thể có **false positive** — bị huỷ dù thực tế không xung đột.
+- Bắt buộc: **retry toàn bộ transaction** ở app, và giữ transaction ngắn.
+
+```ts title="app/src/db/with-transaction-retry.ts"
+import type { Pool, PoolClient } from "pg";
+
+const SERIALIZATION_FAILURE = "40001";
+
+export async function withTransactionRetry<T>(pool: Pool, work: (client: PoolClient) => Promise<T>, maxAttempts = 3): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+      const result = await work(client);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      const code = (error as { code?: string }).code;
+      if (code !== SERIALIZATION_FAILURE || attempt >= maxAttempts) throw error;
+      // Exponential backoff + full jitter so retries don't collide again.
+      const delayMs = Math.random() * 20 * 2 ** attempt;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    } finally {
+      client.release();
+    }
+  }
+}
+```
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| READ COMMITTED (mặc định) | Ít lỗi retry, throughput cao, dễ hiểu | Lost update/write skew nếu code read-modify-write | Phần lớn CRUD; kết hợp atomic update hoặc lock tường minh cho chỗ nhạy cảm |
+| REPEATABLE READ | Snapshot nhất quán cho báo cáo; chặn lost update bằng lỗi | Phải xử lý `40001`; vẫn có write skew | Transaction đọc nhiều bảng cần số liệu khớp nhau |
+| SERIALIZABLE | Đúng như chạy tuần tự — không phải tự liệt kê anomaly | Retry nhiều hơn khi tải cao, overhead theo dõi, transaction dài bị huỷ nhiều | Luật nghiệp vụ phức tạp trải nhiều dòng (booking, trực ca, hạn mức) |
+| READ COMMITTED + `FOR UPDATE` / constraint | Chặn đúng chỗ, không retry | Phải tự nhận ra mọi chỗ cần khoá; dễ sót | Luồng nóng đã biết rõ, như trừ tiền một tài khoản |
+
+**Khi nào đổi ý:** nếu tỉ lệ lỗi `40001` ở SERIALIZABLE làm p99 tăng không chấp nhận được, thu hẹp phạm vi: chỉ transaction nhạy cảm dùng SERIALIZABLE, hoặc chuyển sang khoá tường minh / ràng buộc `UNIQUE`/`EXCLUDE`.
+
+</Technical>
+
+## Thực hành
+
+Mở hai terminal, cả hai chạy `docker compose exec postgres psql -U app -d app`. Chuẩn bị dữ liệu ở một bên:
+
+```sql
+CREATE TABLE doctors (name text PRIMARY KEY, on_call boolean NOT NULL);
+INSERT INTO doctors VALUES ('alice', true), ('bob', true);
+```
+
+Chạy xen kẽ theo thứ tự (A rồi B rồi A…) để tái hiện write skew ở REPEATABLE READ:
+
+<Terminal
+  title="Session A và B (xen kẽ)"
+  prompt="app=#"
+  commands={[
+    { comment: "A", command: "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM doctors WHERE on_call;", output: "BEGIN\n count\n-------\n     2" },
+    { comment: "B", command: "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM doctors WHERE on_call;", output: "BEGIN\n count\n-------\n     2" },
+    { comment: "A: còn 2 người nên alice nghỉ", command: "UPDATE doctors SET on_call = false WHERE name = 'alice';", output: "UPDATE 1" },
+    { comment: "B: cũng thấy 2 người nên bob nghỉ", command: "UPDATE doctors SET on_call = false WHERE name = 'bob';", output: "UPDATE 1" },
+    { comment: "A", command: "COMMIT;", output: "COMMIT" },
+    { comment: "B — không lỗi gì", command: "COMMIT;", output: "COMMIT" },
+    { comment: "Kiểm tra: luật 'còn ≥ 1 người trực' đã bị phá", command: "SELECT count(*) FROM doctors WHERE on_call;", output: " count\n-------\n     0" },
+  ]}
+/>
+
+Reset (`UPDATE doctors SET on_call = true;`) rồi lặp lại với `BEGIN ISOLATION LEVEL SERIALIZABLE;`. Một trong hai session sẽ nhận:
+
+```text
+ERROR:  could not serialize access due to read/write dependencies among transactions
+DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.
+HINT:  The transaction might succeed if retried.
+```
+
+Dòng `DETAIL` có thể khác tuỳ thời điểm PostgreSQL phát hiện xung đột (ở `UPDATE` hay ở `COMMIT`) — điều quan trọng là SQLSTATE `40001` và gợi ý retry.
+
+<Callout type="mistake">
+
+**Tin rằng "đã bọc trong transaction là an toàn".** Transaction chỉ đảm bảo atomicity; ở READ COMMITTED mặc định, hai transaction read-modify-write vẫn ghi đè nhau. Lỗi thứ hai: bật SERIALIZABLE nhưng **không viết code retry** — người dùng nhận lỗi 500 mỗi khi tải tăng.
+
+</Callout>
+
+<Callout type="warning">
+
+Transaction mở lâu (đợi gọi API bên ngoài, đợi user) giữ snapshot cũ ⇒ `VACUUM` không dọn được phiên bản cũ, bảng phình ra; ở SERIALIZABLE còn làm tăng tỉ lệ bị huỷ. Gọi service bên ngoài **trước hoặc sau** transaction, không nằm giữa.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu trả lời mạnh cho "làm sao tránh bán vượt tồn kho/double-booking?": gọi tên anomaly (lost update hay write skew), nói isolation level mặc định của database đang dùng (PostgreSQL: READ COMMITTED), rồi đưa 2 phương án — atomic conditional update / `FOR UPDATE` hoặc SERIALIZABLE + retry — kèm trade-off throughput vs độ đúng. Điểm cộng: nhắc ràng buộc ở tầng DB (`UNIQUE`, `CHECK`, `EXCLUDE`) như lưới an toàn cuối cùng.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "transaction", meaning: "Nhóm thao tác commit trọn hoặc rollback trọn." },
+    { term: "isolation level", meaning: "Mức độ các transaction song song được che chắn khỏi nhau." },
+    { term: "snapshot / MVCC", meaning: "Mỗi transaction đọc một phiên bản nhất quán của dữ liệu; ghi tạo phiên bản mới thay vì sửa đè." },
+    { term: "lost update", meaning: "Hai lần read-modify-write cùng dòng, lần sau ghi đè mất kết quả lần trước." },
+    { term: "write skew", meaning: "Hai transaction đọc cùng điều kiện, sửa hai dòng khác nhau và cùng phá một bất biến." },
+    { term: "SSI", meaning: "Serializable Snapshot Isolation — cách PostgreSQL hiện thực SERIALIZABLE bằng theo dõi phụ thuộc và huỷ transaction." },
+    { term: "SQLSTATE 40001", meaning: "serialization_failure — tín hiệu app cần retry toàn bộ transaction." },
+  ]}
+/>
+
+<QuickCheck
+  question="Luồng đặt phòng: kiểm tra `SELECT count(*) FROM bookings WHERE room_id = 7 AND ngày chồng lấn` bằng 0 rồi mới INSERT. Chạy ở REPEATABLE READ trên PostgreSQL, hai request đồng thời có thể cùng đặt được không?"
+  options={[
+    "Không, REPEATABLE READ của PostgreSQL ngăn phantom nên chặn được",
+    "Không, INSERT thứ hai sẽ bị lỗi 40001 vì cùng bảng",
+    "Chỉ xảy ra ở READ UNCOMMITTED",
+    "Có — đây là write skew/phantom kiểu 'kiểm tra rồi chèn'; cần SERIALIZABLE, exclusion constraint hoặc khoá tường minh",
+  ]}
+  answerIndex={3}
+  explanation="Cả hai nhìn 'tấm ảnh' lúc bắt đầu thấy phòng trống rồi cùng chèn dòng mới — không dòng nào bị ghi đồng thời nên snapshot không phát hiện. SERIALIZABLE (trọng tài) huỷ một bên; hoặc để DB tự chặn bằng `EXCLUDE` constraint trên khoảng ngày."
+/>

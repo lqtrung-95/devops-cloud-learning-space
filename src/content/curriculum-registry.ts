@@ -16,8 +16,9 @@ import { m14GitopsArgocdModule } from "./modules/m14-gitops-argocd/module-meta";
 import { m15ObservabilityModule } from "./modules/m15-observability/module-meta";
 import { m16SrePracticesModule } from "./modules/m16-sre-practices/module-meta";
 import { m17DevsecopsModule } from "./modules/m17-devsecops/module-meta";
+import { sd05DatabaseFundamentalsModule } from "./modules/sd05-database-fundamentals/module-meta";
 
-/** All modules in learning order. Add new modules here after they pass `pnpm validate:module`. */
+/** All modules of every course (order within a course comes from `module.order`). Add modules after they pass `pnpm validate:module`. */
 export const curriculumModules: ModuleDefinition[] = [
   m01LinuxShellModule,
   m02NetworkingModule,
@@ -36,4 +37,5 @@ export const curriculumModules: ModuleDefinition[] = [
   m15ObservabilityModule,
   m16SrePracticesModule,
   m17DevsecopsModule,
+  sd05DatabaseFundamentalsModule,
 ];

@@ -1,0 +1,121 @@
+import { DatabaseFamilyChooserDiagram } from "../diagrams/database-family-chooser-diagram";
+
+<Eli5 title="Chọn database giống chọn chỗ cất đồ trong cửa hàng tạp hoá" emoji="🏪">
+
+Cửa hàng có nhiều kiểu chỗ cất, mỗi kiểu hợp một cách lấy đồ. **Sổ kế toán** nhiều cột, dòng nào cũng kiểm tra chéo với dòng khác — chậm hơn chút nhưng không bao giờ lệch tiền (**relational**). **Tủ gửi đồ đánh số**: đưa đúng số thẻ là lấy được ngay, nhưng hỏi "tủ nào đựng túi màu đỏ?" thì phải mở từng tủ (**key-value**).
+
+**Bìa hồ sơ** mỗi khách một kẹp, trong đó có gì cũng được — rút một kẹp là đủ thông tin (**document**). **Cuốn sổ ghi theo ngày** cho từng nhà cung cấp, cứ viết nối đuôi mãi, rất nhanh (**wide-column**). **Tấm bản đồ quan hệ họ hàng** để trả lời "ai là bà con xa của ai" (**graph**).
+
+Không có chỗ cất nào "tốt nhất". Câu hỏi đúng là: **mình hay lấy đồ theo kiểu nào?** Chỗ ví von hơi hụt: database thật có thể lai (Postgres có `jsonb`, DynamoDB vừa key-value vừa document) — nên hãy nhìn vào *hình dạng truy vấn*, không nhìn vào nhãn "SQL/NoSQL".
+
+</Eli5>
+
+Trong phỏng vấn và ở công việc thật, "dùng database gì?" là một trong những quyết định khó đổi nhất: migrate dữ liệu hàng trăm GB tốn hàng tháng. Người mới hay chọn theo trend ("NoSQL scale tốt hơn"); người có kinh nghiệm bắt đầu từ **access pattern** — liệt kê các câu hỏi hệ thống phải trả lời, tần suất và yêu cầu nhất quán — rồi mới chọn.
+
+<DatabaseFamilyChooserDiagram />
+
+<Technical>
+
+### Relational (SQL)
+
+- Dữ liệu là **bảng** có schema cố định, quan hệ bằng **foreign key**, ghép lúc đọc bằng **JOIN**.
+- Mạnh nhất ở: **transaction ACID trên nhiều dòng/bảng**, ràng buộc toàn vẹn (`UNIQUE`, `CHECK`, FK), **truy vấn ad-hoc** — câu hỏi mới hôm nay không cần thiết kế lại dữ liệu, chỉ cần thêm index.
+- Scale ghi theo chiều dọc là chính; scale ngang (sharding) làm được nhưng bạn tự gánh phần phức tạp (SD06).
+
+### Bốn họ NoSQL
+
+| Họ | Mô hình dữ liệu | Truy vấn "sở trường" | Ví dụ |
+|---|---|---|---|
+| Key-value | `key → value` (value mờ đục với DB) | get/put theo key, TTL | Redis, DynamoDB, etcd |
+| Document | document JSON/BSON lồng nhau | đọc/ghi nguyên document, index trên field | MongoDB, Couchbase, Postgres `jsonb` |
+| Wide-column | partition key → các dòng sắp theo clustering key | ghi lượng lớn, đọc theo partition + range | Cassandra, ScyllaDB, HBase, Bigtable |
+| Graph | node + edge có thuộc tính | duyệt quan hệ nhiều bước | Neo4j, Amazon Neptune |
+
+Điểm chung thật sự của nhiều hệ NoSQL phân tán không phải "không có schema" mà là **ép bạn truy cập theo partition key**. Chính ràng buộc đó cho phép chia dữ liệu ra nhiều máy dễ dàng — và cũng là lý do bạn mất JOIN tuỳ ý và transaction tuỳ ý (nhiều hệ có transaction nhưng có giới hạn — kiểm tra tài liệu mới nhất của từng hệ).
+
+### "Schemaless" là schema-on-read
+
+Document DB không bắt khai báo schema, nhưng code đọc dữ liệu vẫn *giả định* một schema. Khác biệt là schema được kiểm tra lúc **đọc** (trong app) thay vì lúc **ghi** (trong DB). Tiện khi mỗi bản ghi một hình dạng; phiền khi 3 phiên bản app ghi 3 kiểu document khác nhau.
+
+### Quy trình chọn theo access pattern
+
+1. Liệt kê access pattern: "lấy X theo Y", kèm tần suất, latency mong muốn, cần nhất quán mạnh hay không.
+2. Ước lượng quy mô **có giả định**. Ví dụ: `DAU 1M, mỗi user 20 lần ghi/ngày ⇒ 2×10⁷ ghi/ngày ÷ 10⁵ giây ≈ 200 QPS trung bình, peak 2–3× ≈ 400–600 QPS`. Cỡ này một Postgres cấu hình tốt thường chịu được — tuỳ workload, cần benchmark trước khi kết luận.
+3. Hỏi: có cần transaction nhiều entity? Có query ad-hoc/báo cáo? Quan hệ nhiều bước? Ghi có vượt xa sức một máy không?
+4. Mặc định hợp lý cho phần lớn sản phẩm mới: **một relational database** — đổi ý khi số liệu ở bước 2–3 nói khác.
+5. **Polyglot persistence** (Postgres làm source of truth + Redis cache + search engine) là bình thường, nhưng mỗi database thêm vào là thêm một thứ phải backup, monitor, nâng cấp.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Relational (Postgres) | ACID nhiều bảng, ràng buộc, query ad-hoc, hệ sinh thái lớn | Scale ghi ngang phải tự sharding; schema migration cần cẩn thận | Mặc định cho dữ liệu nghiệp vụ, tiền, đơn hàng |
+| Key-value | Latency thấp, scale ngang dễ, đơn giản | Chỉ hỏi theo key; query mới cần thiết kế lại | Session, cache, counter, giỏ hàng |
+| Document | Hợp dữ liệu lồng nhau, mỗi bản ghi một hình dạng | JOIN yếu; dữ liệu trùng lặp dễ lệch | Catalog, CMS, profile nhiều thuộc tính |
+| Wide-column | Chịu ghi rất lớn, multi-datacenter | Phải thiết kế bảng theo từng query; đọc ad-hoc gần như không có | Time-series, event log, IoT ở quy mô rất lớn |
+| Graph | Duyệt quan hệ nhiều bước tự nhiên | Phạm vi dùng hẹp, khó scale ngang, đội ít người quen | Mạng xã hội, phát hiện gian lận, knowledge graph |
+
+**Khi nào đổi ý:** khi access pattern đổi (thêm báo cáo ad-hoc → nghiêng về SQL/kho phân tích), hoặc khi ước lượng cho thấy lượng ghi/dung lượng vượt xa một máy dù đã tối ưu.
+
+</Technical>
+
+## Thực hành
+
+Postgres trong `sd-playground` làm được cả việc "document": thử lưu catalog với `jsonb`, rồi so với cách key-value của Redis.
+
+<Terminal
+  title="sd-playground"
+  commands={[
+    { comment: "Vào Postgres của playground", command: "docker compose exec postgres psql -U app -d app" },
+    { comment: "Bảng catalog: cột cố định + thuộc tính linh hoạt", command: "CREATE TABLE products (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, category text NOT NULL, attrs jsonb NOT NULL);", output: "CREATE TABLE" },
+    { command: "INSERT INTO products (category, attrs) VALUES ('shirt', '{\"size\": \"M\", \"color\": \"red\"}'), ('laptop', '{\"cpu\": \"M3\", \"ram_gb\": 16}');", output: "INSERT 0 2" },
+    { comment: "GIN index cho phép lọc theo field bên trong document", command: "CREATE INDEX idx_products_attrs ON products USING gin (attrs);", output: "CREATE INDEX" },
+    { command: "SELECT id, category FROM products WHERE attrs @> '{\"color\": \"red\"}';", output: " id | category\n----+----------\n  1 | shirt\n(1 row)" },
+    { comment: "Thoát psql, thử kiểu key-value: chỉ hỏi được theo key", command: "docker compose exec redis redis-cli SET cart:user:42 '{\"sku\":\"A1\",\"qty\":2}' EX 3600", output: "OK" },
+    { command: "docker compose exec redis redis-cli GET cart:user:42", output: "\"{\\\"sku\\\":\\\"A1\\\",\\\"qty\\\":2}\"" },
+  ]}
+/>
+
+Giờ tự hỏi: "giỏ hàng nào đang chứa SKU `A1`?" — Postgres trả lời được bằng một query; Redis thì không, trừ khi bạn tự duy trì thêm một cấu trúc index riêng. Đó chính là khác biệt về *hình dạng truy vấn*.
+
+<Callout type="mistake">
+
+**Chọn MongoDB/Cassandra "vì schema linh hoạt" hoặc "vì scale tốt", rồi 6 tháng sau cần JOIN, transaction và báo cáo.** Đội bắt đầu tự viết join trong code, dữ liệu trùng lặp lệch nhau. Hãy viết ra access pattern trước — nếu phần lớn là quan hệ và cần nhất quán, relational gần như luôn thắng ở giai đoạn đầu.
+
+</Callout>
+
+<Callout type="warning">
+
+**Redis không phải source of truth** chỉ vì nó nhanh. Muốn dùng làm dữ liệu chính, bạn phải cấu hình persistence (AOF/RDB), replication và chấp nhận rủi ro mất dữ liệu gần nhất khi failover — và phải ghi rõ lý do trong design doc.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Interviewer ít khi chấm "chọn đúng tên database" mà chấm **lập luận**. Câu trả lời mạnh: (1) nêu access pattern chính và tỉ lệ đọc/ghi, (2) nêu yêu cầu nhất quán (luồng tiền cần ACID), (3) chọn database kèm một câu "vì sao" và một câu "đổi lại mất gì", (4) nói khi nào sẽ đổi ý. Tránh câu "dùng NoSQL cho scalable" không kèm số.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "access pattern", meaning: "Một kiểu câu hỏi hệ thống phải trả lời, ví dụ 'lấy 20 đơn mới nhất theo customerId', kèm tần suất và latency." },
+    { term: "relational / SQL", meaning: "Dữ liệu dạng bảng, schema cố định, JOIN, transaction ACID, query ad-hoc." },
+    { term: "key-value", meaning: "Lưu và lấy value theo đúng một key; nhanh, đơn giản, không hỏi theo nội dung được." },
+    { term: "document", meaning: "Lưu bản ghi dạng JSON lồng nhau; mỗi document có thể mang hình dạng khác nhau." },
+    { term: "wide-column", meaning: "Dữ liệu chia theo partition key, trong partition sắp theo clustering key; tối ưu cho ghi lớn." },
+    { term: "schema-on-read", meaning: "Schema được app kiểm tra lúc đọc thay vì DB kiểm tra lúc ghi." },
+    { term: "polyglot persistence", meaning: "Dùng nhiều loại database trong một hệ thống, mỗi loại cho một access pattern." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hệ thống cần lưu vị trí GPS của 200.000 xe, mỗi xe gửi mỗi 5 giây, và chỉ truy vấn 'lộ trình của xe X trong khoảng thời gian T'. Lựa chọn nào hợp lý nhất nếu ước lượng cho thấy lượng ghi lớn và còn tăng?"
+  options={[
+    "Graph database, vì xe di chuyển giữa các điểm",
+    "Wide-column với partition key = xe, clustering key = thời gian",
+    "Redis làm nơi lưu vĩnh viễn duy nhất",
+    "Relational với JOIN giữa bảng xe và bảng điểm cho mọi query",
+  ]}
+  answerIndex={1}
+  explanation="200.000 xe ÷ 5 giây ≈ 40.000 lần ghi/giây, truy vấn luôn theo (xe, khoảng thời gian) — đúng 'cuốn sổ ghi theo ngày' của từng xe. Nếu volume nhỏ hơn nhiều, Postgres partition theo thời gian vẫn là lựa chọn đơn giản hơn."
+/>

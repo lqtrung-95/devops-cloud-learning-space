@@ -1,0 +1,158 @@
+import { LockingStrategiesScenarioDiagram } from "../diagrams/locking-strategies-scenario-diagram";
+
+<Eli5 title="Locking giống phòng thử đồ có chìa khoá và tài liệu có số phiên bản" emoji="🔐">
+
+**Pessimistic locking** giống **phòng thử đồ có chìa khoá**: ai vào trước thì cầm chìa, khoá cửa lại; người sau đứng chờ ngoài cửa tới khi người trong trả chìa. Không bao giờ hai người cùng thay đồ trong một phòng — nhưng nếu người bên trong ngồi gọi điện nửa tiếng, cả hàng người phải chờ. Người đứng ngoài vẫn *nhìn* được tấm ảnh chụp phòng lúc trước; chỉ không được *vào sửa*.
+
+**Optimistic locking** giống **sửa tài liệu có số phiên bản**: ai cũng lấy "bản số 7" về sửa thoải mái, không phải chờ ai. Lúc nộp, thư ký kiểm tra: "tài liệu vẫn đang là bản 7 chứ?" Nếu người khác đã nộp thành bản 8, bạn phải lấy bản 8 về sửa lại.
+
+Chỗ ví von hụt: trong database, "người chờ ngoài cửa" có thể chờ nhau vòng tròn (deadlock) — database sẽ phát hiện và huỷ một người, còn phòng thử đồ thật thì không.
+
+</Eli5>
+
+"Trừ tiền", "giữ ghế", "trừ tồn kho" là những luồng mà sai một lần là mất tiền thật. Bài trước cho thấy READ COMMITTED mặc định không chặn lost update. Bài này là bộ công cụ thực tế để chặn nó — và cách chọn đúng công cụ theo **mức độ xung đột** và **thời gian giữ dữ liệu**.
+
+<LockingStrategiesScenarioDiagram />
+
+<Technical>
+
+### Bốn cách chống lost update
+
+1. **Atomic update** — để database tự tính: `UPDATE accounts SET balance = balance - 50 WHERE id = 1 AND balance >= 50`. Kiểm tra `rowCount`: 0 ⇒ không đủ tiền. Đơn giản và nhanh nhất khi logic viết được bằng một câu SQL.
+2. **Pessimistic lock** — `SELECT … FOR UPDATE`, xử lý trong app, rồi `UPDATE` trong cùng transaction.
+3. **Optimistic lock** — version column (hoặc `updated_at`/ETag), ghi có điều kiện, retry khi thua.
+4. **Isolation cao hơn** — REPEATABLE READ/SERIALIZABLE + retry `40001` (bài trước).
+
+### `SELECT … FOR UPDATE` — semantics trong PostgreSQL
+
+- Khoá **các dòng được trả về** tới hết transaction (COMMIT/ROLLBACK). Không có "unlock" giữa chừng.
+- Transaction khác muốn `UPDATE`, `DELETE`, `SELECT … FOR UPDATE`/`FOR NO KEY UPDATE`/`FOR SHARE` các dòng đó sẽ **chờ**. `SELECT` thường **không** bị chặn (MVCC) và đọc phiên bản đã commit.
+- Ở READ COMMITTED, khi hết chờ, câu lệnh kiểm tra lại điều kiện `WHERE` trên **phiên bản mới nhất** của dòng rồi mới trả kết quả. Ở REPEATABLE READ/SERIALIZABLE, nếu dòng đã bị sửa sau snapshot thì nhận lỗi `40001`.
+- Biến thể hữu ích:
+  - `FOR UPDATE NOWAIT` — không chờ, báo lỗi ngay nếu dòng đang bị khoá.
+  - `FOR UPDATE SKIP LOCKED` — bỏ qua dòng đang bị khoá; hợp cho **job queue** nhiều worker lấy việc.
+  - `FOR NO KEY UPDATE` — khoá nhẹ hơn khi không đổi khoá chính, ít đụng foreign key check hơn.
+- **Không khoá được dòng chưa tồn tại.** "Kiểm tra chưa ai đặt rồi INSERT" vẫn hỏng — dùng `UNIQUE`/`EXCLUDE` constraint, SERIALIZABLE, hoặc khoá một dòng "cha" (vd dòng `rooms`).
+
+```sql title="Pessimistic: rút 50 từ tài khoản 1"
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;
+-- app kiểm tra balance >= 50, gọi rule nghiệp vụ (KHÔNG gọi API chậm ở đây)
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;
+INSERT INTO ledger (account_id, amount, idempotency_key) VALUES (1, -50, 'req-7f3a');
+COMMIT;
+```
+
+### Deadlock & timeout
+
+- T1 khoá tài khoản A rồi xin B; T2 khoá B rồi xin A ⇒ chờ vòng tròn. PostgreSQL kiểm tra sau `deadlock_timeout` (mặc định 1s) và huỷ một bên với SQLSTATE `40P01`.
+- Phòng tránh: **luôn khoá theo thứ tự cố định** (vd `ORDER BY id` khi chuyển tiền giữa hai tài khoản), giữ transaction ngắn, đặt `lock_timeout` để không treo vô hạn.
+
+### Optimistic locking
+
+```ts title="app/src/accounts/withdraw-optimistic.ts"
+import type { Pool } from "pg";
+
+export async function withdraw(pool: Pool, accountId: number, amount: number, maxAttempts = 3): Promise<number> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const { rows } = await pool.query("SELECT balance, version FROM accounts WHERE id = $1", [accountId]);
+    if (rows.length === 0) throw new Error("account not found");
+    const { balance, version } = rows[0] as { balance: number; version: number };
+    if (balance < amount) throw new Error("insufficient funds");
+
+    const result = await pool.query(
+      "UPDATE accounts SET balance = $1, version = version + 1 WHERE id = $2 AND version = $3",
+      [balance - amount, accountId, version],
+    );
+    if (result.rowCount === 1) return balance - amount;
+    // Someone else wrote first: back off with jitter, then re-read and try again.
+    await new Promise((resolve) => setTimeout(resolve, Math.random() * 10 * 2 ** attempt));
+  }
+  throw new Error("conflict: too many concurrent updates, try again");
+}
+```
+
+Cùng ý tưởng xuất hiện ở khắp nơi: HTTP `ETag` + `If-Match` (trả `412 Precondition Failed`), DynamoDB `ConditionExpression`, Kubernetes `resourceVersion`.
+
+### Chọn gì cho luồng trừ tiền?
+
+- Logic viết được bằng một câu SQL ⇒ **atomic conditional update** ở READ COMMITTED + `CHECK (balance >= 0)` làm lưới an toàn.
+- Cần đọc lên app để áp nhiều rule (hạn mức ngày, trạng thái KYC…) nhưng xử lý nhanh ⇒ **transaction ngắn + `FOR UPDATE`**, khoá theo thứ tự id.
+- Xung đột hiếm, thời gian từ lúc đọc tới lúc ghi dài (form, workflow nhiều bước) ⇒ **optimistic**.
+- Mọi phương án đều cần **idempotency key** để retry từ client không trừ tiền hai lần.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Atomic conditional update | Không lock chủ động lâu, không retry, nhanh | Chỉ khi logic gói được trong một câu SQL | Trừ số dư, trừ tồn kho, tăng counter |
+| Pessimistic (`FOR UPDATE`) | Đúng ngay lần đầu, không retry; hợp khi xung đột thường xuyên | Chờ lock làm giảm throughput; deadlock; không giữ được qua thời gian user suy nghĩ | Transaction ngắn trên dòng nóng, xung đột nhiều |
+| Optimistic (version) | Không chặn ai, không giữ connection/lock, hợp với HTTP/stateless | Xung đột nhiều ⇒ retry dồn dập, tốn công vô ích; phải viết code retry | Xung đột hiếm, đọc–ghi cách nhau lâu |
+| SERIALIZABLE + retry | Không phải tự tìm chỗ cần khoá | Tỉ lệ huỷ tăng theo tải; phải retry cả transaction | Bất biến phức tạp trải nhiều dòng |
+
+**Khi nào đổi ý:** đo tỉ lệ `UPDATE 0` (optimistic) hoặc thời gian chờ lock (pessimistic). Retry vượt vài phần trăm request ⇒ nghiêng về pessimistic; lock wait chiếm phần lớn latency ⇒ thu nhỏ transaction hoặc chuyển optimistic/atomic.
+
+</Technical>
+
+## Thực hành
+
+Chuẩn bị bảng: `CREATE TABLE accounts (id int PRIMARY KEY, balance int NOT NULL CHECK (balance >= 0), version int NOT NULL DEFAULT 1); INSERT INTO accounts VALUES (1, 100, 1);` rồi mở hai session psql.
+
+<Terminal
+  title="Session A, B và C (terminal thứ 3)"
+  prompt="app=#"
+  commands={[
+    { comment: "A: khoá dòng", command: "BEGIN; SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;", output: "BEGIN\n balance\n---------\n     100" },
+    { comment: "B: cũng muốn khoá → treo, con trỏ không trả về", command: "BEGIN; SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;", output: "BEGIN" },
+    { comment: "C: xem ai đang chờ ai", command: "SELECT pid, state, wait_event_type, wait_event, left(query, 60) AS query FROM pg_stat_activity WHERE datname = 'app' AND pid <> pg_backend_pid();", output: " pid |        state        | wait_event_type |  wait_event   |                            query\n-----+---------------------+-----------------+---------------+--------------------------------------------------------------\n 412 | idle in transaction | Client          | ClientRead    | BEGIN; SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;\n 418 | active              | Lock            | transactionid | BEGIN; SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;\n(2 rows)" },
+    { comment: "A: trừ 30 và commit → B được nhả, nhận phiên bản mới nhất (70)", command: "UPDATE accounts SET balance = balance - 30 WHERE id = 1; COMMIT;", output: "UPDATE 1\nCOMMIT" },
+    { comment: "B: kết thúc thí nghiệm pessimistic, chuyển sang optimistic — đọc kèm version", command: "ROLLBACK; SELECT balance, version FROM accounts WHERE id = 1;", output: "ROLLBACK\n balance | version\n---------+---------\n      70 |       1" },
+    { comment: "A: ghi trước với version 1 → thắng", command: "UPDATE accounts SET balance = 60, version = version + 1 WHERE id = 1 AND version = 1;", output: "UPDATE 1" },
+    { comment: "B: ghi với version 1 đã cũ → thua, không ghi đè ai", command: "UPDATE accounts SET balance = 20, version = version + 1 WHERE id = 1 AND version = 1;", output: "UPDATE 0" },
+    { comment: "B: đọc lại (60, v2), tính lại rồi ghi đúng version", command: "UPDATE accounts SET balance = 10, version = version + 1 WHERE id = 1 AND version = 2;", output: "UPDATE 1" },
+  ]}
+/>
+
+Để ý dòng B có `wait_event_type = Lock`: đó là cách bạn nhận ra "request chậm vì chờ lock" trên production. Session A ở trạng thái `idle in transaction` — đang giữ lock mà không làm gì, đúng kiểu người ngồi lì trong phòng thử đồ.
+
+<Callout type="mistake">
+
+**Giữ `FOR UPDATE` trong khi gọi payment gateway hoặc chờ user xác nhận.** Mỗi request chiếm một connection và một row lock trong vài giây ⇒ pool cạn, request khác chờ dây chuyền. Tách thành: giữ chỗ (trạng thái `PENDING`) trong transaction ngắn → gọi bên ngoài → cập nhật kết quả trong transaction ngắn khác.
+
+</Callout>
+
+<Callout type="warning">
+
+Optimistic locking mà **quên tăng `version`** hoặc **quên kiểm tra `rowCount`** thì không khác gì không khoá. Viết test concurrency (k6 nhiều VU cùng rút tiền) và so tổng tiền trước/sau — đừng chỉ đọc code.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Với câu "thiết kế ví/booking chống double-spend", một câu trả lời mạnh: chọn **atomic conditional update** hoặc **`FOR UPDATE` trong transaction ngắn** cho luồng trừ tiền, giải thích vì sao không optimistic (xung đột có thể cao ở tài khoản nóng), nhắc **khoá theo thứ tự** để tránh deadlock, **idempotency key** cho retry, và **constraint** (`CHECK balance >= 0`, `UNIQUE`) làm lưới an toàn. Nói thêm lock chỉ có tác dụng trong **một database** — khi dữ liệu nằm ở nhiều service thì phải dùng saga/outbox (SD07, SD12).
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "pessimistic locking", meaning: "Khoá trước khi sửa; người khác muốn sửa phải chờ tới khi transaction kết thúc." },
+    { term: "optimistic locking", meaning: "Không khoá; ghi có điều kiện theo version, thua thì đọc lại và thử lại." },
+    { term: "SELECT … FOR UPDATE", meaning: "Đọc và giữ row lock trên các dòng trả về tới COMMIT/ROLLBACK." },
+    { term: "SKIP LOCKED / NOWAIT", meaning: "Bỏ qua dòng đang bị khoá / báo lỗi ngay thay vì chờ." },
+    { term: "deadlock", meaning: "Hai transaction chờ lock của nhau; PostgreSQL huỷ một bên với lỗi 40P01." },
+    { term: "atomic conditional update", meaning: "Một câu UPDATE tự tính và kiểm tra điều kiện, vd `balance = balance - 50 WHERE balance >= 50`." },
+    { term: "idempotency key", meaning: "Mã duy nhất cho mỗi yêu cầu để retry không thực hiện hai lần." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hệ thống job queue trên Postgres: 20 worker cùng lấy việc từ bảng `jobs`, mỗi job chỉ được một worker xử lý. Câu lệnh lấy việc nào hợp lý nhất?"
+  options={[
+    "`SELECT * FROM jobs WHERE status = 'queued' LIMIT 1` rồi UPDATE",
+    "`SELECT * FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED` trong transaction, rồi đánh dấu `running`",
+    "`LOCK TABLE jobs` rồi chọn job",
+    "Dùng optimistic version trên toàn bảng `jobs`",
+  ]}
+  answerIndex={1}
+  explanation="`SKIP LOCKED` giống thấy phòng thử đồ đã có người thì đi sang phòng trống kế bên thay vì đứng chờ — mỗi worker khoá một job khác nhau, không ai chờ ai. SELECT thường cho hai worker cùng lấy một job; LOCK TABLE làm 20 worker chạy như 1."
+/>
