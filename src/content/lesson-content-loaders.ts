@@ -56,4 +56,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "b10-caching-for-backend": (lessonSlug) => import(`./modules/b10-caching-for-backend/lessons/${lessonSlug}.mdx`),
   "b14-microservice-split-event-driven": (lessonSlug) => import(`./modules/b14-microservice-split-event-driven/lessons/${lessonSlug}.mdx`),
   "b13-grpc-internal-services": (lessonSlug) => import(`./modules/b13-grpc-internal-services/lessons/${lessonSlug}.mdx`),
+  "b15-security-for-backend": (lessonSlug) => import(`./modules/b15-security-for-backend/lessons/${lessonSlug}.mdx`),
 };

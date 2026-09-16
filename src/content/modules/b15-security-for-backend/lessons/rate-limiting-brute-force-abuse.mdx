@@ -1,0 +1,113 @@
+import { RateLimitBucketFillingDiagram } from "../diagrams/rate-limit-bucket-filling-diagram";
+
+<Eli5 title="Rate limit giống như bảo vệ đếm số lần gõ mã cửa" emoji="🚪">
+  Cửa vào chung cư có bàn phím nhập mã PIN. Bảo vệ không cấm ai nhập sai — con người thỉnh thoảng gõ nhầm là bình thường. Nhưng nếu MỘT người đứng đó gõ liên tục 20 mã khác nhau trong 1 phút, bảo vệ sẽ tạm khoá bàn phím đó vài phút, dù người đứng đó có phải chủ nhà thật hay không.
+
+  Đó chính là rate limit: không phân biệt "người tốt" hay "kẻ xấu" — chỉ đếm số lần thử trong một khoảng thời gian, và chặn khi vượt ngưỡng.
+</Eli5>
+
+`/api/v1/auth/login` (B05) là mục tiêu hấp dẫn nhất cho brute-force: kẻ tấn công có thể thử hàng nghìn mật khẩu mỗi phút nếu không bị chặn. Toàn bộ API cũng cần một ngưỡng chung để tránh bị scrape hoặc làm quá tải bởi một client duy nhất.
+
+<RateLimitBucketFillingDiagram />
+
+<Technical>
+
+### Hai scope, hai ngưỡng khác nhau
+
+`@fastify/rate-limit` cho phép đăng ký một ngưỡng **global** rồi override ở từng route:
+
+```ts title="src/app.ts"
+import rateLimit from "@fastify/rate-limit";
+
+await app.register(rateLimit, {
+  max: 100,
+  timeWindow: "1 minute",
+  errorResponseBuilder: (_request, context) => ({
+    error: {
+      code: "RATE_LIMITED",
+      message: `Quá nhiều request, thử lại sau ${context.after}.`,
+    },
+  }),
+});
+```
+
+```ts title="src/routes/auth.ts"
+app.post(
+  "/api/v1/auth/login",
+  {
+    config: {
+      rateLimit: {
+        max: 5,
+        timeWindow: "1 minute",
+      },
+    },
+  },
+  loginHandler,
+);
+```
+
+`config.rateLimit` ở route-level GHI ĐÈ cấu hình global chỉ cho route đó — `/auth/login` còn 5 request/phút thay vì 100.
+
+### Rate limit không phải "cài xong là xong"
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Chỉ rate limit global (100/phút) | Đơn giản, một cấu hình cho cả API | Không đủ chặt cho brute-force login — vẫn thử được hàng chục mật khẩu | API không có endpoint nhạy cảm đặc biệt |
+| Global + override riêng cho login | Chặn brute-force hiệu quả, vẫn cho phép traffic bình thường ở route khác | Cần nhớ override đúng route mỗi khi thêm endpoint nhạy cảm mới | `taskflow-api` — có `/auth/login`, sau này thêm `/auth/reset-password` cũng cần override tương tự |
+| Rate limit theo `userId` thay vì IP | Không bị ảnh hưởng bởi NAT/proxy dùng chung IP | Cần user đã đăng nhập mới biết `userId` — không áp dụng được cho `/auth/login` (chưa biết ai) | Route đã qua `authenticate`, ví dụ giới hạn số comment/phút của một user |
+
+### Giới hạn thật của rate limit theo IP
+
+- **NAT/proxy công ty**: nhiều nhân viên dùng chung một IP công cộng — rate limit theo IP có thể khoá nhầm người dùng thật đứng sau cùng NAT.
+- **IP rotation**: kẻ tấn công có botnet hoặc danh sách proxy có thể rotate IP để mỗi IP chỉ gửi vài request, né được ngưỡng.
+- Kết luận: rate limit là **một lớp phòng thủ**, không phải giải pháp trọn vẹn. Để chống brute-force triệt để hơn, cần thêm khoá tài khoản tạm thời sau N lần sai liên tiếp (theo `email`, không chỉ theo IP) hoặc CAPTCHA — những cơ chế này nằm ngoài phạm vi lab của module, nhưng nên biết để không chủ quan.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài plugin rate limit", command: `pnpm add @fastify/rate-limit` },
+    {
+      comment: "Gửi sai mật khẩu 5 lần liên tiếp — vẫn trong hạn mức",
+      command: `for i in $(seq 1 5); do curl -s -o /dev/null -w "%{http_code}\\n" -X POST http://localhost:3000/api/v1/auth/login -H "Content-Type: application/json" -d '{"email":"a@b.com","password":"wrong"}'; done`,
+      output: `401\n401\n401\n401\n401`,
+    },
+    {
+      comment: "Lần thứ 6 trong cùng 1 phút — bucket đã đầy",
+      command: `curl -s -X POST http://localhost:3000/api/v1/auth/login -H "Content-Type: application/json" -d '{"email":"a@b.com","password":"wrong"}'`,
+      output: `{"error":{"code":"RATE_LIMITED","message":"Quá nhiều request, thử lại sau 42 giây."}}`,
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Đặt CÙNG một ngưỡng cho `/auth/login` và toàn API. Nếu ngưỡng global (ví dụ 100/phút) cũng là ngưỡng cho login, kẻ tấn công vẫn thử được hàng chục mật khẩu mỗi phút — con số đó nghe "thấp" nhưng đủ để dò được mật khẩu yếu trong vài giờ.
+</Callout>
+
+<Callout type="warning">
+  Rate limit theo IP không phải "chống brute-force tuyệt đối". Nó chặn được kẻ tấn công thiếu tinh vi, nhưng vẫn bị lách qua bởi IP rotation, và có thể khoá nhầm người dùng thật sau NAT/proxy công ty. Đừng dừng lại ở đây nếu hệ thống của bạn thật sự là mục tiêu tấn công có tổ chức — cân nhắc thêm khoá tài khoản theo email hoặc CAPTCHA.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Rate limiting", meaning: "Giới hạn số request được xử lý trong một khoảng thời gian, theo một khoá (IP, user, API key...)." },
+    { term: "timeWindow", meaning: "Khoảng thời gian tính ngưỡng, ví dụ '1 minute'." },
+    { term: "Brute-force", meaning: "Thử liên tục nhiều giá trị (mật khẩu, token...) cho tới khi trúng." },
+    { term: "429 Too Many Requests", meaning: "Mã HTTP báo client đã vượt ngưỡng rate limit." },
+    { term: "NAT", meaning: "Cơ chế nhiều thiết bị nội bộ dùng chung một địa chỉ IP công cộng khi ra Internet." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao taskflow-api cần một ngưỡng rate limit RIÊNG, thấp hơn hẳn cho /auth/login thay vì chỉ dùng ngưỡng chung 100 request/phút cho toàn API?"
+  options={[
+    "Vì route login luôn chậm hơn các route khác nên cần giới hạn nhiều hơn",
+    "Vì 100 request/phút vẫn đủ để một kẻ tấn công thử hàng chục mật khẩu khác nhau — cần một ngưỡng nhỏ hơn hẳn (ví dụ 5/phút) dành riêng cho endpoint bị brute-force",
+    "Vì Fastify chỉ hỗ trợ tối đa một cấu hình rate limit cho cả server",
+    "Vì login không dùng JSON nên cần cấu hình khác",
+  ]}
+  answerIndex={1}
+  explanation="Ngưỡng global bảo vệ toàn API khỏi abuse chung, nhưng với một endpoint mà MỖI request là một lần thử mật khẩu, 100/phút là quá rộng rãi cho brute-force. Route-level override cho phép đặt một ngưỡng nhỏ hơn nhiều chỉ cho /auth/login mà không ảnh hưởng các route khác."
+/>

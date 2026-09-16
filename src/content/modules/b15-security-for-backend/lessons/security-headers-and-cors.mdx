@@ -1,0 +1,97 @@
+import { CorsPreflightDecisionTreeDiagram } from "../diagrams/cors-preflight-decision-tree-diagram";
+
+<Eli5 title="Helmet là hàng rào mặc định, CORS là danh sách khách mời" emoji="🧱">
+  Một quán ăn có hai lớp an toàn khác nhau. Lớp một: quán tự lắp sẵn tay vịn cầu thang, biển "sàn ướt", bình cứu hoả — những thứ MẶC ĐỊNH nên có, không cần khách yêu cầu (đó là `helmet`).
+
+  Lớp hai: quán chỉ giao đồ ăn tận nơi cho những địa chỉ đã đăng ký trước (đó là CORS `origin` allowlist) — không phải vì sợ khách lạ, mà vì đơn hàng đi kèm thẻ thành viên (cookie) chỉ nên giao tới đúng nhà đã đăng ký, không giao bừa cho bất kỳ ai gọi tới.
+</Eli5>
+
+`taskflow-api` từ B05 dùng cookie `httpOnly` để lưu refresh token. Đây là chi tiết quan trọng: một khi có cookie, cấu hình CORS sai một chút là mở đường cho site lạ mượn cookie của người dùng để gọi API thay họ.
+
+<CorsPreflightDecisionTreeDiagram />
+
+<Technical>
+
+### `@fastify/helmet`: hàng rào header mặc định
+
+```ts title="src/app.ts"
+import helmet from "@fastify/helmet";
+
+await app.register(helmet);
+```
+
+Đăng ký với cấu hình mặc định là đủ cho một JSON API (không cần tinh chỉnh Content-Security-Policy phức tạp như một trang HTML render phía server). Helmet tự thêm các response header giảm thiểu một số lớp tấn công phía trình duyệt — ví dụ ngăn trình duyệt tự đoán loại nội dung khác với `Content-Type` khai báo. Đây là lớp phòng thủ **bổ sung**, không thay thế cho validate input hay authorization.
+
+### CORS: allowlist origin, không phải `'*'`
+
+```ts title="src/app.ts"
+import cors from "@fastify/cors";
+import { env } from "./env.js";
+
+await app.register(cors, {
+  origin: env.ALLOWED_ORIGINS.split(","),
+  credentials: true,
+});
+```
+
+`env.ALLOWED_ORIGINS` là một biến môi trường mới, ví dụ `http://localhost:5173,https://app.taskflow.example`. `@fastify/cors` tự so khớp `Origin` header của request với danh sách này — nếu khớp, trả đúng origin đó trong `Access-Control-Allow-Origin` (không phải `'*'`); nếu không khớp, không thêm header cho phép.
+
+**Vì sao không dùng `'*'`?** Vì `/auth/refresh` (B05) gửi refresh token qua cookie `httpOnly`. Theo đặc tả CORS, `Access-Control-Allow-Origin: '*'` KHÔNG được phép đi kèm `Access-Control-Allow-Credentials: true` — trình duyệt sẽ chặn response nếu server cố trả cả hai. Muốn hỗ trợ cookie, server bắt buộc phải khai một origin cụ thể, lấy từ allowlist đã kiểm tra — không có cách nào lách qua yêu cầu này.
+
+### So sánh các cách cấu hình `origin`
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| `origin: '*'` | Đơn giản, không cần bảo trì allowlist | Không thể dùng cùng `credentials: true` — vi phạm CORS spec | API công khai, không cookie/session (ví dụ API đọc dữ liệu công khai) |
+| `origin: [danh sách tĩnh]` | An toàn, rõ ràng, dễ audit | Phải cập nhật khi thêm domain frontend mới | `taskflow-api` — số lượng frontend origin cố định, ít thay đổi |
+| `origin: (origin, cb) => ...` (hàm động) | Linh hoạt cho multi-tenant với domain riêng từng khách hàng | Phức tạp hơn, viết sai logic có thể vô tình cho phép mọi origin | Sản phẩm SaaS multi-tenant cho phép khách gắn domain riêng (chưa phải nhu cầu hiện tại của `taskflow-api`) |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài helmet và cors", command: `pnpm add @fastify/helmet @fastify/cors` },
+    {
+      comment: "Preflight từ origin lạ — không nằm trong ALLOWED_ORIGINS",
+      command: `curl -s -i -X OPTIONS http://localhost:3000/api/v1/projects/abc -H "Origin: http://evil.example" -H "Access-Control-Request-Method: DELETE" | grep -i access-control`,
+      output: `(không có dòng nào khớp — server không trả Access-Control-Allow-Origin cho origin này)`,
+    },
+    {
+      comment: "Preflight từ origin hợp lệ trong allowlist",
+      command: `curl -s -i -X OPTIONS http://localhost:3000/api/v1/projects/abc -H "Origin: http://localhost:5173" -H "Access-Control-Request-Method: DELETE" | grep -i access-control`,
+      output: `access-control-allow-origin: http://localhost:5173\naccess-control-allow-credentials: true`,
+    },
+  ]}
+/>
+
+<Callout type="warning">
+  `origin: '*'` cộng với `credentials: true` KHÔNG hoạt động — đây không phải một tuỳ chọn cấu hình sai nhẹ, mà là một kết hợp trình duyệt sẽ chủ động chặn theo đặc tả CORS. Nếu `taskflow-api` cần hỗ trợ cookie (đúng như thiết kế từ B05), origin bắt buộc phải là danh sách cụ thể — không có đường tắt.
+</Callout>
+
+<Callout type="mistake">
+  Đăng ký `@fastify/cors` với `origin: true` (cho phép mọi origin phản chiếu lại) để "cho dễ debug" rồi quên đổi lại trước khi deploy. Về mặt hành vi với trình duyệt, điều này gần như tương đương `'*'` nhưng dễ bị bỏ sót hơn khi review code vì trông có vẻ là một cấu hình hợp lệ.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "CORS", meaning: "Cross-Origin Resource Sharing — cơ chế trình duyệt cho phép/chặn request JavaScript tới origin khác." },
+    { term: "Preflight", meaning: "Request OPTIONS trình duyệt tự gửi trước để hỏi server có cho phép request thật hay không." },
+    { term: "Origin allowlist", meaning: "Danh sách các origin cụ thể được phép gọi API, thay vì mở cho mọi origin." },
+    { term: "Access-Control-Allow-Credentials", meaning: "Header xác nhận server chấp nhận request kèm cookie/session credentials." },
+    { term: "helmet", meaning: "Thư viện thêm các HTTP response header an toàn mặc định." },
+  ]}
+/>
+
+<QuickCheck
+  question="taskflow-api cần hỗ trợ cookie httpOnly cho refresh token (từ B05). Vì sao KHÔNG thể cấu hình CORS origin: '*' kèm credentials: true để 'cho tiện'?"
+  options={[
+    "Vì Fastify sẽ báo lỗi cú pháp ngay khi khởi động server",
+    "Vì đây là một kết hợp bị cấm theo CORS spec — Access-Control-Allow-Origin: '*' không tương thích với Access-Control-Allow-Credentials: true; trình duyệt sẽ chặn response, phải khai một origin cụ thể",
+    "Vì '*' chỉ hoạt động với method GET, không hoạt động với POST/DELETE",
+    "Vì cookie httpOnly không bao giờ được gửi kèm request CORS, nên cấu hình origin không quan trọng",
+  ]}
+  answerIndex={1}
+  explanation="Đây là quy tắc cứng trong đặc tả CORS, không phải một khuyến nghị best-practice có thể bỏ qua: khi request có credentials, server bắt buộc phải trả một origin cụ thể (không phải '*') trong Access-Control-Allow-Origin, nếu không trình duyệt sẽ tự chặn response phía client."
+/>

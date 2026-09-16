@@ -1,0 +1,89 @@
+import { OwaspTop10ChecklistDiagram } from "../diagrams/owasp-top10-checklist-diagram";
+
+<Eli5 title="OWASP Top 10 giống như 10 kiểu trộm hay gặp nhất ở chung cư" emoji="🕵️">
+  Ban quản lý một chung cư không thể đoán MỌI cách trộm có thể đột nhập — nhưng họ có thể học từ 10 kiểu đột nhập phổ biến nhất mà cảnh sát tổng hợp mỗi năm: cửa không khoá, bảo vệ không kiểm tra thẻ, camera hỏng không ai sửa, ổ khoá dùng loại rẻ tiền dễ cạy...
+
+  OWASP Top 10 chính là "báo cáo tổng hợp" đó, nhưng cho ứng dụng web. Tin vui: `taskflow-api` đã tự khoá được vài cửa từ trước (B04–B06) mà không hề gọi tên "OWASP". Module này chỉ đi rà lại từng cửa, gọi đúng tên nó, và khoá nốt những cửa còn hở.
+</Eli5>
+
+`taskflow-api` giờ đã có CRUD, auth, RBAC, test, upload, job nền, cache, realtime, GraphQL — gần đủ để chạy production. Trước khi qua B16 (observability) và B17 (containerize/CI), đây là lần rà soát bảo mật tổng thể đầu tiên: không xây thêm tính năng, chỉ vá lỗ hổng.
+
+<OwaspTop10ChecklistDiagram />
+
+<Technical>
+
+### OWASP Top 10 (2021) — soi vào đúng taskflow-api
+
+| # | Hạng mục | Trạng thái ở taskflow-api |
+|---|---|---|
+| A01 | Broken Access Control | ✅ B06 — `requireRole` + lọc `organization_id` trong WHERE |
+| A02 | Cryptographic Failures | ✅ B05 — argon2id cho mật khẩu, JWT ký bằng secret riêng |
+| A03 | Injection | ✅ B04 — Drizzle parameterized query; B15 viết test xác nhận |
+| A04 | Insecure Design | 🛠️ B15 — quyết định scope rate limit theo route |
+| A05 | Security Misconfiguration | 🛠️ B15 — `@fastify/helmet` + CORS allowlist |
+| A06 | Vulnerable Components | 🛠️ B15 — quy trình `pnpm audit` |
+| A07 | Identification & Auth Failures | ✅ B05 — access/refresh token, revoke thật trong DB |
+| A08 | Software & Data Integrity Failures | ⏭️ B17 — pipeline CI (lint/test/build trước merge) |
+| A09 | Logging & Monitoring Failures | ⏭️ B16 — structured log + requestId (B15 chỉ chặn rò secret trong log) |
+| A10 | SSRF | ⏭️ chưa phát sinh — `taskflow-api` chưa có tính năng gọi URL do user cung cấp |
+
+### Vì sao A03 (Injection) coi như "đã xong" từ B04?
+
+Drizzle không nối chuỗi SQL bằng string concatenation. Khi bạn viết:
+
+```ts title="src/routes/tasks.ts"
+await db.insert(tasks).values({ title: input.title, projectId });
+```
+
+Drizzle sinh ra một câu lệnh **parameterized**: giá trị `input.title` được gửi tới Postgres như một THAM SỐ riêng (`$1`, `$2`...), không phải được chèn thẳng vào chuỗi SQL. Dù `input.title` là `"'; DROP TABLE tasks; --"`, Postgres chỉ hiểu đó là một chuỗi ký tự cần lưu, không phải một câu lệnh mới cần thực thi.
+
+Điều này KHÔNG có nghĩa là injection không bao giờ xảy ra được — nó chỉ đúng khi mọi nơi trong code đều dùng Drizzle query builder. Một dòng `db.execute(sql.raw(rawInput))` nối chuỗi input trực tiếp vẫn có thể mở lại lỗ hổng này.
+
+### Vì sao module này KHÔNG dạy lại auth/RBAC?
+
+`taskflow-api` đã có access control (A01) và authentication (A07) từ B05/B06 — bài học ở đó đã đi sâu vào JWT, refresh token, `requireRole`, lọc `organization_id`. Ở đây ta chỉ **nối lại** các mảnh ghép đó vào bức tranh OWASP Top 10, để nhìn thấy: bảo mật không phải một module riêng lẻ, mà là tổng của nhiều quyết định nhỏ trải dài suốt course.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Xem Drizzle sinh SQL thật thế nào khi tạo task (log ở mức debug)",
+      command: `DEBUG=drizzle:query pnpm dev`,
+      output: `query: insert into "tasks" ("id", "title", "project_id") values ($1, $2, $3) -- params: ["c1a9...", "Fix login bug", "b7e2..."]`,
+    },
+    {
+      comment: "Rà soát codebase: có nơi nào tự nối chuỗi SQL bằng backtick không đi qua Drizzle query builder?",
+      command: `grep -rn "sql.raw(" src/ --include="*.ts"`,
+      output: `(không có kết quả — không có nơi nào dùng sql.raw() với input người dùng)`,
+    },
+  ]}
+/>
+
+<Callout type="warning">
+  "Đã dùng ORM là an toàn" là một giả định nguy hiểm. Luôn tự hỏi: có chỗ nào trong code gọi `db.execute(sql.raw(...))`, ghép chuỗi truy vấn tay, hoặc gọi driver Postgres thô mà không qua Drizzle query builder không? Đó là nơi injection vẫn có thể quay lại.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "OWASP Top 10", meaning: "Danh sách 10 rủi ro bảo mật web phổ biến nhất, cập nhật định kỳ bởi cộng đồng OWASP." },
+    { term: "Injection", meaning: "Chèn input độc hại để thay đổi ý nghĩa của một câu lệnh (SQL, shell...) mà ứng dụng thực thi." },
+    { term: "Parameterized query", meaning: "Câu lệnh SQL truyền giá trị qua tham số riêng ($1, $2...), không nối chuỗi trực tiếp." },
+    { term: "Broken Access Control", meaning: "Lỗi để user thực hiện hành động hoặc xem dữ liệu vượt quyền của mình." },
+    { term: "Security Misconfiguration", meaning: "Cấu hình mặc định/thiếu sót (header, CORS, permission...) tạo ra lỗ hổng dù code logic đúng." },
+  ]}
+/>
+
+<QuickCheck
+  question="taskflow-api dùng Drizzle ORM cho mọi query từ B04. Vì sao A03 (Injection) trong bảng OWASP ở trên được đánh dấu 'đã xử lý' thay vì để module B15 dạy từ đầu?"
+  options={[
+    "Vì injection không còn là rủi ro thật trong bất kỳ ứng dụng nào dùng ORM",
+    "Vì Drizzle build câu lệnh bằng parameterized query từ B04 — rủi ro injection cổ điển đã giảm thiểu từ đó; B15 chỉ viết test để xác nhận bằng thực nghiệm",
+    "Vì injection chỉ xảy ra với MySQL, không xảy ra với PostgreSQL",
+    "Vì B04 đã tắt hoàn toàn khả năng ghi dữ liệu text tự do",
+  ]}
+  answerIndex={1}
+  explanation="Việc chọn Drizzle (parameterized query) từ B04 đã là lớp phòng thủ chính chống injection cổ điển. B15 không dạy lại khái niệm này — nó thêm một test thực nghiệm để chứng minh điều đó đúng, đúng tinh thần 'đọc lỗi thật, không giả định suông' của course."
+/>

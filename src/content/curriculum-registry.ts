@@ -11,6 +11,7 @@ import { b09BackgroundJobsSchedulingModule } from "./modules/b09-background-jobs
 import { b10CachingForBackendModule } from "./modules/b10-caching-for-backend/module-meta";
 import { b13GrpcInternalServicesModule } from "./modules/b13-grpc-internal-services/module-meta";
 import { b14MicroserviceSplitEventDrivenModule } from "./modules/b14-microservice-split-event-driven/module-meta";
+import { b15SecurityForBackendModule } from "./modules/b15-security-for-backend/module-meta";
 import { m01LinuxShellModule } from "./modules/m01-linux-shell/module-meta";
 import { m02NetworkingModule } from "./modules/m02-networking/module-meta";
 import { m03DevopsMindsetGitModule } from "./modules/m03-devops-mindset-git/module-meta";
@@ -62,6 +63,7 @@ export const curriculumModules: ModuleDefinition[] = [
   b10CachingForBackendModule,
   b13GrpcInternalServicesModule,
   b14MicroserviceSplitEventDrivenModule,
+  b15SecurityForBackendModule,
   m01LinuxShellModule,
   m02NetworkingModule,
   m03DevopsMindsetGitModule,
