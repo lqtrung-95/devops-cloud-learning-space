@@ -1,0 +1,138 @@
+import { PresignedUploadVsThroughAppDiagram } from "../diagrams/presigned-upload-vs-through-app-diagram";
+import { MultipartUploadRetryDiagram } from "../diagrams/multipart-upload-retry-diagram";
+
+<Eli5 title="Presigned URL giống một vé vào kho chỉ dùng được một lần, đúng việc, đúng giờ" emoji="🎫">
+  Cách chậm: bạn mang hàng tới **quầy lễ tân** (app server), lễ tân nhận hàng từ bạn rồi tự mang vào kho (object storage) giùm bạn. Lễ tân vừa tốn công gấp đôi (nhận rồi lại mang đi), vừa là người duy nhất — đông khách một chút là kẹt cứng.
+
+  Cách nhanh: lễ tân chỉ **ký một tấm vé** ghi rõ "vé này cho phép đưa đúng 1 kiện vào đúng ô X, hết hạn sau 5 phút". Bạn cầm vé đó tự đi thẳng vào kho, không qua quầy nữa. Lễ tân rảnh tay để lo việc khác.
+
+  Còn file quá lớn thì sao? Giống **chuyển nhà**: thay vì bê nguyên cái tủ (nếu rớt giữa đường phải bê lại từ đầu), bạn chia thành nhiều **thùng nhỏ đánh số**. Thùng nào rớt vỡ thì chỉ đóng lại đúng thùng đó, không phải làm lại toàn bộ. Cuối cùng ráp các thùng theo đúng số thứ tự.
+</Eli5>
+
+Đây là lỗi kiến trúc phổ biến: để app server nhận nguyên file rồi tự forward sang object storage. Nó nhân đôi băng thông (nhận từ client, gửi lại object storage), giữ RAM/kết nối lâu, và biến một app server vốn stateless/dễ scale thành nút thắt cổ chai cho đúng mỗi việc upload.
+
+<PresignedUploadVsThroughAppDiagram />
+
+<Technical>
+
+### Luồng upload chuẩn: presigned URL
+
+1. Client gọi app xin phép upload, gửi metadata nhỏ (filename, content-type, size dự kiến) — **không gửi file**.
+2. App kiểm tra quyền, giới hạn loại file/kích thước, sinh một object key (ví dụ `uploads/<uuid>-<filename>`), rồi gọi SDK sinh **presigned URL**.
+3. Client dùng URL đó `PUT` file thẳng lên object storage — app server không nằm trên đường đi của bytes.
+4. Client báo app "đã upload xong" (hoặc app nhận qua event/webhook của object storage); app ghi metadata vào DB, có thể enqueue việc quét virus chạy async trước khi đánh dấu file "sẵn sàng dùng".
+
+```ts title="src/routes/uploads.ts"
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+const s3 = new S3Client({
+  endpoint: process.env.S3_ENDPOINT, // http://minio:9000 trong sd-playground
+  forcePathStyle: true,              // bắt buộc với MinIO — không dùng virtual-hosted-style
+  region: "us-east-1",
+  credentials: { accessKeyId: process.env.S3_KEY!, secretAccessKey: process.env.S3_SECRET! },
+});
+
+async function presignUpload(key: string, contentType: string) {
+  const command = new PutObjectCommand({ Bucket: "uploads", Key: key, ContentType: contentType });
+  return getSignedUrl(s3, command, { expiresIn: 300 }); // 5 phút — càng ngắn càng an toàn
+}
+```
+
+Điểm hay bị bỏ sót khi ký URL: **giới hạn đúng những gì URL cho phép làm**. Presigned URL chỉ trao quyền cho *đúng thao tác đã ký* (ví dụ `PutObject` với đúng `key`, đúng `Content-Type`) — nó không tự nhiên hạn chế kích thước hay cho phép thao tác khác nếu bạn không khai báo điều kiện đó lúc ký (`content-length-range`, `key` cụ thể thay vì prefix rộng).
+
+### Multipart upload
+
+Với file lớn, chia thành nhiều **part** upload độc lập:
+
+1. `CreateMultipartUpload` → nhận `uploadId`.
+2. Nhiều `UploadPart(uploadId, partNumber, body)` — có thể **song song**, mỗi part trả về một `ETag`.
+3. `CompleteMultipartUpload(uploadId, parts: [{partNumber, ETag}, ...])` — object storage ráp các part theo đúng thứ tự `partNumber` thành một object hoàn chỉnh.
+
+<MultipartUploadRetryDiagram />
+
+Giới hạn cần nhớ khi tính part size:
+
+- Part size **tối thiểu 5 MiB**, trừ **part cuối cùng** được phép nhỏ hơn.
+- **Tối đa 10.000 part** cho một multipart upload — file càng lớn thì part size càng phải lớn hơn mức tối thiểu để không vượt số lượng này (ví dụ file 100 GB cần part size tối thiểu khoảng 10 MiB, không thể giữ 5 MiB).
+- Part lỗi chỉ cần **retry đúng part đó**, không cần upload lại toàn bộ file — đây là lý do multipart chịu lỗi mạng tốt hơn hẳn một `PUT` duy nhất cho file lớn.
+- Multipart upload **chưa complete** vẫn chiếm dung lượng (và tính phí) trên object storage; nên có lifecycle rule tự động **abort incomplete multipart upload** sau N ngày.
+
+```ts title="src/routes/multipart.ts (rút gọn)"
+const { UploadId } = await s3.send(new CreateMultipartUploadCommand({ Bucket: "uploads", Key: key }));
+
+const parts = await Promise.all(
+  chunks.map(async (chunk, index) => {
+    const partNumber = index + 1;
+    const { ETag } = await s3.send(
+      new UploadPartCommand({ Bucket: "uploads", Key: key, UploadId, PartNumber: partNumber, Body: chunk }),
+    );
+    return { ETag, PartNumber: partNumber };
+  }),
+);
+
+await s3.send(
+  new CompleteMultipartUploadCommand({ Bucket: "uploads", Key: key, UploadId, MultipartUpload: { Parts: parts } }),
+);
+```
+
+### Virus scan & trạng thái file
+
+Vì upload đi thẳng client → object storage, app **không thấy nội dung file lúc upload**. Muốn quét virus trước khi cho dùng: đánh dấu file `status = 'pending_scan'` khi client báo hoàn tất, một worker async tải object về quét (ClamAV hoặc dịch vụ tương đương), rồi cập nhật `status = 'clean'`/`'quarantined'` — đúng mô hình outbox/event của SD07, chỉ khác event là `FileUploaded` thay vì `OrderPlaced`.
+
+| Cách upload | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Qua app server (client → app → object storage) | App kiểm soát toàn bộ nội dung ngay lúc nhận (dễ validate/quét ngay) | Băng thông nhân đôi, app giữ kết nối lâu, dễ thành bottleneck với file lớn | File rất nhỏ, cần xử lý đồng bộ ngay (ví dụ resize ảnh nhỏ trước khi lưu) |
+| Presigned URL, PUT đơn | App không cầm bytes, đơn giản | Không phù hợp file rất lớn hoặc mạng không ổn định (lỗi phải upload lại từ đầu) | File vừa (vài chục MB trở xuống), mạng ổn định |
+| Presigned URL + multipart | Chịu lỗi mạng tốt (retry từng part), có thể upload song song | Phức tạp hơn để cài đặt và theo dõi trạng thái từng part | File lớn (hàng trăm MB tới hàng chục GB) |
+
+**Khi nào đổi ý:** nếu cần xử lý đồng bộ ngay khi nhận (ví dụ kiểm duyệt nội dung bắt buộc trước khi lưu), chấp nhận cho app server làm trạm trung chuyển cho riêng loại file đó, nhưng vẫn giới hạn kích thước chặt và stream thay vì buffer toàn bộ vào RAM.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo file test 200MB", command: "dd if=/dev/urandom of=big.bin bs=1M count=200", output: "200+0 records in\n200+0 records out\n209715200 bytes transferred" },
+    { comment: "Xin presigned URL từ app", command: "curl -s -X POST localhost:8080/uploads/presign -d '{\"filename\":\"big.bin\",\"contentType\":\"application/octet-stream\"}' -H 'content-type: application/json'", output: "{\"url\":\"http://localhost:9000/uploads/uploads/ab12-big.bin?X-Amz-...\",\"key\":\"uploads/ab12-big.bin\"}" },
+    { comment: "PUT thẳng lên MinIO bằng URL vừa nhận — app không thấy byte nào", command: "curl -T big.bin \"http://localhost:9000/uploads/uploads/ab12-big.bin?X-Amz-...\"", output: "" },
+    { comment: "Xác nhận file đã lên đủ dung lượng", command: "mc stat local/uploads/uploads/ab12-big.bin", output: "Name      : ab12-big.bin\nSize      : 200 MiB" },
+    { comment: "So khớp checksum sau khi tải lại — kiểm tra toàn vẹn", command: "mc cat local/uploads/uploads/ab12-big.bin | md5sum && md5sum big.bin", output: "3f9a1c... -\n3f9a1c... big.bin" },
+  ]}
+/>
+
+<Callout type="mistake" title="Ký presigned URL hết hạn quá lâu hoặc không giới hạn content-length">
+  URL hết hạn sau 24 giờ và không giới hạn kích thước có thể bị lộ (log, lịch sử trình duyệt, proxy) rồi bị lạm dụng để nạp file khổng lồ vào đúng bucket của bạn suốt thời gian đó. Đặt expiry ngắn (vài phút, đủ cho việc upload thực tế) và luôn ký kèm điều kiện `content-length-range`.
+</Callout>
+
+<Callout type="warning" title="Quên dọn multipart upload chưa complete">
+  Nếu client bỏ dở giữa chừng, các part đã upload vẫn tồn tại và tính phí dù không bao giờ complete. Bật lifecycle rule "Abort incomplete multipart uploads after N days" trên bucket.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi "thiết kế upload file lớn" gần như luôn kỳ vọng bạn nói tới: (1) app server không cầm bytes — presigned URL, (2) multipart cho file lớn với ngưỡng 5 MiB/part và 10.000 part, (3) làm sao biết upload xong (client callback hoặc event từ object storage), và (4) xử lý nội dung chưa tin cậy (virus scan async) trước khi coi file là "sẵn sàng".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "presigned URL", meaning: "Link có chữ ký, hết hạn, chỉ cho đúng thao tác/điều kiện đã ký khi tạo." },
+    { term: "multipart upload", meaning: "Chia file thành nhiều part upload độc lập rồi ráp lại bằng CompleteMultipartUpload." },
+    { term: "part / ETag", meaning: "Một phần dữ liệu trong multipart upload; ETag là checksum object storage trả về sau mỗi UploadPart, cần cho bước complete." },
+    { term: "abort incomplete multipart upload", meaning: "Lifecycle rule tự xoá các part mồ côi của upload không bao giờ complete." },
+    { term: "content-length-range", meaning: "Điều kiện ký kèm presigned URL để giới hạn kích thước object được phép PUT." },
+    { term: "forcePathStyle", meaning: "Cấu hình SDK dùng dạng URL path-style (bắt buộc với MinIO thay vì virtual-hosted-style)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một multipart upload có part 1 (6 MiB), part 2 (6 MiB), part 3 lỗi mạng giữa chừng, part 4 (6 MiB, part cuối, đã upload xong). Cách xử lý đúng khi phát hiện part 3 lỗi?"
+  options={[
+    "Huỷ toàn bộ multipart upload và upload lại từ part 1",
+    "Chỉ upload lại (retry) đúng part 3, giữ nguyên ETag của part 1, 2, 4 đã có",
+    "Bỏ qua part 3, gọi CompleteMultipartUpload với 3 part còn lại",
+    "Giảm part size xuống 1 MiB cho toàn bộ file rồi làm lại"
+  ]}
+  answerIndex={1}
+  explanation="Giống chuyển nhà chia thùng: thùng nào rớt thì đóng lại đúng thùng đó, không bê lại cả nhà. Các part khác đã có ETag hợp lệ, chỉ cần retry part 3 rồi gọi CompleteMultipartUpload với đủ 4 part theo đúng thứ tự — bỏ sót một part sẽ làm complete thất bại."
+/>

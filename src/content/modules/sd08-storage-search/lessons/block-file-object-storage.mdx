@@ -1,0 +1,105 @@
+import { StorageTierComparisonDiagram } from "../diagrams/storage-tier-comparison-diagram";
+
+<Eli5 title="Object storage giống một kho tự quản (self-storage) khổng lồ" emoji="📦">
+  Bạn thuê hẳn **một phòng riêng** trong nhà (ổ cứng gắn thẳng vào 1 máy) thì nhanh và riêng tư, nhưng chỉ mình bạn dùng được. Cả văn phòng dùng chung **một ổ đĩa mạng** (NAS) có cây thư mục thì ai cũng vào được, nhưng chậm hơn và khó phình ra hàng chục triệu file nhỏ.
+
+  Còn **kho tự quản**: bạn không tự khiêng hàng vào tận kệ. Bạn đưa cho nhân viên một **mã số** (key), họ (hoặc xe nâng tự động) lấy đúng kiện đó ra. Bạn không thể "sửa một góc" trong kiện hàng — muốn đổi thì phải mang nguyên kiện mới vào thay thế. Đổi lại, kho này chứa được gần như vô hạn kiện hàng và không quan tâm bạn đặt tên file gì.
+
+  Ba mô hình đó là **block, file và object storage** — khác nhau ở đơn vị dữ liệu và cách truy cập, không phải cái nào "tốt hơn" cái nào.
+</Eli5>
+
+Chọn sai storage cho một access pattern là quyết định rất tốn công sửa sau này: dữ liệu người dùng upload (ảnh, video, PDF) gần như luôn nên nằm ở object storage, không phải một cột `bytea` trong Postgres hay ổ đĩa cục bộ của app server — vì app server là stateless (SD03) và ổ đĩa của nó biến mất khi container restart.
+
+<StorageTierComparisonDiagram />
+
+<Technical>
+
+### Block, file, object — ba đơn vị dữ liệu khác nhau
+
+| Loại | Đơn vị dữ liệu | Truy cập | Ví dụ | Dùng khi |
+|---|---|---|---|---|
+| Block storage | Block cố định kích thước, không có khái niệm "file" ở tầng này | Gắn (attach) vào đúng 1 instance; OS format thành filesystem; random read/write nhanh | AWS EBS, ổ đĩa GCE Persistent Disk | Đĩa của database, cần latency thấp và không chia sẻ |
+| File storage | File trong cây thư mục, ngữ nghĩa POSIX | Nhiều instance mount cùng lúc qua NFS/SMB | AWS EFS | Thư mục dùng chung giữa nhiều server cũ (legacy), config file |
+| Object storage | Object = `key` + blob + metadata, phẳng (không thư mục thật, `/` chỉ là ký tự trong key) | HTTP API: `PutObject`/`GetObject`/`DeleteObject`; **không** sửa một phần — phải ghi lại cả object | AWS S3, MinIO | File người dùng upload, backup, static asset, log, dữ liệu bất biến quy mô lớn |
+
+Điểm hay bị hiểu sai: object storage **không phải** ổ đĩa mạng chậm hơn. Nó là một mô hình khác hẳn — bù lại việc không sửa được một phần của file (phải PUT lại nguyên object), nó đổi lấy khả năng scale ngang gần như vô hạn và một API HTTP đơn giản mà bất kỳ service nào cũng gọi được, không cần mount filesystem.
+
+### Durability của object storage
+
+AWS mô tả S3 được thiết kế cho độ bền rất cao (thường nhắc tới con số "11 số 9" mỗi năm) nhờ tự động replicate/erasure-code dữ liệu qua nhiều thiết bị trong nhiều Availability Zone. Đây là **mục tiêu thiết kế của nhà cung cấp**, không phải một định luật vật lý — luôn kiểm tra tài liệu mới nhất cho con số và phạm vi chính xác (theo class lưu trữ, theo region), và nhớ rằng durability của *dữ liệu lưu trữ* khác với *availability của service* (S3 vẫn có SLA uptime riêng).
+
+### Storage class & lifecycle
+
+S3 có nhiều storage class đánh đổi **chi phí lưu trữ** lấy **latency truy xuất** và **chi phí truy xuất**:
+
+| Storage class (khái niệm) | Latency truy xuất | Chi phí lưu trữ | Dùng khi |
+|---|---|---|---|
+| Standard | Mili-giây, truy cập ngay | Cao nhất | Dữ liệu truy cập thường xuyên |
+| Infrequent Access (IA) | Mili-giây, nhưng phí lấy ra (retrieval fee) cao hơn | Thấp hơn Standard | Dữ liệu ít đọc nhưng cần sẵn sàng ngay khi đọc |
+| Glacier (các mức retrieval khác nhau) | Từ vài phút tới vài giờ tuỳ mức | Rất thấp | Backup, dữ liệu lưu trữ dài hạn theo quy định |
+
+`Lifecycle rule` tự động chuyển object giữa các class theo tuổi (`transition after N days`) hoặc xoá hẳn (`expiration`) — ví dụ: log giữ ở Standard 30 ngày, chuyển IA tới 90 ngày, sau đó Glacier, xoá sau 1 năm. Tên gọi và số mức chính xác của mỗi class thay đổi theo thời gian — nói ý tưởng "đánh đổi latency lấy chi phí" quan trọng hơn nhớ tên chính xác.
+
+### Serving nội dung: CDN và signed URL
+
+Hai cách phổ biến để phục vụ nội dung từ object storage:
+
+- **Nội dung công khai, ít đổi** (ảnh sản phẩm, asset tĩnh): đặt **CDN phía trước object storage** (SD04) — cache ở edge, giảm tải và latency cho người đọc ở xa.
+- **Nội dung riêng tư** (file cá nhân, hoá đơn): dùng **signed URL/presigned URL** — một link có chữ ký, hết hạn sau một khoảng thời gian, chỉ cho phép đúng thao tác đã ký (thường là `GET`). App không cần tự proxy file để kiểm tra quyền mỗi lần tải — ký một URL ngắn hạn rồi để client tải thẳng.
+
+| Cách serve | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| CDN + object storage, cache công khai | Nhanh, giảm tải origin, chi phí băng thông thấp | Không hợp cho nội dung riêng tư cần kiểm soát theo từng user | Ảnh, video công khai, static asset |
+| Signed/presigned URL trực tiếp | Kiểm soát quyền chi tiết theo từng request, hết hạn ngắn | Mỗi lần cần link mới phải gọi app để ký; khó cache ở CDN | File riêng tư, upload, tải xuống có kiểm soát |
+
+**Khi nào đổi ý:** nội dung riêng tư nhưng traffic rất lớn (video premium cho hàng triệu user) vẫn có thể đặt CDN phía trước, dùng **signed cookie/signed URL của chính CDN** để vừa cache được vừa kiểm soát quyền — phức tạp hơn nhưng cần khi signed URL trực tiếp không đủ tải.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Thêm MinIO (S3-compatible) vào sd-playground và khởi động", command: "docker compose up -d minio", output: "Container sd-playground-minio-1  Started" },
+    { comment: "Cấu hình alias cho CLI mc trỏ vào MinIO local", command: "mc alias set local http://localhost:9000 minioadmin minioadmin", output: "Added `local` successfully." },
+    { comment: "Tạo bucket cho file upload", command: "mc mb local/uploads", output: "Bucket created successfully `local/uploads`." },
+    { comment: "Upload thử một file bằng mc — tương đương PutObject", command: "mc cp ./avatar.png local/uploads/avatar.png", output: "avatar.png: 42.10 KiB / 42.10 KiB ✓" },
+    { comment: "Object là key phẳng — không có \"thư mục thật\" dù nhìn giống", command: "mc ls local/uploads", output: "[2026-09-16 10:02:11 +07]  42KiB STANDARD avatar.png" },
+  ]}
+/>
+
+<Callout type="mistake" title="Coi object storage như một ổ đĩa mạng có thể sửa từng phần">
+  Không có "mở file, seek tới byte 1000, ghi đè, đóng file" trên object storage — mọi lần sửa là ghi lại nguyên object mới (dù chỉ đổi 1 byte). Ứng dụng nào cần sửa ngẫu nhiên từng phần file liên tục (ví dụ ghi log nối tiếp vào cùng 1 file, hay filesystem cho ứng dụng cũ) nên dùng block hoặc file storage, rồi định kỳ archive sang object storage.
+</Callout>
+
+<Callout type="cost" title="Xoá sớm khỏi storage class rẻ có thể bị tính phí">
+  Storage class rẻ (IA, Glacier) thường có "minimum storage duration" — xoá hoặc chuyển class trước thời hạn tối thiểu vẫn bị tính phí như đủ thời hạn. Đọc kỹ điều khoản trước khi đặt lifecycle rule chuyển dữ liệu có vòng đời ngắn.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi được hỏi "file người dùng upload lưu ở đâu", câu trả lời mạnh không chỉ nói "S3" mà giải thích **vì sao**: app server stateless (SD03) nên không giữ file trên đĩa cục bộ; object storage tách rời khỏi vòng đời app, scale độc lập, và cho phép serve trực tiếp qua signed URL/CDN mà không tốn tài nguyên app. Nhắc thêm storage class theo tần suất truy cập cho thấy bạn nghĩ tới chi phí, không chỉ chức năng.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "block storage", meaning: "Ổ đĩa ảo gắn riêng cho một máy, đơn vị dữ liệu là block cố định, format thành filesystem." },
+    { term: "file storage (NFS/EFS)", meaning: "Filesystem chia sẻ được nhiều máy mount cùng lúc, ngữ nghĩa POSIX." },
+    { term: "object storage", meaning: "Lưu trữ phẳng theo key, truy cập qua HTTP API, không sửa một phần object." },
+    { term: "durability", meaning: "Khả năng dữ liệu không bị mất theo thời gian — mục tiêu thiết kế của nhà cung cấp, kiểm tra tài liệu mới nhất cho con số cụ thể." },
+    { term: "storage class", meaning: "Cấp lưu trữ đánh đổi chi phí lưu trữ với latency/chi phí truy xuất." },
+    { term: "lifecycle rule", meaning: "Quy tắc tự động chuyển class hoặc xoá object theo tuổi." },
+    { term: "signed/presigned URL", meaning: "Link có chữ ký, hết hạn, chỉ cho đúng thao tác đã ký — đào sâu ở bài sau." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một service cũ (legacy) cần nhiều instance cùng đọc/ghi vào đúng một cây thư mục dùng chung, có thao tác kiểu POSIX (rename, append). Lựa chọn hợp lý nhất?"
+  options={[
+    "Object storage, vì scale tốt nhất",
+    "File storage (kiểu NFS/EFS) — giữ đúng ngữ nghĩa POSIX và cho nhiều instance mount chung",
+    "Block storage gắn cho từng instance rồi đồng bộ thủ công",
+    "Lưu trực tiếp trong bảng Postgres dạng bytea",
+  ]}
+  answerIndex={1}
+  explanation="Object storage không hỗ trợ append/rename kiểu POSIX và không mount như filesystem. Khi yêu cầu thực sự là 'nhiều máy cùng dùng chung một cây thư mục với ngữ nghĩa file truyền thống', file storage là lựa chọn đúng — dù về dài hạn nên cân nhắc thiết kế lại để dùng object storage nếu access pattern cho phép."
+/>

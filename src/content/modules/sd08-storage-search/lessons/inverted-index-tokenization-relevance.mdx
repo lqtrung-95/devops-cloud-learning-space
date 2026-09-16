@@ -1,0 +1,128 @@
+import { InvertedIndexBuilderDiagram } from "../diagrams/inverted-index-builder-diagram";
+
+<Eli5 title="Inverted index giống mục lục cuối sách giáo khoa" emoji="📚">
+  Muốn tìm mọi chỗ sách nhắc tới "quang hợp", bạn có hai cách. Cách chậm: lật từng trang từ đầu tới cuối, đọc hết rồi ghi lại trang nào có từ đó — đây là **forward index**, tra theo tài liệu trước rồi mới ra nội dung.
+
+  Cách nhanh: dở tới **mục lục cuối sách**, tìm chữ "quang hợp", nó ghi sẵn "trang 12, 45, 88". Bạn nhảy thẳng tới đó. Ai đó đã tốn công đọc cả cuốn sách một lần, dựng sẵn mục lục — đổi lại, mọi lần tra sau đều gần như tức thì. Đó chính là **inverted index**: với mỗi từ (token), lưu sẵn danh sách tài liệu chứa nó (postings list), thay vì lưu theo tài liệu.
+
+  Việc "đọc và tách chữ" trước khi đưa vào mục lục gọi là **tokenization** — và cách bạn tách chữ (có bỏ dấu câu không, có quy "chạy"/"đang chạy" về cùng gốc không) quyết định tra từ nào thì ra kết quả nào.
+</Eli5>
+
+Mọi search engine — từ `grep`, Postgres full-text search, tới Elasticsearch/OpenSearch — đều dựa trên ý tưởng này. Hiểu nó giúp bạn đọc được lý do một câu tìm kiếm không ra kết quả tưởng như "rõ ràng phải có", và biết khi nào Postgres là đủ, khi nào cần một search engine riêng (bài sau).
+
+<InvertedIndexBuilderDiagram />
+
+<Technical>
+
+### Tokenization pipeline
+
+Trước khi vào index, văn bản đi qua vài bước biến đổi:
+
+1. **Lowercase** — "Cache" và "cache" phải là cùng một token (trừ khi cố tình phân biệt hoa/thường).
+2. **Tách từ (tokenize)** theo khoảng trắng/dấu câu — tuỳ ngôn ngữ mà phức tạp khác nhau (tiếng Việt không có khoảng trắng giữa mọi "từ" theo nghĩa ngôn ngữ học, tiếng Trung/Nhật không có khoảng trắng — cần tokenizer riêng).
+3. **Bỏ stopword** — từ quá phổ biến, ít giá trị phân biệt ("và", "the", "là"…) — tuỳ ngôn ngữ và use case, đôi khi giữ lại nếu stopword mang nghĩa (ví dụ "to be or not to be").
+4. **Stemming/lemmatization** — quy các biến thể về cùng gốc ("running", "runs", "ran" → "run") để tìm "run" vẫn ra kết quả chứa "running".
+
+Bỏ qua bước 4 là lỗi rất hay gặp: người dùng gõ số ít, tài liệu chứa số nhiều — không khớp dù "rõ ràng cùng một ý".
+
+### Cấu trúc inverted index
+
+```text
+token       postings list (documentId, [vị trí trong tài liệu])
+─────────────────────────────────────────────────────────────
+cache    →  [doc0, doc2]
+index    →  [doc1, doc2]
+nhanh    →  [doc2]
+database →  [doc3]
+```
+
+Tra "cache" là tra thẳng một hàng trong bảng băm/B-tree của index — không quét lại toàn bộ tài liệu. Đây chính là lý do search "nhanh": chi phí dựng index trả trước một lần (tokenize + ghi postings), chi phí tra cứu gần như hằng số theo số tài liệu.
+
+Tìm nhiều từ (`"cache" AND "index"`) là **giao (intersection)** hai postings list; tìm `OR` là **hợp (union)**. Postings list càng dài (từ càng phổ biến) thì phép giao càng tốn — đây là lý do loại bỏ stopword giúp cả kích thước index lẫn tốc độ truy vấn.
+
+### Relevance: từ TF-IDF tới BM25
+
+Có nhiều tài liệu khớp một truy vấn — câu hỏi tiếp theo là **xếp hạng** thế nào. Ý tưởng cốt lõi:
+
+- **Term Frequency (TF):** từ xuất hiện càng nhiều lần trong một tài liệu, tài liệu đó càng liên quan tới từ đó.
+- **Inverse Document Frequency (IDF):** từ xuất hiện trong **càng ít** tài liệu thì càng "đặc trưng", mang nhiều thông tin hơn (từ nào cũng có trong 99% tài liệu thì gần như vô nghĩa để phân biệt).
+- **BM25** (Best Matching 25) là công thức phổ biến hiện nay, cải tiến TF-IDF thuần bằng cách **bão hoà** ảnh hưởng của TF (lặp một từ 100 lần không nên tốt gấp 100 lần lặp 1 lần) và **chuẩn hoá theo độ dài tài liệu** (tài liệu dài tự nhiên có nhiều từ hơn, không nên vì thế mà luôn thắng). BM25 là similarity mặc định của Elasticsearch/OpenSearch ở các phiên bản phổ biến hiện nay — tham số điều chỉnh độ bão hoà (`k1`) và mức chuẩn hoá độ dài (`b`) có thể khác nhau tuỳ cấu hình/phiên bản, nên tránh nhớ một con số cố định và luôn kiểm tra tài liệu của phiên bản đang dùng.
+
+### Postgres full-text search
+
+Postgres có sẵn cơ chế tương đương một inverted index nhỏ, đủ tốt cho nhiều ứng dụng:
+
+```sql
+-- to_tsvector: tokenize + bỏ stopword + stem theo "dictionary" (vd 'english')
+SELECT to_tsvector('english', 'The runners are running fast');
+-- 'fast':5 'runner':2 'run':4
+
+ALTER TABLE articles ADD COLUMN search_vector tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || body)) STORED;
+
+CREATE INDEX articles_search_idx ON articles USING GIN (search_vector);
+
+SELECT id, ts_rank(search_vector, query) AS rank
+FROM articles, to_tsquery('english', 'kubernetes & scaling') query
+WHERE search_vector @@ query
+ORDER BY rank DESC LIMIT 20;
+```
+
+`tsvector` là inverted index được Postgres tự dựng và lưu ngay trong bảng; `GIN` (Generalized Inverted Index) là loại B-tree-như-index tối ưu cho dữ liệu "một dòng có nhiều giá trị" như tập token. `ts_rank` cho điểm relevance đơn giản hơn BM25 nhưng đủ dùng cho phần lớn ứng dụng vừa và nhỏ.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Tự build inverted index (TypeScript, in-memory) | Hiểu rõ cơ chế, không phụ thuộc gì thêm | Không bền (mất khi restart), không ranking tốt, không cập nhật incremental dễ dàng, không scale | Học tập, dataset rất nhỏ và tĩnh |
+| Postgres `tsvector` + GIN | Không cần vận hành hệ thống mới, luôn nhất quán với dữ liệu gốc (cùng transaction) | Ranking đơn giản hơn BM25, ít tính năng (không autocomplete/fuzzy mạnh), giới hạn bởi scale một Postgres instance | Vài trăm nghìn tới vài triệu tài liệu, không cần facet/fuzzy phức tạp |
+| Search engine chuyên dụng (Elasticsearch/OpenSearch) | BM25, facet, fuzzy matching, highlight, scale ngang qua nhiều shard | Thêm hệ thống phải vận hành, dữ liệu **eventually consistent** với DB nguồn (bài sau) | Chục triệu tài liệu trở lên, cần tính năng tìm kiếm nâng cao |
+
+**Khi nào đổi ý:** bắt đầu với `tsvector` nếu đã dùng Postgres — chỉ chuyển sang search engine riêng khi đã chạm giới hạn thật (latency, tính năng thiếu, hoặc chi phí vận hành một Postgres to hơn còn đắt hơn thêm một service search).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem to_tsvector tokenize + stem thế nào", command: "psql -U app -d app -c \"SELECT to_tsvector('english', 'The runners are running fast');\"", output: "                 to_tsvector\n----------------------------------------\n 'fast':5 'run':2,4" },
+    { comment: "Tạo GIN index cho cột search_vector", command: "psql -U app -d app -c \"CREATE INDEX articles_search_idx ON articles USING GIN (search_vector);\"", output: "CREATE INDEX" },
+    { comment: "So sánh query plan trước/sau khi có GIN index", command: "psql -U app -d app -c \"EXPLAIN ANALYZE SELECT id FROM articles WHERE search_vector @@ to_tsquery('english', 'kubernetes & scaling');\"", output: "Bitmap Heap Scan on articles (cost=... rows=42)\n  Recheck Cond: (search_vector @@ '''kubernet'' & ''scale'''::tsquery)\n  ->  Bitmap Index Scan on articles_search_idx\nExecution Time: 1.842 ms" },
+  ]}
+/>
+
+<Callout type="mistake" title="Dùng LIKE '%keyword%' để tìm kiếm văn bản">
+  `WHERE body LIKE '%kubernetes%'` bắt buộc quét tuần tự (không dùng được B-tree index thông thường), chậm dần theo số dòng, và không xử lý số ít/số nhiều, hoa/thường, hay xếp hạng liên quan. Đây là dấu hiệu rõ ràng cần `tsvector`/GIN hoặc search engine.
+</Callout>
+
+<Callout type="tip" title="Chọn đúng 'dictionary' theo ngôn ngữ">
+  `to_tsvector('english', ...)` dùng luật stemming tiếng Anh — áp cho nội dung tiếng Việt sẽ cho kết quả stem sai hoặc không stem gì cả. Với nội dung đa ngôn ngữ, cân nhắc dictionary `simple` (chỉ tokenize, không stem) hoặc một search engine có hỗ trợ tokenizer riêng cho ngôn ngữ đó.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi bàn về search, người phỏng vấn thường muốn nghe bạn phân biệt được **tokenization ảnh hưởng gì tới kết quả** (không chỉ nói "dùng Elasticsearch") và giải thích được **vì sao tra inverted index nhanh** (không phải "vì nó là NoSQL"). Nhắc BM25 là similarity mặc định, và biết khi nào `tsvector` của Postgres là đủ thay vì mặc định nhảy sang một cluster search mới, cho thấy bạn cân nhắc chi phí vận hành.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "token", meaning: "Đơn vị từ/chuỗi sau khi tách văn bản, dùng làm khoá trong inverted index." },
+    { term: "inverted index", meaning: "Cấu trúc token → danh sách tài liệu chứa token đó (postings list)." },
+    { term: "postings list", meaning: "Danh sách document id (và có thể cả vị trí) chứa một token." },
+    { term: "stemming/lemmatization", meaning: "Quy các biến thể của một từ về cùng gốc để tìm kiếm khớp linh hoạt hơn." },
+    { term: "stopword", meaning: "Từ quá phổ biến, thường bị loại khỏi index để giảm kích thước và tăng chất lượng kết quả." },
+    { term: "TF-IDF", meaning: "Điểm relevance dựa trên tần suất từ trong tài liệu (TF) và độ hiếm của từ trên toàn bộ tập dữ liệu (IDF)." },
+    { term: "BM25", meaning: "Công thức relevance phổ biến hiện nay, bão hoà TF và chuẩn hoá theo độ dài tài liệu; similarity mặc định của Elasticsearch/OpenSearch." },
+    { term: "tsvector / GIN index", meaning: "Cơ chế full-text search có sẵn của Postgres và loại index tối ưu cho nó." },
+  ]}
+/>
+
+<QuickCheck
+  question="Corpus có 4 tài liệu, từ 'the' xuất hiện trong cả 4, từ 'kubernetes' chỉ xuất hiện trong 1 tài liệu. Theo ý tưởng TF-IDF/BM25, từ nào mang nhiều thông tin phân biệt hơn khi xếp hạng kết quả?"
+  options={[
+    "'the' — vì xuất hiện nhiều lần hơn tổng thể",
+    "'kubernetes' — vì độ hiếm (xuất hiện trong ít tài liệu hơn) làm nó đặc trưng hơn, IDF cao hơn",
+    "Cả hai như nhau vì đều được tokenize",
+    "Không so sánh được nếu chưa biết BM25 k1/b cụ thể",
+  ]}
+  answerIndex={1}
+  explanation="Mục lục mà từ nào cũng dẫn tới mọi trang thì vô dụng để phân biệt. 'the' xuất hiện khắp nơi nên IDF thấp, đóng góp ít vào điểm relevance; 'kubernetes' hiếm hơn nên IDF cao, tài liệu chứa nó nổi bật rõ hơn khi xếp hạng — đây là lý do stopword như 'the' thường bị loại khỏi index."
+/>

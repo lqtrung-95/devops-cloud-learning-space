@@ -1,0 +1,111 @@
+import { SearchSyncDualWriteVsOutboxDiagram } from "../diagrams/search-sync-dual-write-vs-outbox-diagram";
+
+<Eli5 title="Search engine giống một chi nhánh thư viện chuyên tra cứu nhanh" emoji="🏛️">
+  Kho sách chính (**database**) là nơi giữ sự thật — mọi thay đổi phải qua đó trước. Nhưng kho chính không tối ưu để tra cứu kiểu "tìm mọi sách nhắc tới X, xếp theo mức liên quan". Vậy thành phố mở thêm một **chi nhánh chuyên tra cứu** (**search engine** như OpenSearch/Elasticsearch): sách ở chi nhánh là **bản sao**, luôn được chuyển từ kho chính sang sau một khoảng trễ ngắn — không bao giờ là nguồn sự thật.
+
+  Nếu bạn để nhân viên **tự tay** cập nhật cả hai nơi mỗi lần có sách mới (**dual write**) — ghi vào kho chính rồi chạy sang chi nhánh cập nhật — chỉ cần nhân viên đó bận việc khác giữa chừng (crash) là hai nơi **lệch nhau mãi mãi**, không ai biết để sửa. Cách chắc hơn: dùng đúng "người chuyển phát" (**outbox + relay**) đã dựng ở module trước — ghi kho chính xong là tự động có phiếu chuyển đi, không phụ thuộc nhân viên nhớ hay không.
+</Eli5>
+
+Đây là nơi mọi kiến thức trong module này khớp lại: storage giữ file, database giữ sự thật, và search index là một **read model phái sinh** — luôn đồng bộ *sau* DB, không bao giờ được coi là nguồn dữ liệu gốc.
+
+<SearchSyncDualWriteVsOutboxDiagram />
+
+<Technical>
+
+### Index, shard, replica
+
+Trong OpenSearch/Elasticsearch, khái niệm tương ứng gần đúng với thế giới database quan hệ:
+
+| Khái niệm search engine | Tương đương gần đúng | Ghi chú |
+|---|---|---|
+| Index | Table | Một tập document cùng loại, có mapping (schema) riêng |
+| Shard | Partition (SD06) | Một index được chia thành nhiều shard để scale ghi/đọc và song song hoá |
+| Replica shard | Read replica | Bản sao của shard, phục vụ đọc và chịu lỗi khi một node chết |
+
+Số lượng **primary shard** thường cố định lúc tạo index — muốn đổi phải tạo index mới rồi **reindex** dữ liệu sang, sau đó chuyển alias trỏ sang index mới (gần giống zero-downtime migration ở SD05/SD06). Chi tiết cấu hình mapping/shard chính xác khác nhau giữa phiên bản Elasticsearch và OpenSearch — luôn kiểm tra tài liệu của phiên bản đang dùng trước khi quyết định số shard cho production.
+
+### Đồng bộ dữ liệu từ DB nguồn sang search index
+
+Ba cách phổ biến, y hệt vấn đề "đồng bộ hai hệ thống" đã gặp ở SD07:
+
+**1. Dual write** — app tự ghi cả DB lẫn search engine trong cùng request:
+
+```ts
+await db.query("UPDATE products SET price = $1 WHERE id = $2", [newPrice, id]); // ①
+await opensearchClient.index({ index: "products", id, document: { price: newPrice } }); // ②
+```
+
+Crash giữa ① và ② làm hai hệ thống lệch nhau **vĩnh viễn** — không có cơ chế nào tự phát hiện. Đây chính là dual-write problem của SD07, chỉ đổi "Kafka" thành "search engine".
+
+**2. Outbox + relay (khuyến nghị mặc định, tái dùng nguyên bảng `outbox` từ SD07)** — ghi DB và ghi event `ProductUpdated` trong cùng transaction; relay đọc outbox chưa publish rồi **upsert** document vào search engine theo đúng `id`:
+
+```ts title="src/relay/search-sync.ts (thêm nhánh cho relay đã có ở SD07)"
+if (row.type === "ProductUpdated") {
+  await opensearchClient.index({ index: "products", id: row.aggregate_id, document: row.payload });
+  // index theo cùng id → gọi lại nhiều lần cho ra kết quả giống nhau (idempotent)
+}
+```
+
+Vì `index` (upsert) ghi đè toàn bộ document theo `id`, gọi lại nhiều lần (outbox là at-least-once) **vô hại** — khác với ví dụ gửi email ở SD07, ở đây không cần bảng `processed_messages` riêng vì bản thân phép ghi đã idempotent.
+
+**3. Change Data Capture (CDC)** — một connector (như Debezium) đọc trực tiếp WAL của Postgres, tự phát hiện `INSERT`/`UPDATE`/`DELETE` trên bảng `products` mà không cần sửa code ghi hay bảng outbox — đánh đổi bằng việc vận hành thêm Kafka Connect và theo dõi replication slot (đã nói ở SD07).
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Dual write | Đơn giản nhất để viết | Lệch dữ liệu vĩnh viễn khi crash giữa chừng, không tự phát hiện | Hầu như không nên dùng cho dữ liệu cần đúng |
+| Outbox + relay | Tái dùng hạ tầng SD07; at-least-once; upsert theo id nên tự idempotent | Có polling latency (chu kỳ relay); phải viết code publish event khi ghi | Mặc định cho hầu hết hệ thống đã có outbox |
+| CDC (Debezium đọc WAL) | Không cần sửa code ghi nghiệp vụ; bắt được cả thay đổi từ nguồn khác (batch job, migration) | Thêm Kafka Connect; lộ schema nội bộ bảng `products`; phải giám sát replication slot | Nhiều bảng cần đồng bộ, không muốn sửa từng chỗ ghi, hoặc dữ liệu bị đổi từ nhiều nguồn ngoài app |
+
+**Khi nào đổi ý:** bắt đầu bằng outbox + relay vì hạ tầng đã có sẵn từ SD07; chuyển sang CDC khi số bảng cần đồng bộ tăng lên và việc thêm `INSERT INTO outbox` vào mọi chỗ ghi trở nên rải rác, khó bảo trì.
+
+### Search index luôn là eventual consistency
+
+Dù dùng cách nào, luôn có một khoảng trễ giữa lúc DB commit và lúc search engine phản ánh thay đổi — vài trăm mili-giây (CDC) tới vài giây (relay polling chu kỳ dài). Đây **không phải lỗi**, mà là đặc điểm thiết kế cần nói rõ với người dùng/sản phẩm: vừa sửa giá xong tìm ngay có thể vẫn thấy giá cũ trong chốc lát. Với dữ liệu bắt buộc phải "đọc thấy ngay sau khi ghi" (ví dụ giỏ hàng), đọc thẳng từ DB thay vì qua search index.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Thêm OpenSearch single-node vào sd-playground (chỉ dùng cấu hình này cho lab local)", command: "docker compose up -d opensearch", output: "Container sd-playground-opensearch-1  Started" },
+    { comment: "Kiểm tra cluster đã lên", command: "curl -s localhost:9200 | jq .version.number", output: "\"2.15.0\"" },
+    { comment: "Tạo index products với mapping tối thiểu", command: "curl -s -X PUT localhost:9200/products -H 'content-type: application/json' -d '{\"mappings\":{\"properties\":{\"name\":{\"type\":\"text\"},\"price\":{\"type\":\"float\"}}}}'", output: "{\"acknowledged\":true,\"shards_acknowledged\":true,\"index\":\"products\"}" },
+    { comment: "Sửa giá một sản phẩm qua API (ghi outbox trong cùng transaction)", command: "curl -s -X PATCH localhost:8080/products/p1 -d '{\"price\":120000}' -H 'content-type: application/json'", output: "{\"id\":\"p1\",\"price\":120000,\"status\":\"updated\"}" },
+    { comment: "Poll search mỗi 100ms cho tới khi thấy giá mới — đo độ trễ đồng bộ", command: "until curl -s 'localhost:9200/products/_doc/p1' | jq -e '._source.price == 120000' >/dev/null; do sleep 0.1; done; echo done", output: "done  (≈ 340ms sau COMMIT — tuỳ chu kỳ poll của relay, cần benchmark trên máy bạn)" },
+  ]}
+/>
+
+<Callout type="mistake" title="Coi search index là nguồn sự thật">
+  Sửa dữ liệu trực tiếp trong OpenSearch mà không qua DB, hoặc để một tính năng chỉ đọc/ghi từ search index mà không có bản gốc ở DB, sẽ mất dữ liệu vĩnh viễn nếu phải xoá và dựng lại index (reindex do đổi mapping, hay sự cố cluster). Search index phải luôn **rebuildable 100% từ DB** — đó là lý do nó gọi là "chi nhánh", không phải "kho chính".
+</Callout>
+
+<Callout type="warning" title="Security plugin tắt trong sd-playground chỉ dùng cho local">
+  Cấu hình `plugins.security.disabled=true` giúp lab đơn giản (không cần cấu hình TLS/user) nhưng **không bao giờ** dùng ngoài production — mọi client có thể đọc/ghi/xoá toàn bộ dữ liệu không cần xác thực.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi thiết kế có "search riêng khỏi DB chính", câu hỏi tiếp theo gần như chắc chắn là "đồng bộ thế nào, và nếu lệch thì sao?". Trả lời mạnh: nêu tên **dual-write problem**, đề xuất **outbox/relay tái dùng hạ tầng đã có** (hoặc CDC nếu nhiều bảng), giải thích index theo `id` là tự nhiên idempotent, và thừa nhận thẳng **eventual consistency** kèm con số độ trễ đo được thay vì né tránh.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "index (search engine)", meaning: "Tập document cùng loại trong OpenSearch/Elasticsearch, tương đương một table." },
+    { term: "shard / replica shard", meaning: "Phân mảnh dữ liệu của index (để scale) và bản sao của shard (để chịu lỗi, phục vụ đọc)." },
+    { term: "upsert", meaning: "Ghi đè toàn bộ document theo id nếu đã tồn tại, tạo mới nếu chưa — khiến việc index lại vô hại (idempotent)." },
+    { term: "reindex + alias swap", meaning: "Tạo index mới với mapping mới, chép dữ liệu sang, rồi chuyển alias để đổi không downtime." },
+    { term: "eventual consistency (search)", meaning: "Search index luôn phản ánh DB sau một độ trễ, không phải tức thời." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team dùng dual write (app tự ghi Postgres rồi tự gọi OpenSearch). Sau vài tuần vận hành, một số sản phẩm có giá hiển thị sai trên tìm kiếm dù DB đúng, và không ai biết từ khi nào. Vấn đề gốc và cách sửa đúng theo bài học là gì?"
+  options={[
+    "OpenSearch bị bug, cần nâng cấp phiên bản mới nhất",
+    "Dual write không phát hiện được lỗi khi một trong hai lệnh ghi thất bại/app crash giữa chừng — chuyển sang outbox + relay upsert theo id (hoặc CDC) để đảm bảo mọi thay đổi DB cuối cùng đều tới search",
+    "Cần thêm cache Redis giữa app và OpenSearch để tránh lệch dữ liệu",
+    "Giảm số replica shard của index products xuống 0 để tránh không đồng bộ giữa các replica",
+  ]}
+  answerIndex={1}
+  explanation="Hai lệnh ghi không chung transaction (dual write) là nguyên nhân gốc — giống hệt dual-write problem ở SD07, chỉ khác đích đến là search engine thay vì message broker. Outbox đảm bảo event luôn được ghi cùng transaction với thay đổi DB, và relay upsert theo id làm việc gửi lại (do crash, do retry) trở nên vô hại."
+/>
