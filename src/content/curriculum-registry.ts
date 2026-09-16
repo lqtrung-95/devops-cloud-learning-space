@@ -9,6 +9,7 @@ import { b07TestingBackendModule } from "./modules/b07-testing-backend/module-me
 import { b08FileUploadObjectStorageModule } from "./modules/b08-file-upload-object-storage/module-meta";
 import { b09BackgroundJobsSchedulingModule } from "./modules/b09-background-jobs-scheduling/module-meta";
 import { b10CachingForBackendModule } from "./modules/b10-caching-for-backend/module-meta";
+import { b13GrpcInternalServicesModule } from "./modules/b13-grpc-internal-services/module-meta";
 import { b14MicroserviceSplitEventDrivenModule } from "./modules/b14-microservice-split-event-driven/module-meta";
 import { m01LinuxShellModule } from "./modules/m01-linux-shell/module-meta";
 import { m02NetworkingModule } from "./modules/m02-networking/module-meta";
@@ -59,6 +60,7 @@ export const curriculumModules: ModuleDefinition[] = [
   b08FileUploadObjectStorageModule,
   b09BackgroundJobsSchedulingModule,
   b10CachingForBackendModule,
+  b13GrpcInternalServicesModule,
   b14MicroserviceSplitEventDrivenModule,
   m01LinuxShellModule,
   m02NetworkingModule,

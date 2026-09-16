@@ -1,0 +1,106 @@
+import { ProtoFieldNumberingEvolutionDiagram } from "../diagrams/proto-field-numbering-evolution-diagram";
+
+<Eli5 title="Field number giống số ô trong tủ khoá bưu điện, không phải nhãn dán" emoji="📮">
+  Tủ khoá bưu điện có các ô đánh số cố định: ô số 1, ô số 2, ô số 3... Người gửi thư bỏ thư vào đúng SỐ Ô, không quan tâm ô đó dán nhãn gì. Nếu bưu điện đổi nhãn dán trên ô số 2 từ "Thư thường" thành "Thư ưu tiên" nhưng vẫn là ô số 2, người gửi cũ vẫn bỏ đúng thư vào đúng ô — không ai bị lạc thư.
+
+  Nhưng nếu bưu điện lấy ô số 2 (từng dùng cho "Thư thường") rồi giao lại đúng số đó cho một mục đích hoàn toàn khác ("Bưu kiện cỡ lớn") — người gửi cũ vẫn quen tay bỏ thư thường vào đó, và bưu kiện cỡ lớn thật sự lại bị nhét/đọc nhầm là thư thường. Đó chính là lỗi tái sử dụng field number trong Protobuf.
+</Eli5>
+
+<ProtoFieldNumberingEvolutionDiagram />
+
+<Technical>
+
+### Quy tắc tiến hoá `.proto` an toàn
+
+| Thay đổi | An toàn? | Vì sao |
+|---|---|---|
+| Thêm field mới với number chưa dùng | ✅ An toàn | Client cũ không biết field mới tồn tại — bỏ qua nó, dùng giá trị mặc định. Server mới đọc client cũ — chỉ thấy field đó rỗng/mặc định |
+| Đổi TÊN field, giữ nguyên number và kiểu | ✅ An toàn (với code sinh lại) | Field number là thứ trên wire, tên chỉ ảnh hưởng code sinh ra ở ngôn ngữ lập trình |
+| Xoá field, đánh dấu `reserved <number>;` | ✅ An toàn | Ngăn ai đó vô tình tái sử dụng đúng number đã xoá cho việc khác trong tương lai |
+| Xoá field nhưng KHÔNG `reserved`, rồi sau này dùng lại number đó cho field khác | ❌ Phá vỡ | Client cũ (nếu còn tồn tại ở đâu đó) gửi dữ liệu theo nghĩa field cũ vào đúng number đó — server mới decode nhầm sang nghĩa field mới |
+| Đổi KIỂU dữ liệu của field đang dùng (`string` → `int32`) | ❌ Phá vỡ | Wire type mã hoá khác nhau giữa các kiểu — bên nhận decode sai byte, có thể lỗi hoặc ra giá trị vô nghĩa |
+| Đổi field number của field đang dùng | ❌ Phá vỡ | Coi như xoá field cũ + thêm field mới cùng lúc — client/server chưa đồng bộ sẽ đọc nhầm hoàn toàn |
+
+Quy tắc nhớ nhanh: **field number là hợp đồng vĩnh viễn** một khi đã deploy ra ít nhất 1 client thật. Muốn đổi ý, luôn "thêm field number mới" — không bao giờ "tái chế" field number cũ.
+
+```proto title="notification-service/proto/notification.proto — thêm field ưu tiên, backward-compatible"
+message SendNotificationRequest {
+  string notification_id = 1;
+  string user_id = 2;
+  string type = 3;
+  string payload_json = 4;
+  optional string priority = 5; // MỚI ở bản này — số 5 chưa từng dùng, an toàn thêm vào
+}
+```
+
+Nếu sau này cần xoá hẳn `payload_json` (ví dụ đổi hướng thiết kế), cách đúng là:
+
+```proto title="Xoá field đúng cách — reserved, không tái sử dụng số 4"
+message SendNotificationRequest {
+  reserved 4;
+  reserved "payload_json";
+  string notification_id = 1;
+  string user_id = 2;
+  string type = 3;
+  optional string priority = 5;
+}
+```
+
+`reserved 4;` và `reserved "payload_json";` báo cho `protoc`/`proto-loader` biết: cả number `4` lẫn tên `payload_json` không được dùng lại nữa trong message này — kể cả vô tình.
+
+### So sánh nhanh gRPC nội bộ vs REST nội bộ (đúc kết cả module)
+
+| Tiêu chí | REST/JSON nội bộ | gRPC/Protobuf nội bộ |
+|---|---|---|
+| Contract | Ngầm định qua tài liệu/code, không ép buộc lúc runtime | `.proto` ép buộc — sinh code từ đúng 1 nguồn sự thật |
+| Debug thủ công | `curl` trực tiếp, đọc JSON bằng mắt | Cần `grpcurl` hoặc script client — không đọc bytes bằng mắt được |
+| Payload | Lớn hơn (tên field lặp lại mỗi message) | Nhỏ hơn (field number, không lặp tên) — chỉ đáng kể khi tần suất cao |
+| Streaming | Phải tự chế (polling, SSE, WebSocket) | Có sẵn 4 kiểu streaming qua HTTP/2 |
+| Tiến hoá API | Thêm/bớt field JSON thoải mái, dễ tuỳ tiện | Có quy tắc rõ ràng (field number), nhưng phải tuân thủ nghiêm ngặt hơn |
+| Gọi từ browser | Trực tiếp, không cần gì thêm | Cần grpc-web hoặc gateway trung gian — không gọi thẳng từ browser |
+
+**Kết luận thực dụng cho `taskflow-api`:** gRPC hợp lý cho gọi service-to-service nội bộ như `worker → notification-service` (không có browser nào gọi thẳng `notification-service`). Route công khai `/api/v1/...` mà client di động/web gọi vẫn giữ nguyên REST/JSON — đổi toàn bộ API công khai sang gRPC không nằm trong phạm vi module này và không cần thiết cho `taskflow-api`.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Thêm field priority (backward-compatible) vào notification.proto", command: "sed -i '' 's/string payload_json = 4;/string payload_json = 4;\\n  optional string priority = 5;/' notification-service/proto/notification.proto" },
+    { comment: "Deploy lại notification-service TRƯỚC (server mới hiểu field 5, client worker vẫn cũ)", command: "docker compose up -d --build notification-service", output: "[+] Running 1/1\n ✔ Container taskflow-api-notification-service-1  Started" },
+    { comment: "worker (client cũ, chưa biết field priority) vẫn gọi SendNotification bình thường", command: "docker compose logs worker --tail 3", output: "[worker] job task-status-changed completed" },
+    { comment: "Xác nhận notification-service không hề lỗi khi nhận request thiếu field 5", command: "docker compose logs notification-service --tail 3", output: "[notification-service] delivering task_status_changed to user u_1 (notification n_9f2c)" },
+    { comment: "Sau đó mới cập nhật worker để BẮT ĐẦU gửi kèm priority — không cần deploy đồng thời với notification-service", command: "docker compose up -d --build worker" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Nghĩ rằng phải deploy `worker` và `notification-service` CÙNG LÚC mỗi khi đổi `.proto`. Với thay đổi backward-compatible (chỉ thêm field mới), hai service được phép lệch version tạm thời — đây chính là lý do field-number discipline quan trọng: nó cho phép rolling deploy độc lập giữa các service.
+</Callout>
+
+<Callout type="tip" title="Góc nhìn thực dụng khi phỏng vấn/review code">
+  Nếu ai hỏi "gRPC có nhanh hơn REST không", câu trả lời tốt không phải "có" hay "không" — mà là: với 1 cuộc gọi lẻ, thường không đáng kể; giá trị thật là contract chặt (`.proto`), sinh code tự động, và streaming built-in qua HTTP/2. Đây là câu trả lời trung thực hơn khẩu hiệu marketing.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "reserved", meaning: "Từ khoá `.proto` đánh dấu một field number (hoặc tên) đã xoá, cấm dùng lại trong tương lai để tránh xung đột dữ liệu cũ/mới." },
+    { term: "Backward-compatible change", meaning: "Thay đổi `.proto` mà client cũ vẫn hoạt động đúng với server mới (và ngược lại) — điển hình là chỉ thêm field number mới." },
+    { term: "Breaking change (proto)", meaning: "Đổi kiểu, đổi number, hoặc tái sử dụng number đã xoá — khiến bên cũ/mới decode sai dữ liệu của nhau." },
+    { term: "Rolling deploy", meaning: "Triển khai service này trước, service kia sau, chấp nhận có khoảng thời gian hai bên chạy khác version — chỉ an toàn nếu thay đổi backward-compatible." },
+    { term: "grpcurl", meaning: "Công cụ dòng lệnh gọi thử gRPC service thủ công, tương đương `curl` cho REST — không dùng trong lab này nhưng hữu ích để debug thực tế." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một field `string old_channel = 6;` bị xoá khỏi `SendNotificationRequest` nhưng KHÔNG khai báo `reserved 6;`. Sáu tháng sau, một lập trình viên khác thêm field mới `int32 retry_count = 6;` (vô tình trùng số). Điều gì có thể xảy ra nếu vẫn còn một client cũ nào đó (chưa cập nhật) gửi request có field số 6 theo nghĩa cũ?"
+  options={[
+    "Không có vấn đề gì — Protobuf tự nhận ra field 6 đã đổi nghĩa và bỏ qua giá trị cũ",
+    "Server mới sẽ decode nhầm dữ liệu string cũ (gửi ở field 6) thành một giá trị int32, gây lỗi hoặc dữ liệu vô nghĩa — đây chính xác là lý do phải luôn reserved field number đã xoá",
+    "gRPC sẽ tự động từ chối kết nối từ client cũ",
+    "Không ảnh hưởng vì payload_json đã bao gồm toàn bộ dữ liệu",
+  ]}
+  answerIndex={1}
+  explanation="Đây là ví dụ kinh điển của việc tái sử dụng field number: bên nhận decode theo định nghĩa MỚI (int32) trong khi bytes trên wire được mã hoá theo định nghĩa CŨ (string) — kết quả là dữ liệu sai hoặc lỗi decode. `reserved 6;` tồn tại chính để công cụ sinh code cảnh báo nếu ai đó vô tình tái sử dụng lại số này."
+/>

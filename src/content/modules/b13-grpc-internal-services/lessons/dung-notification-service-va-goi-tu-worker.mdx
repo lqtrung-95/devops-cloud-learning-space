@@ -1,0 +1,249 @@
+import { WorkerNotificationServiceGrpcCallDiagram } from "../diagrams/worker-notification-service-grpc-call-diagram";
+
+<Eli5 title="Tách bếp phụ ra khỏi bếp chính, nhưng sổ ghi order vẫn ở bếp chính" emoji="🏠">
+  Từ B09, "bếp chính" (`worker`) vừa nấu (xử lý job) vừa tự ghi vào sổ order (bảng `notifications`) vừa tự đi giao tận tay khách. Giờ ta thuê một đội giao hàng riêng (`notification-service`) chỉ lo phần **giao** — nhưng cuốn sổ order (bảng `notifications` trong Postgres) vẫn ở bếp chính, đội giao hàng không cầm sổ, không tự viết vào sổ. Bếp chính viết sổ xong, gọi điện (`gRPC`) báo đội giao hàng: "đơn này giao giúp tôi", đội giao hàng giao xong thì báo lại "giao xong rồi".
+</Eli5>
+
+### Lựa chọn data ownership cho `notification-service` — và vì sao chọn vậy
+
+Trước khi viết code: `notification-service` có nên có kết nối Postgres riêng, đọc/ghi thẳng bảng `notifications` không?
+
+**Quyết định của module này: KHÔNG.** `notification-service` **không có kết nối Postgres**. `worker` (đã có sẵn từ B09) vẫn là chủ sở hữu duy nhất của bảng `notifications` — vẫn tự `INSERT` như cũ. `notification-service` chỉ nhận một request gRPC gọn nhẹ (`SendNotification`) và chịu trách nhiệm cho **side effect gửi đi** (ví dụ: log ra như một bước giả lập gửi push/email — chưa cần tích hợp nhà cung cấp thật ở module này), rồi trả về đã "delivered" hay chưa.
+
+Lý do chọn hướng này thay vì cho `notification-service` một bảng/DB riêng ngay bây giờ:
+
+1. **Đúng phạm vi của B13.** Mục tiêu module này là tách phần **giao tiếp** (gọi hàm trực tiếp → gọi qua gRPC), chưa phải tách toàn bộ **quyền sở hữu dữ liệu**. Nhét cả hai thay đổi lớn (đổi giao thức gọi + đổi ai giữ DB) vào cùng 1 module làm khó review và khó rollback nếu có lỗi.
+2. **Nối đúng với B14.** Curriculum B14 dạy đúng chủ đề "data ownership khi tách service (`notification-service` có DB/bảng riêng, không đọc thẳng bảng của `api`)" như một khái niệm MỚI, cùng với outbox pattern. Nếu B13 đã cho `notification-service` DB riêng, B14 sẽ không còn gì mới để dạy ở phần đó. B13 cố tình dừng ở "tách giao tiếp", để B14 dạy trọn vẹn bước "tách dữ liệu" — đây là ranh giới service boundary mà mọi module `b14+` sẽ dựa vào.
+3. **Ít rủi ro đồng bộ dữ liệu hơn.** Nếu `notification-service` có DB riêng ngay bây giờ, phải giải quyết ngay câu hỏi "ai là nguồn sự thật khi có xung đột" — một vấn đề đáng ra thuộc về outbox pattern ở B14. Giữ 1 nguồn sự thật (`worker`/`api` sở hữu bảng `notifications`) tránh vấn đề đó phát sinh sớm.
+
+<Callout type="warning" title="Đây là quyết định thiết kế có đánh đổi — không phải 'chân lý' duy nhất">
+  Một lựa chọn hợp lệ khác (không dùng ở module này) là cho `notification-service` bảng riêng ngay từ B13. Cả hai đều đúng về mặt kỹ thuật; điều quan trọng là **chọn một, nêu rõ lý do, và nhất quán** — vì các module sau sẽ build tiếp trên đúng ranh giới đã chọn.
+</Callout>
+
+<WorkerNotificationServiceGrpcCallDiagram />
+
+<Technical>
+
+### Scaffold `notification-service` — thêm service mới vào `docker-compose.yml` (mục 3 curriculum)
+
+`notification-service` build từ Dockerfile riêng của chính nó, khác với `api`/`worker` (dùng chung 1 Dockerfile):
+
+```yaml title="docker-compose.yml"
+services:
+  # ... api, postgres, redis, minio, worker giữ nguyên như các module trước ...
+
+  notification-service:
+    build: ./notification-service # Dockerfile riêng, base node:22-slim
+    ports: ["50051:50051"]
+    # KHÔNG có DATABASE_URL — không kết nối Postgres, đúng quyết định data ownership ở trên
+```
+
+```dockerfile title="notification-service/Dockerfile"
+FROM node:22-slim
+WORKDIR /app
+COPY package.json pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --frozen-lockfile --prod
+COPY . .
+EXPOSE 50051
+CMD ["node", "--experimental-strip-types", "src/server.ts"]
+```
+
+### Server: implement `NotificationService`
+
+```ts title="notification-service/src/server.ts"
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import * as grpc from "@grpc/grpc-js";
+import * as protoLoader from "@grpc/proto-loader";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PROTO_PATH = path.join(__dirname, "../proto/notification.proto");
+
+const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
+  keepCase: true,
+  longs: String,
+  enums: String,
+  defaults: true,
+  oneofs: true,
+});
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- proto-loader không có type tĩnh cho package definition
+const proto = grpc.loadPackageDefinition(packageDefinition) as any;
+const notificationProto = proto.taskflow.notification.v1;
+
+function sendNotification(
+  call: grpc.ServerUnaryCall<{ notification_id: string; user_id: string; type: string; payload_json: string }, unknown>,
+  callback: grpc.sendUnaryData<{ delivered: boolean; delivery_id: string }>,
+) {
+  const { notification_id, user_id, type } = call.request;
+
+  // Side effect "gửi đi" thật sự sẽ nằm ở đây (push provider, email...).
+  // Module này giả lập bằng log — notification-service KHÔNG đọc/ghi Postgres.
+  console.log(`[notification-service] delivering ${type} to user ${user_id} (notification ${notification_id})`);
+
+  callback(null, { delivered: true, delivery_id: `dl_${notification_id}` });
+}
+
+function streamNotifications(
+  call: grpc.ServerWritableStream<{ user_id: string }, unknown>,
+) {
+  // Bản demo tối giản cho B13 — chưa nối vào dữ liệu notification thật hay SSE của B11.
+  call.write({ notification_id: "demo-1", type: "task_status_changed", payload_json: "{}", created_at_epoch_ms: Date.now() });
+  call.end();
+}
+
+const server = new grpc.Server();
+server.addService(notificationProto.NotificationService.service, {
+  SendNotification: sendNotification,
+  StreamNotifications: streamNotifications,
+});
+
+server.bindAsync("0.0.0.0:50051", grpc.ServerCredentials.createInsecure(), (error) => {
+  if (error) throw error;
+  console.log("[notification-service] gRPC server listening on :50051");
+  // Ghi chú phiên bản: các bản @grpc/grpc-js gần đây tự start server ngay khi bindAsync
+  // thành công — không cần gọi thêm `server.start()`. Kiểm tra CHANGELOG của bản đang cài
+  // nếu dùng phiên bản cũ hơn yêu cầu gọi `server.start()` tường minh.
+});
+```
+
+`grpc.ServerCredentials.createInsecure()` nghĩa là không có TLS — chấp nhận được cho gọi nội bộ trong Docker network riêng tư của lab này; production thật nên bật TLS hoặc mTLS giữa các service (nội dung sâu hơn nằm ở B15 bảo mật).
+
+### Client: `worker` gọi `SendNotification` thay vì `INSERT` trực tiếp side-effect gửi
+
+```ts title="src/grpc/notification-client.ts"
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import * as grpc from "@grpc/grpc-js";
+import * as protoLoader from "@grpc/proto-loader";
+import { env } from "../lib/env.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PROTO_PATH = path.join(__dirname, "../../proto/notification.proto");
+
+const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
+  keepCase: true,
+  longs: String,
+  enums: String,
+  defaults: true,
+  oneofs: true,
+});
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const proto = grpc.loadPackageDefinition(packageDefinition) as any;
+const notificationProto = proto.taskflow.notification.v1;
+
+const client = new notificationProto.NotificationService(
+  env.NOTIFICATION_SERVICE_URL, // "notification-service:50051" trong docker-compose network
+  grpc.credentials.createInsecure(),
+);
+
+interface SendNotificationInput {
+  notificationId: string;
+  userId: string;
+  type: string;
+  payloadJson: string;
+}
+
+export function sendNotification(input: SendNotificationInput): Promise<{ delivered: boolean; deliveryId: string }> {
+  return new Promise((resolve, reject) => {
+    const deadline = new Date(Date.now() + 3000); // 3s — tránh worker treo vô hạn nếu notification-service không phản hồi
+    client.SendNotification(
+      { notification_id: input.notificationId, user_id: input.userId, type: input.type, payload_json: input.payloadJson },
+      { deadline },
+      (error: grpc.ServiceError | null, response: { delivered: boolean; delivery_id: string }) => {
+        if (error) return reject(error);
+        resolve({ delivered: response.delivered, deliveryId: response.delivery_id });
+      },
+    );
+  });
+}
+```
+
+### Sửa `src/worker.ts` — thêm bước gọi gRPC, vẫn giữ nguyên `INSERT notifications`
+
+```ts title="src/worker.ts"
+import { sendNotification } from "./grpc/notification-client.js";
+// ... các import khác giữ nguyên như B09 ...
+
+new Worker<TaskStatusChangedJobData>(
+  "notifications",
+  async (job) => {
+    const { taskId, organizationId, actorId, oldStatus, newStatus } = job.data;
+
+    const [notification] = await db.transaction(async (tx) => {
+      await tx.insert(activityLogs).values({
+        organizationId,
+        actorId,
+        action: "task.status_changed",
+        entityType: "task",
+        entityId: taskId,
+        metadata: { oldStatus, newStatus },
+      });
+
+      // worker VẪN là chủ sở hữu bảng notifications — không đổi so với B09.
+      return tx
+        .insert(notifications)
+        .values({ userId: actorId, type: "task_status_changed", payload: { taskId, oldStatus, newStatus } })
+        .returning();
+    });
+
+    // Bước MỚI ở B13: gọi notification-service qua gRPC để thực hiện side effect "gửi đi".
+    // Nếu lệnh này throw, BullMQ sẽ retry đúng job này (đã cấu hình attempts/backoff từ B09) —
+    // bản ghi notification đã insert ở trên KHÔNG bị rollback, chỉ có bước "gửi" bị lặp lại.
+    await sendNotification({
+      notificationId: notification.id,
+      userId: notification.userId,
+      type: notification.type,
+      payloadJson: JSON.stringify(notification.payload),
+    });
+  },
+  { connection: redisConnection },
+);
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Scaffold thư mục notification-service", command: "mkdir -p notification-service/src notification-service/proto" },
+    { comment: "Copy notification.proto (bài trước) vào notification-service/proto/", command: "cp notification.proto notification-service/proto/notification.proto" },
+    { comment: "Khởi tạo package.json riêng cho notification-service (process độc lập, không dùng chung node_modules với api)", command: "cd notification-service && pnpm init && pnpm add @grpc/grpc-js @grpc/proto-loader", output: "Packages: +2" },
+    { comment: "Build & chạy notification-service qua Compose", command: "docker compose up -d --build notification-service", output: "[+] Running 1/1\n ✔ Container taskflow-api-notification-service-1  Started" },
+    { comment: "Xác nhận server đã bind cổng 50051", command: "docker compose logs notification-service", output: "[notification-service] gRPC server listening on :50051" },
+    { comment: "Đổi task status thật để kích hoạt toàn bộ chuỗi worker → gRPC → notification-service", command: "curl -s -X PATCH localhost:3000/api/v1/tasks/<id> -d '{\"status\":\"done\"}'" },
+    { comment: "Xem log notification-service nhận và 'giao' notification", command: "docker compose logs notification-service --tail 5", output: "[notification-service] delivering task_status_changed to user u_1 (notification n_9f2c)" },
+  ]}
+/>
+
+<Callout type="warning" title="Đừng để lỗi gRPC làm mất bản ghi notification đã ghi">
+  `sendNotification(...)` chạy SAU khi transaction Postgres đã commit. Nếu gRPC call lỗi, đừng viết code rollback ngược lại bản ghi `notifications` đã lưu — bản ghi đó vẫn đúng về mặt nghiệp vụ (notification tồn tại), chỉ có bước "gửi" chưa thành công. Để BullMQ retry đúng job, không tự chế cơ chế rollback thủ công phức tạp hơn cần thiết.
+</Callout>
+
+<Callout type="mistake">
+  Quên set `deadline` cho gRPC call. Không có deadline, nếu `notification-service` treo (không lỗi hẳn, chỉ chậm), `worker` có thể chờ vô thời hạn, chiếm giữ 1 "chỗ" xử lý job trong khi các job khác vẫn phải đợi.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Data ownership", meaning: "Quy ước ai được phép đọc/ghi trực tiếp một bảng dữ liệu — ở B13, `worker` là chủ sở hữu duy nhất của bảng `notifications`." },
+    { term: "Side effect gửi đi (delivery side effect)", meaning: "Hành động thực sự 'đưa notification tới nơi cần tới' (push/email/log) — tách biệt khỏi việc lưu trữ dữ liệu notification." },
+    { term: "deadline", meaning: "Thời hạn tối đa client chờ response của 1 gRPC call trước khi tự huỷ, tránh treo vô thời hạn." },
+    { term: "`grpc.credentials.createInsecure()`", meaning: "Kết nối gRPC không mã hoá TLS — chấp nhận được trong Docker network nội bộ của lab, không dùng cho production thật." },
+    { term: "@grpc/proto-loader", meaning: "Thư viện Node.js parse file `.proto` lúc runtime, không cần bước generate code tĩnh trước khi build." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao module B13 chọn để `worker` tiếp tục là chủ sở hữu bảng `notifications`, thay vì cho `notification-service` một kết nối Postgres riêng ngay bây giờ?"
+  options={[
+    "Vì gRPC về mặt kỹ thuật không thể gọi tới một service có kết nối database",
+    "Vì Postgres chỉ cho phép đúng 1 service kết nối tới mỗi bảng",
+    "Vì B13 chỉ tập trung tách phần GIAO TIẾP (gọi hàm trực tiếp → gọi qua gRPC); tách quyền sở hữu dữ liệu (`notification-service` có DB riêng) là nội dung được dạy có chủ đích ở B14 cùng với outbox pattern — làm cả hai cùng lúc ở B13 sẽ khó review và không còn gì mới để B14 dạy",
+    "Vì `notification-service` chạy image `node:22-slim` không hỗ trợ driver Postgres",
+  ]}
+  answerIndex={2}
+  explanation="Đây là một quyết định phạm vi (scope) có chủ đích: tách giao tiếp trước, tách dữ liệu sau — đúng theo lộ trình B13 → B14 của curriculum. Không phải giới hạn kỹ thuật của gRPC, Postgres hay Docker image."
+/>

@@ -1,0 +1,88 @@
+import { RestJsonVsGrpcProtobufWireDiagram } from "../diagrams/rest-json-vs-grpc-protobuf-wire-diagram";
+
+<Eli5 title="REST nội bộ giống viết thư tay mỗi lần trao đổi giữa hai phòng ban cùng công ty" emoji="✉️">
+  Hai phòng ban trong cùng một công ty (`api`/`worker` và `notification-service` sắp tách ra) trước giờ trao đổi bằng thư tay: mỗi lần cần gì, viết hẳn một lá thư đầy đủ câu chữ (`{"userId": "...", "type": "..."}`), bỏ vào phong bì, gửi qua đường bưu điện nội bộ (HTTP/1.1, mỗi request một chuyến).
+
+  Vì hai phòng ban ở chung công ty, ngồi gần nhau, tốc độ gửi thư không phải vấn đề lớn — bưu điện nội bộ nhanh. Cái đáng lo hơn là: hai bên có tự hiểu đúng ý nhau không? Nếu phòng A quên ghi rõ "giao đúng 17h", phòng B có thể hiểu sai. gRPC giống việc hai phòng ban thống nhất trước một **biểu mẫu chuẩn** (`.proto`) — điền đúng ô, đúng thứ tự, máy tự kiểm tra hộ, không ai "hiểu nhầm ý nhau" nữa.
+</Eli5>
+
+`taskflow-api` sắp tách phần gửi notification ra một process riêng — `notification-service`. Đây là cuộc gọi **nội bộ**, giữa hai service do chính team bạn viết và triển khai, không phải API công khai cho bên thứ ba. Câu hỏi module này trả lời: gọi nội bộ đó nên là REST/JSON như từ trước tới giờ, hay gRPC?
+
+<RestJsonVsGrpcProtobufWireDiagram />
+
+<Technical>
+
+### gRPC là gì, gồm những mảnh nào
+
+gRPC là một framework RPC (Remote Procedure Call) mã nguồn mở của Google, đứng trên 3 trụ cột:
+
+| Thành phần | Vai trò |
+|---|---|
+| **Protocol Buffers (Protobuf)** | Ngôn ngữ định nghĩa contract (`.proto`) + định dạng mã hoá nhị phân nhỏ gọn, dựa trên field NUMBER thay vì tên field |
+| **HTTP/2** | Giao thức vận chuyển — hỗ trợ multiplexing (nhiều RPC cùng lúc trên 1 connection) và streaming hai chiều |
+| **Code generation** | Từ 1 file `.proto`, sinh ra client stub + server interface cho nhiều ngôn ngữ — không ai tự viết tay logic parse/serialize |
+
+### Vì sao chọn gRPC cho gọi nội bộ — và vì sao KHÔNG phải vì "nó luôn nhanh hơn"
+
+Nói thẳng: với **một cuộc gọi nội bộ đơn lẻ**, trong cùng datacenter/cùng máy Docker Compose, chênh lệch độ trễ giữa REST/JSON và gRPC/Protobuf thường **không phải yếu tố quyết định** — cả hai đều tính bằng mili-giây, network giữa hai container trên cùng Docker network gần như không đáng kể. Nếu ai đó chọn gRPC chỉ vì "gRPC nhanh hơn REST", đó là lý do chưa đủ thuyết phục.
+
+Giá trị thật của gRPC nằm ở chỗ khác:
+
+1. **Contract bắt buộc, không tuỳ tiện.** File `.proto` định nghĩa chính xác `SendNotification` nhận gì, trả gì — sinh ra type TypeScript tương ứng. Với REST/JSON nội bộ, hai bên chỉ "thoả thuận miệng" qua tài liệu hoặc đọc code, dễ lệch khi một bên đổi mà quên báo bên kia.
+2. **Tooling sinh code hai chiều.** Không cần viết tay interface cho cả client lẫn server — generate từ cùng 1 nguồn sự thật (`.proto`).
+3. **HTTP/2 multiplexing & streaming có sẵn.** Khi `notification-service` cần đẩy nhiều message qua 1 kết nối (ví dụ `StreamNotifications`, bài sau), REST/JSON truyền thống không có mô hình tự nhiên cho việc đó — phải tự chế bằng polling hoặc SSE (đã học ở B11).
+4. **Payload nhỏ hơn khi tần suất gọi lớn.** Nếu `notification-service` nhận hàng chục nghìn request/giây, khác biệt byte giữa JSON và Protobuf CỘNG DỒN mới trở nên đáng kể — không phải với 1 request lẻ tẻ.
+
+### Khi nào REST/JSON vẫn hợp lý hơn cho nội bộ
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| **REST/JSON nội bộ** | Debug bằng `curl` ngay lập tức; không cần công cụ sinh code; browser gọi thẳng được | Không có contract bắt buộc; dễ lệch field giữa hai bên khi codebase lớn dần | Gọi nội bộ ít, tạm thời, hoặc một phía là browser/script không có tooling gRPC |
+| **gRPC/Protobuf nội bộ** | Contract ép buộc qua `.proto`; sinh code tự động; có streaming; multiplex HTTP/2 | Cần công cụ sinh code (`protoc`/`proto-loader`); không gọi trực tiếp từ browser (cần grpc-web/gateway); khó debug bằng mắt hơn JSON | Nhiều service nội bộ gọi nhau, tần suất cao, hoặc cần streaming thật sự |
+
+`taskflow-api` chọn gRPC ở đây chủ yếu vì lý do (1) và (3): `notification-service` sẽ còn phình ra ở B14 (event-driven), và cần một contract rõ ràng để cả hai team (nếu có nhiều người) không tự ý đổi field mà không báo nhau.
+
+### HTTP/2 multiplexing — vì sao nó khác HTTP/1.1
+
+HTTP/1.1 (hoặc HTTP/1.1 + keep-alive) mỗi connection tại một thời điểm về cơ bản xử lý tuần tự theo kiểu request-response; muốn song song thật sự thường phải mở nhiều connection. HTTP/2 cho phép nhiều "luồng" (streams) độc lập chạy đồng thời trên **một** connection TCP — gRPC tận dụng thẳng cơ chế này: nhiều RPC call cùng lúc từ `worker` tới `notification-service` không cần mở nhiều connection mới.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem thử payload REST/JSON hiện tại (nếu vẫn còn endpoint cũ để so sánh)", command: "curl -s -X POST http://localhost:3000/internal/notifications -d '{\"userId\":\"u_1\",\"type\":\"task_status_changed\"}' | wc -c", output: "86" },
+    { comment: "Cài package gRPC cho Node.js — dùng ở các bài sau trong module này", command: "pnpm add @grpc/grpc-js @grpc/proto-loader", output: "Packages: +2\n+ @grpc/grpc-js 1.11.x\n+ @grpc/proto-loader 0.7.x" },
+  ]}
+/>
+
+<Callout type="tip" title="Đừng nói 'gRPC luôn nhanh hơn REST' trong phỏng vấn hay trong code review">
+  Câu trả lời chính xác hơn: gRPC thắng REST/JSON nội bộ ở **contract chặt + tooling sinh code + streaming có sẵn qua HTTP/2**. Tốc độ chỉ chênh lệch rõ khi tần suất gọi rất cao hoặc payload rất lớn — với một cuộc gọi lẻ, sự khác biệt gần như không đo được bằng mắt thường.
+</Callout>
+
+<Callout type="mistake">
+  Nghĩ rằng đổi từ REST sang gRPC là đổi "giao thức mạng" thuần tuý, không ảnh hưởng gì tới cách viết code. Thực tế gRPC thay đổi cả cách định nghĩa API (`.proto` thay vì route + schema), cách sinh type, và cách debug (không còn `curl` đơn giản — cần `grpcurl` hoặc client thật).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "gRPC", meaning: "Framework RPC mã nguồn mở dựa trên Protocol Buffers + HTTP/2, dùng để hai service gọi hàm lẫn nhau qua mạng như gọi hàm cục bộ." },
+    { term: "Protocol Buffers (Protobuf)", meaning: "Ngôn ngữ định nghĩa message/service (`.proto`) và định dạng mã hoá nhị phân dựa trên field number." },
+    { term: "HTTP/2 multiplexing", meaning: "Nhiều luồng request/response độc lập chạy đồng thời trên cùng một connection TCP." },
+    { term: "Contract-first", meaning: "Cách thiết kế API: viết `.proto` (hợp đồng) trước, sinh code sau — cả client lẫn server đều bắt buộc tuân theo cùng một nguồn sự thật." },
+    { term: "RPC (Remote Procedure Call)", meaning: "Mô hình gọi một hàm nằm trên máy/process khác như thể gọi hàm cục bộ, che giấu chi tiết mạng bên dưới." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một đồng nghiệp đề xuất đổi sang gRPC cho cuộc gọi `worker → notification-service` với lý do duy nhất là 'gRPC luôn nhanh hơn REST/JSON'. Nhận định này đúng tới mức nào?"
+  options={[
+    "Hoàn toàn đúng — gRPC luôn nhanh hơn REST/JSON trong mọi trường hợp",
+    "Không chính xác nếu dùng làm lý do DUY NHẤT — với một cuộc gọi nội bộ lẻ tẻ trong cùng hạ tầng, chênh lệch tốc độ thường không phải yếu tố quyết định; giá trị thật nằm ở contract chặt (`.proto`), tooling sinh code, và khả năng streaming qua HTTP/2",
+    "Sai hoàn toàn — gRPC luôn chậm hơn REST/JSON vì phải mã hoá nhị phân",
+    "Không liên quan gì tới tốc độ, gRPC chỉ là REST đổi tên",
+  ]}
+  answerIndex={1}
+  explanation="Tốc độ có thể chênh lệch khi tần suất gọi rất cao hoặc payload lớn, nhưng lý do chính đáng để chọn gRPC cho giao tiếp nội bộ là contract bắt buộc qua `.proto`, sinh code tự động hai chiều, và mô hình streaming tự nhiên qua HTTP/2 — không phải khẩu hiệu 'luôn nhanh hơn'."
+/>

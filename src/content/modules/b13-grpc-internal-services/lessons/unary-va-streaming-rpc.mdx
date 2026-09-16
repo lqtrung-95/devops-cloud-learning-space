@@ -1,0 +1,115 @@
+import { UnaryVsServerStreamingRpcShapeDiagram } from "../diagrams/unary-vs-server-streaming-rpc-shape-diagram";
+
+<Eli5 title="Unary là gọi điện hỏi-đáp một câu, streaming là bật loa phát liên tục" emoji="📻">
+  **Unary RPC** giống gọi điện thoại hỏi một câu rồi cúp máy ngay: "Anh ơi giao hàng chưa?" — "Rồi ạ." Xong cuộc gọi. Đó là `SendNotification`: `worker` hỏi "gửi cái notification này giúp tôi", `notification-service` trả lời "gửi xong" — kết thúc.
+
+  **Server-streaming RPC** giống bật loa phát thanh trong một chuyến xe buýt: hành khách (client) chỉ cần lên xe và ngồi yên (gửi 1 request), rồi loa cứ liên tục đọc thông báo trạm dừng tiếp theo (server liên tục đẩy message) cho tới khi xe tới bến cuối. Hành khách không cần hỏi lại từng trạm một.
+</Eli5>
+
+<UnaryVsServerStreamingRpcShapeDiagram />
+
+<Technical>
+
+### Định nghĩa `NotificationService` trong `notification.proto`
+
+```proto title="notification-service/proto/notification.proto"
+syntax = "proto3";
+
+package taskflow.notification.v1;
+
+service NotificationService {
+  // Unary: worker gửi 1 notification, đợi đúng 1 response xác nhận.
+  rpc SendNotification (SendNotificationRequest) returns (SendNotificationResponse);
+
+  // Server-streaming: client mở 1 kết nối, server đẩy nhiều Notification theo thời gian.
+  // Ý tưởng nối với B11 (SSE) ở tầng khái niệm — RPC này CHƯA nối vào code SSE thật của B11.
+  rpc StreamNotifications (StreamNotificationsRequest) returns (stream Notification);
+}
+
+message SendNotificationRequest {
+  string notification_id = 1;
+  string user_id = 2;
+  string type = 3;
+  string payload_json = 4; // JSON.stringify(payload) — giữ payload jsonb linh hoạt, không ép schema cứng ở tầng proto
+}
+
+message SendNotificationResponse {
+  bool delivered = 1;
+  string delivery_id = 2;
+}
+
+message StreamNotificationsRequest {
+  string user_id = 1;
+}
+
+message Notification {
+  string notification_id = 1;
+  string type = 2;
+  string payload_json = 3;
+  int64 created_at_epoch_ms = 4;
+}
+```
+
+Vài điểm cần để ý ngay từ bản đầu tiên (áp dụng cho cả bài sau về tiến hoá `.proto`):
+
+- **Số sau dấu `=` là field number, KHÔNG phải giá trị mặc định.** `string user_id = 2;` nghĩa là field `user_id` được gán số hiệu `2` trên wire — đây là con số Protobuf dùng để mã hoá/giải mã, không phải "user_id bằng 2".
+- **`package taskflow.notification.v1`** giữ namespace riêng, tránh đụng tên nếu sau này có service `.proto` khác trong cùng repo.
+- **`payload_json` là `string`, không phải `map` hay `struct` lồng sâu.** Vì bảng `notifications.payload` là `jsonb` linh hoạt theo từng loại notification (mục 3 curriculum), ép nó thành message Protobuf cứng nhắc sẽ phải đổi `.proto` mỗi khi thêm loại notification mới — giữ dạng chuỗi JSON đã serialize là lựa chọn đơn giản hơn cho service nội bộ nhỏ này.
+
+### Unary vs streaming — khi nào chọn cái nào
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| **Unary** | Đơn giản, giống gọi hàm bình thường; dễ set timeout/deadline; dễ retry an toàn | Không hợp cho việc "đẩy liên tục" — muốn cập nhật mới phải gọi lại | Một hành động rời rạc, có kết quả rõ ràng ngay (gửi 1 notification, tạo 1 resource) |
+| **Server-streaming** | Một connection, nhiều message — không cần client tự poll lặp lại | Phức tạp hơn khi xử lý lỗi giữa chừng (stream đứt ở message thứ mấy?); client phải tự quản lý vòng đời kết nối dài | Client cần nhận liên tục dữ liệu mới phát sinh (feed thông báo, log theo thời gian thực) |
+
+`taskflow-api` dùng unary cho `SendNotification` (một hành động rời rạc: gửi notification này) và server-streaming cho `StreamNotifications` (một client muốn "nghe" tất cả notification mới của một user, giống việc B11 SSE đang làm — nhưng qua gRPC thay vì SSE).
+
+### gRPC còn 2 kiểu streaming khác (chỉ cần biết tên, không cần dùng ở module này)
+
+- **Client-streaming:** client gửi nhiều message, server trả 1 response duy nhất khi client gửi xong (ví dụ: upload file theo từng chunk).
+- **Bidirectional-streaming:** cả hai phía gửi nhận độc lập trên cùng 1 connection (ví dụ: chat).
+
+`taskflow-api` không cần hai kiểu này ở B13 — nêu ra để không nhầm "streaming" là chỉ có một dạng.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo thư mục proto trong notification-service (sẽ scaffold đầy đủ ở bài sau)", command: "mkdir -p notification-service/proto" },
+    { comment: "Lưu file notification.proto ở trên vào đúng đường dẫn", command: "printf 'syntax = \"proto3\";\\n...' > notification-service/proto/notification.proto" },
+    { comment: "Kiểm tra cú pháp .proto bằng protoc (nếu đã cài) — không bắt buộc vì proto-loader tự parse lúc chạy", command: "protoc --proto_path=notification-service/proto --descriptor_set_out=/dev/null notification-service/proto/notification.proto", output: "(không in gì nếu cú pháp hợp lệ)" },
+  ]}
+/>
+
+<Callout type="info" title="Vì sao không cần chạy protoc để 'build' code trước">
+  Bài sau sẽ dùng `@grpc/proto-loader` — thư viện parse `.proto` **lúc runtime** (khi service khởi động), không cần bước build/generate code riêng như một số ngôn ngữ khác (Go, Java thường generate code tĩnh trước khi build). Cách này đơn giản hơn cho Node.js nhưng đổi lại: lỗi sai cú pháp `.proto` chỉ lộ ra khi service khởi động, không phải lúc build.
+</Callout>
+
+<Callout type="mistake">
+  Nhầm field number với thứ tự khai báo. Nếu bạn viết `string type = 3;` rồi `string payload_json = 4;`, đổi thứ tự dòng trong file (`payload_json` lên trước `type`) nhưng VẪN giữ đúng số `3`/`4` — hoàn toàn không ảnh hưởng gì tới wire format. Field number mới là thứ quyết định, không phải vị trí dòng trong file.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Unary RPC", meaning: "1 request → đúng 1 response, giống gọi hàm bình thường. Ví dụ: `SendNotification`." },
+    { term: "Server-streaming RPC", meaning: "1 request → nhiều response chảy về theo thời gian trên cùng 1 connection. Ví dụ: `StreamNotifications`." },
+    { term: "Client-streaming / bidirectional-streaming", meaning: "Hai kiểu streaming còn lại của gRPC — không dùng ở module này, chỉ cần biết chúng tồn tại." },
+    { term: "field number", meaning: "Con số sau dấu `=` trong mỗi field `.proto` — là thứ thật sự được mã hoá lên wire, không phải tên field." },
+    { term: "`.proto` service", meaning: "Khối `service { rpc ... }` định nghĩa các RPC method mà một gRPC server implement và client gọi tới." },
+  ]}
+/>
+
+<QuickCheck
+  question="`StreamNotifications` được khai báo `rpc StreamNotifications (StreamNotificationsRequest) returns (stream Notification);`. Sau khi client gửi request, điều gì xảy ra tiếp theo?"
+  options={[
+    "Server trả về đúng 1 `Notification` rồi đóng kết nối, giống unary",
+    "Client phải tự gửi lại request định kỳ để lấy notification mới, server không chủ động đẩy",
+    "Kết nối được giữ mở và server có thể đẩy nhiều message `Notification` xuống client theo thời gian, cho tới khi server chủ động đóng stream",
+    "Cả client và server đều phải liên tục gửi message qua lại (bidirectional)",
+  ]}
+  answerIndex={2}
+  explanation="Từ khoá `stream` ở kiểu trả về (không phải ở request) đánh dấu đây là server-streaming: client chỉ gửi 1 request, nhưng response là một luồng nhiều message do SERVER chủ động đẩy, không cần client hỏi lại từng lần."
+/>
