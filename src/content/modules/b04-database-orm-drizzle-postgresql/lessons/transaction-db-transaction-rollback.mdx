@@ -1,0 +1,120 @@
+import { TransactionRollbackDiagram } from "../diagrams/transaction-rollback-diagram";
+
+<Eli5 title="Chuyển khoản ngân hàng: hoặc cả hai vế xảy ra, hoặc không vế nào cả" emoji="🏦">
+  Chuyển tiền từ tài khoản A sang B là hai bước: trừ tiền A, cộng tiền B. Nếu hệ thống crash ngay giữa hai bước — trừ xong nhưng chưa kịp cộng — tiền biến mất. Ngân hàng không chấp nhận rủi ro đó: hoặc **cả hai bước cùng xảy ra**, hoặc **coi như chưa có bước nào xảy ra**.
+
+  **Transaction** trong Postgres chính là lời hứa đó cho một nhóm câu lệnh SQL. `db.transaction(async (tx) => {...})` của Drizzle mở một "chuyến đi" như vậy: mọi `tx.insert`/`tx.update` bên trong cùng thành công thì `COMMIT`, một trong số đó thất bại (hoặc code `throw`) thì Postgres tự `ROLLBACK` — trả mọi thứ về như chưa từng chạy.
+</Eli5>
+
+Trong `taskflow-api`, tạo một task và ghi log hoạt động là hai việc luôn nên đi cùng nhau — không thể có task mà thiếu log, cũng không nên có log "ma" của một task chưa thật sự tồn tại.
+
+<TransactionRollbackDiagram />
+
+<Technical>
+
+### `db.transaction` — cú pháp cơ bản
+
+```ts title="src/services/tasks.ts"
+import { db } from "../db/client";
+import { comments, tasks } from "../db/schema";
+
+const SYSTEM_ACTOR_ID = "00000000-0000-0000-0000-000000000000"; // tạm — chưa có bảng users (B05)
+
+interface CreateTaskInput {
+  projectId: string;
+  title: string;
+  description?: string;
+}
+
+export async function createTaskWithLog(input: CreateTaskInput, options?: { forceFailure?: boolean }) {
+  return db.transaction(async (tx) => {
+    const [task] = await tx
+      .insert(tasks)
+      .values({
+        projectId: input.projectId,
+        title: input.title,
+        description: input.description,
+        status: "todo",
+      })
+      .returning();
+
+    await tx.insert(comments).values({
+      taskId: task.id,
+      authorId: SYSTEM_ACTOR_ID,
+      body: `Task "${task.title}" vừa được tạo.`,
+    });
+
+    if (options?.forceFailure) {
+      // Giả lập một lỗi giữa chừng (ví dụ: gọi service khác thất bại).
+      throw new Error("Giả lập lỗi giữa transaction để kiểm chứng rollback");
+    }
+
+    return task;
+  });
+}
+```
+
+Vài chi tiết dễ bỏ sót nhưng quan trọng:
+
+- **Luôn dùng `tx`, không dùng `db`, bên trong callback.** `tx` là handle bị khoá vào đúng transaction đang mở trên một connection cụ thể. Gọi nhầm `db.insert(...)` sẽ chạy trên một connection khác, **ngoài** transaction — insert đó commit ngay lập tức, không rollback theo được nữa dù transaction cha thất bại sau đó.
+- **Không cần gọi rollback thủ công.** Ném lỗi (`throw`) là đủ để Drizzle biết callback thất bại và tự phát `ROLLBACK`. Bắt lỗi bằng `try/catch` *bên trong* callback rồi nuốt mất lỗi đó (không `throw` lại) sẽ vô tình khiến transaction nghĩ là thành công và `COMMIT`.
+- **Giá trị trả về của callback trở thành giá trị trả về của `db.transaction`.** Ở đây là `task` vừa tạo, để hàm ngoài dùng tiếp (trả response 201 kèm task).
+- **`authorId` dùng UUID giả** vì `comments.author_id` chưa có bảng `users` để trỏ tới (đúng như đã nói ở bài 1) — B05 sẽ thay bằng `req.user.id` thật.
+
+### Tại sao không tự viết `BEGIN`/`COMMIT`/`ROLLBACK` tay
+
+`postgres` (driver) và Drizzle đã lo phần khó: giữ đúng một connection xuyên suốt transaction, tự `ROLLBACK` khi có exception (kể cả lỗi mạng giữa chừng), và trả lỗi rõ ràng nếu bạn cố dùng `tx` sau khi transaction đã kết thúc. Tự quản connection tay dễ rò rỉ (quên trả connection về pool khi có lỗi) — đây là lớp trừu tượng đáng dùng, không phải "ma thuật" cần tránh.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Gọi hàm với forceFailure: true qua một script thử nghiệm",
+      command: "pnpm exec tsx scripts/try-transaction.ts --force-failure",
+      output: "Error: Giả lập lỗi giữa transaction để kiểm chứng rollback\n  at createTaskWithLog (src/services/tasks.ts:29:11)",
+    },
+    {
+      comment: "Xác nhận KHÔNG có task/comment nào của lần gọi lỗi",
+      command: "docker compose exec postgres psql -U taskflow -d taskflow -c \"select count(*) from tasks;\"",
+      output: " count\n-------\n     0",
+    },
+    { comment: "Gọi lại không forceFailure — lần này commit thật", command: "pnpm exec tsx scripts/try-transaction.ts" },
+    {
+      comment: "Giờ mới thấy đúng 1 task và 1 comment",
+      command: "docker compose exec postgres psql -U taskflow -d taskflow -c \"select count(*) from tasks;\"",
+      output: " count\n-------\n     1",
+    },
+  ]}
+/>
+
+<Callout type="warning" title="Transaction không thay thế validation">
+  `db.transaction` bảo vệ tính nhất quán giữa nhiều bảng, nhưng không kiểm tra dữ liệu đầu vào hợp lệ hay chưa — đó vẫn là việc của Zod schema (B03) chạy **trước khi** transaction bắt đầu. Đưa dữ liệu rác vào transaction chỉ khiến bạn rollback muộn hơn, tốn round-trip DB vô ích.
+</Callout>
+
+<Callout type="mistake">
+  Bắt lỗi bằng `try { await db.transaction(...) } catch {}` rồi im lặng bỏ qua ở tầng gọi — request trả về `200` như thể mọi thứ ổn, trong khi transaction đã rollback và chẳng có gì được lưu. Luôn để lỗi transaction đi tới error handler tập trung (B03) để trả đúng status code.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "db.transaction", meaning: "Bọc nhiều thao tác ghi vào một khối; tất cả cùng commit hoặc cùng rollback." },
+    { term: "tx", meaning: "Handle truy vấn bị khoá vào đúng transaction đang mở — phải dùng thay cho db bên trong callback." },
+    { term: "COMMIT / ROLLBACK", meaning: "Lệnh Postgres chốt thay đổi thật, hoặc huỷ toàn bộ thay đổi từ lúc BEGIN." },
+    { term: "atomicity", meaning: "Tính chất 'tất cả hoặc không gì cả' của một transaction — một trong 4 tính chất ACID." },
+  ]}
+/>
+
+<QuickCheck
+  question="Trong `db.transaction(async (tx) => { await tx.insert(tasks)...; await db.insert(comments)...; })` — dòng thứ hai lỡ gọi `db` thay vì `tx`. Nếu transaction sau đó throw lỗi, chuyện gì xảy ra với dòng comment đã insert?"
+  options={[
+    "Bị rollback cùng với task, vì cả hai đều nằm trong cùng khối `db.transaction`",
+    "Vẫn được lưu vào DB — vì `db.insert` chạy ngoài transaction (trên connection khác), nó đã tự commit trước khi transaction cha rollback",
+    "Gây lỗi cú pháp, code sẽ không chạy được",
+    "Drizzle tự phát hiện và chuyển `db.insert` thành `tx.insert` giúp bạn",
+  ]}
+  answerIndex={1}
+  explanation="tx và db là hai handle khác nhau. Dùng nhầm db bên trong callback nghĩa là câu lệnh đó chạy độc lập, ngoài transaction — nó commit ngay, rollback ở tx không ảnh hưởng tới nó."
+/>

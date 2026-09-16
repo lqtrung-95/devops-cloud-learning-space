@@ -1,0 +1,125 @@
+import { MigrationLifecycleDiagram } from "../diagrams/migration-lifecycle-diagram";
+
+<Eli5 title="Bản vẽ kệ hàng khác với việc thật sự đóng kệ" emoji="🛠️">
+  Viết `schema.ts` giống vẽ bản thiết kế kệ hàng lên giấy — chưa có cái kệ nào tồn tại thật cả. **Migration** là bước mang bản vẽ đó đi đóng kệ thật trong nhà kho (Postgres).
+
+  `drizzle-kit` là đội thợ mộc: `generate` đọc bản vẽ mới, so với bản vẽ cũ, rồi viết ra "phiếu công việc" (file SQL) — đóng thêm kệ nào, sửa kệ nào. `migrate` là thợ thực sự cầm phiếu đó đi làm. `push` là phiên bản "làm luôn cho nhanh, khỏi ghi phiếu" — tiện lúc đang thử nghiệm một mình, nhưng nguy hiểm nếu nhiều người cùng làm chung một nhà kho.
+</Eli5>
+
+<MigrationLifecycleDiagram />
+
+<Technical>
+
+### `drizzle.config.ts` — nói cho drizzle-kit biết đọc/ghi ở đâu
+
+```ts title="drizzle.config.ts"
+import { defineConfig } from "drizzle-kit";
+
+export default defineConfig({
+  schema: "./src/db/schema.ts",
+  out: "./drizzle",
+  dialect: "postgresql",
+  dbCredentials: {
+    url: process.env.DATABASE_URL ?? "postgres://taskflow:taskflow@postgres:5432/taskflow",
+  },
+});
+```
+
+- `schema` trỏ tới file khai báo `pgTable` ở bài trước.
+- `out` là thư mục chứa các file `.sql` được sinh ra — commit thư mục này vào Git, nó là lịch sử schema của cả team.
+- `dialect: "postgresql"` báo cho drizzle-kit biết sinh SQL theo cú pháp Postgres (không phải MySQL/SQLite).
+
+### `generate` — sinh file migration, chưa chạm DB
+
+```bash
+npx drizzle-kit generate
+```
+
+Lệnh này **chỉ đọc** `schema.ts`, so với snapshot lần generate trước (lưu trong `drizzle/meta/`), rồi viết ra một file mới, ví dụ `drizzle/0000_wandering_black_widow.sql`:
+
+```sql title="drizzle/0000_xxx.sql (rút gọn)"
+CREATE TABLE "organizations" (
+  "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+  "name" text NOT NULL,
+  "slug" text NOT NULL UNIQUE,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE "projects" (
+  "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+  "organization_id" uuid NOT NULL,
+  ...
+);
+
+ALTER TABLE "projects" ADD CONSTRAINT "projects_organization_id_organizations_id_fk"
+  FOREIGN KEY ("organization_id") REFERENCES "organizations"("id");
+```
+
+File này là **SQL thật** — không phải chi tiết ẩn của Drizzle. Đọc kỹ trước khi áp, nhất là trong PR review: đây là chỗ dễ phát hiện một `ALTER TABLE ... DROP COLUMN` vô tình do ai đó xoá nhầm dòng trong `schema.ts`.
+
+### `migrate` vs `push` — hai cách áp migration
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| `drizzle-kit generate` + `migrate` | Có file `.sql` versioned, review được trong PR, chạy lại y hệt ở mọi môi trường (CI, staging, production) | Thêm một bước (generate) trước khi thấy hiệu ứng | CI/CD, production, mọi thay đổi schema sẽ được review |
+| `drizzle-kit push` | Áp thẳng schema hiện tại vào DB, không cần file trung gian, lặp nhanh | Không để lại lịch sử; hai người `push` khác nhau cùng lúc dễ ghi đè ý định của nhau | Máy cá nhân, đang thử nghiệm cấu trúc bảng, chưa chốt |
+
+```bash
+# Production/CI: chạy đúng các file .sql đã generate và review
+npx drizzle-kit migrate
+
+# Local dev: áp thẳng thay đổi, bỏ qua bước sinh file
+npx drizzle-kit push
+```
+
+<Callout type="warning" title="Đừng push thẳng vào Postgres mà đồng nghiệp khác cũng đang dùng">
+  `push` so sánh schema code với DB đang chạy rồi tự quyết cách biến đổi — nếu ai đó đã chạy `push` khác trước bạn, Postgres có thể ở trạng thái không khớp snapshot nào cả, dẫn tới migration `generate` sau này bị lệch. Quy ước an toàn: `push` chỉ dùng trên Postgres cục bộ của riêng bạn.
+</Callout>
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Đảm bảo Postgres đang chạy", command: "docker compose up -d postgres" },
+    { comment: "Sinh migration đầu tiên từ schema.ts", command: "npx drizzle-kit generate" , output: "✓ 1 migration created: drizzle/0000_wandering_black_widow.sql" },
+    { comment: "Áp migration vào Postgres của taskflow-api", command: "npx drizzle-kit migrate", output: "✓ Applied 1 migration" },
+    {
+      comment: "Xác nhận đủ 4 bảng, đúng user/db taskflow",
+      command: "docker compose exec postgres psql -U taskflow -d taskflow -c '\\dt'",
+      output: " Schema |     Name      | Type  |  Owner\n--------+---------------+-------+----------\n public | comments      | table | taskflow\n public | organizations | table | taskflow\n public | projects      | table | taskflow\n public | tasks         | table | taskflow",
+    },
+    {
+      comment: "Thử push cho một thay đổi nhỏ trong lúc dev (ví dụ vừa thêm cột thử nghiệm)",
+      command: "npx drizzle-kit push",
+      output: "Changes applied\n[i] No config changes detected",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Sinh file migration bằng `generate` xong nhưng chưa `migrate`/`push`, rồi nghĩ là bảng đã tồn tại — restart `api` thấy lỗi `relation "tasks" does not exist` vì Postgres thật sự chưa có bảng nào.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "migration", meaning: "File SQL mô tả một thay đổi schema, có thể chạy lại và review được." },
+    { term: "drizzle-kit generate", meaning: "So sánh schema.ts với snapshot cũ, sinh file .sql mới — không chạm DB." },
+    { term: "drizzle-kit migrate", meaning: "Chạy các file .sql đã generate vào DB thật, theo đúng thứ tự." },
+    { term: "drizzle-kit push", meaning: "Áp thẳng schema hiện tại vào DB, bỏ qua file trung gian — chỉ nên dùng ở local dev." },
+    { term: "snapshot", meaning: "Trạng thái schema tại một thời điểm, lưu trong drizzle/meta/ để generate biết cái gì đã đổi." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team đã có pipeline CI chạy migration mỗi khi merge vào `main`. Bước nào nên đưa vào bước build của CI để áp schema production?"
+  options={[
+    "`drizzle-kit push` vì nó nhanh nhất",
+    "`drizzle-kit studio` để mở giao diện chỉnh tay",
+    "`drizzle-kit migrate`, chạy đúng các file `.sql` đã được review trong PR trước đó",
+    "Sửa trực tiếp bằng lệnh `ALTER TABLE` viết tay trong CI script",
+  ]}
+  answerIndex={2}
+  explanation="CI/production cần tính lặp lại và có lịch sử — đó là lý do generate+migrate tồn tại. push tiện cho một máy dev đơn lẻ, không phù hợp môi trường nhiều người/nhiều lần chạy."
+/>

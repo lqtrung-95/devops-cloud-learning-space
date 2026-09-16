@@ -1,0 +1,154 @@
+import { SchemaRelationshipsDiagram } from "../diagrams/schema-relationships-diagram";
+
+<Eli5 title="Map trong RAM là bảng ghi chú, Postgres là nhà kho thật" emoji="🗄️">
+  Ba module trước, `taskflow-api` cất `projects`/`tasks` vào một cái `Map` — giống dán ghi chú lên bảng trắng trong văn phòng. Tiện, nhanh, nhưng tắt điện (restart container) là mất sạch.
+
+  Module này xây một **nhà kho thật** (PostgreSQL) và thuê một **thư ký biết đọc TypeScript** (Drizzle ORM). Bạn mô tả "kho có mấy kệ, mỗi kệ chứa gì" bằng code — thư ký lo phần dịch sang tiếng của nhà kho (SQL) và lo việc cất/lấy đúng ô.
+
+  `pgTable` chính là "bản vẽ kệ hàng": khai báo một lần bằng TypeScript, dùng để vừa sinh SQL thật, vừa cho code truy vấn có gợi ý kiểu dữ liệu (autocomplete tên cột, sai kiểu là đỏ ngay lúc code).
+</Eli5>
+
+Từ module này, mọi route B02/B03 sẽ đọc/ghi PostgreSQL thật thay vì `Map`. Việc đầu tiên: mô tả đúng 4 bảng theo spec taskflow-api — sai tên bảng hay tên cột ở đây sẽ kéo lỗi qua toàn bộ các module sau.
+
+<SchemaRelationshipsDiagram />
+
+<Technical>
+
+### `pgTable` — khai báo một bảng
+
+```ts title="src/db/schema.ts"
+import { pgTable, uuid, text, timestamp, check } from "drizzle-orm/pg-core";
+import { relations, sql } from "drizzle-orm";
+
+export const organizations = pgTable("organizations", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  slug: text("slug").notNull().unique(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const projects = pgTable("projects", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  organizationId: uuid("organization_id")
+    .notNull()
+    .references(() => organizations.id),
+  name: text("name").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+```
+
+- Tham số đầu (`"organizations"`) là **tên bảng thật trong Postgres** — phải khớp chính xác spec, không tự đổi tên "cho đẹp".
+- `uuid("id").primaryKey().defaultRandom()` sinh ra cột `uuid` với default `gen_random_uuid()` — đúng yêu cầu `id uuid pk default gen_random_uuid()`.
+- `.references(() => organizations.id)` tạo **foreign key constraint thật** ở tầng Postgres — hàm callback (không truyền thẳng `organizations.id`) để tránh lỗi "used before defined" khi các bảng tham chiếu vòng qua nhau.
+- `timestamp(..., { withTimezone: true })` khớp với `timestamptz` trong spec — thiếu `withTimezone` sẽ tạo ra `timestamp` không có múi giờ, một lỗi tinh vi khó phát hiện qua test.
+
+### `tasks` và `comments` — cột chưa có foreign key
+
+```ts title="src/db/schema.ts (tiếp)"
+export const tasks = pgTable(
+  "tasks",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id),
+    title: text("title").notNull(),
+    description: text("description"),
+    status: text("status").notNull().default("todo"),
+    // Chưa .references() — bảng "users" chỉ được tạo ở B05.
+    assigneeId: uuid("assignee_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [check("tasks_status_check", sql`${table.status} in ('todo', 'in_progress', 'done')`)],
+);
+
+export const comments = pgTable("comments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  taskId: uuid("task_id")
+    .notNull()
+    .references(() => tasks.id),
+  // Chưa .references() — cùng lý do: "users" đến ở B05.
+  authorId: uuid("author_id").notNull(),
+  body: text("body").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+```
+
+<Callout type="warning" title="Cú pháp check() có thể khác theo phiên bản Drizzle">
+  Tham số thứ ba của `pgTable` (mảng constraint như `check(...)`) là API tương đối mới và từng đổi hình dạng (mảng vs object) giữa các bản Drizzle. Nếu `pnpm exec tsc` báo lỗi kiểu ở dòng này, kiểm tra "Drizzle ORM docs — Overview" (mục PostgreSQL constraints) cho đúng phiên bản đang cài — phần còn lại của schema không phụ thuộc chi tiết này.
+</Callout>
+
+`assigneeId`/`authorId` là `uuid` **trơn**, không `.references()` — vì bảng `users` chưa tồn tại. B05 sẽ chạy một migration mới thêm `users`/`memberships` rồi mới thêm FK cho hai cột này. Đừng tự ý tạo bảng `users` sớm ở đây.
+
+### Nối driver `postgres` + connection pool
+
+```ts title="src/db/client.ts"
+import postgres from "postgres";
+import { drizzle } from "drizzle-orm/postgres-js";
+import * as schema from "./schema";
+
+const connectionString = process.env.DATABASE_URL ?? "postgres://taskflow:taskflow@postgres:5432/taskflow";
+
+// max: giới hạn số connection đồng thời driver này mở tới Postgres.
+const client = postgres(connectionString, { max: 10 });
+
+export const db = drizzle(client, { schema });
+```
+
+- `DATABASE_URL` bên trong container `api` luôn dùng host `postgres` (tên service trong `docker-compose.yml`), cổng **5432** — cổng `5434` chỉ để bạn `psql` từ máy host vào container.
+- Truyền `{ schema }` vào `drizzle()` là bắt buộc nếu muốn dùng relational query API (`db.query.tasks.findMany({ with: {...} })`) ở bài sau — thiếu dòng này, `db.query` sẽ rỗng.
+- `max: 10` là một con số khởi điểm hợp lý cho một server dài hạn (không phải serverless): đủ để phục vụ nhiều request đồng thời mà không mở quá nhiều connection cùng lúc. Không có một con số "đúng tuyệt đối" — nó phụ thuộc số instance `api` đang chạy và `max_connections` cấu hình trên Postgres; đặt quá cao khi có nhiều instance có thể khiến Postgres từ chối connection mới. Với kiến trúc serverless (nhiều instance bật/tắt liên tục) rủi ro này còn rõ hơn, nhưng đó không phải tình huống của `taskflow-api` — ở đây server chạy dài hạn nên một pool cố định vừa phải là đủ.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài ORM, driver, và CLI migration (dev dependency)", command: "pnpm add drizzle-orm postgres" },
+    { comment: "", command: "pnpm add -D drizzle-kit" },
+    { comment: "Tạo file schema — dán nội dung ở phần Technical vào", command: "touch src/db/schema.ts src/db/client.ts" },
+    {
+      comment: "Kiểm tra type ngay, chưa cần Postgres chạy",
+      command: "pnpm exec tsc --noEmit src/db/schema.ts src/db/client.ts",
+      output: "(không có lỗi — nếu có, thường là thiếu import hoặc sai thứ tự tham chiếu bảng)",
+    },
+    {
+      comment: "Chạy thử import để chắc không có lỗi runtime (chưa cần kết nối DB)",
+      command: "pnpm exec tsx -e 'import(\"./src/db/schema.ts\").then((m) => console.log(Object.keys(m)))'",
+      output: "[ 'organizations', 'projects', 'tasks', 'comments' ]",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Quên `.notNull()` cho cột lẽ ra bắt buộc — Drizzle sẽ để cột đó nullable trong SQL sinh ra, nhưng Zod schema ở tầng route (B03) vẫn coi là required. Kết quả: bug chỉ lộ ra khi có ai insert thẳng bằng script khác, bỏ qua route.
+</Callout>
+
+<Callout type="tip" title="Đặt tên cột nhất quán">
+  Property TypeScript dùng camelCase (`organizationId`) nhưng cột SQL thật là snake_case (`"organization_id"`) — Drizzle tự map hai chiều miễn bạn truyền đúng tên cột làm tham số đầu của `uuid(...)`/`text(...)`. Lẫn lộn ở đây là nguồn lỗi phổ biến nhất khi mới học Drizzle.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "pgTable", meaning: "Hàm khai báo một bảng Postgres bằng TypeScript — vừa để sinh SQL, vừa để code truy vấn có type." },
+    { term: ".references()", meaning: "Khai báo foreign key constraint thật giữa hai cột, ở tầng Postgres." },
+    { term: "schema drift", meaning: "Khi code schema.ts và cấu trúc DB thật lệch nhau vì ai đó sửa tay bằng psql." },
+    { term: "connection pool", meaning: "Nhóm connection driver giữ sẵn tới Postgres, tái dùng thay vì mở mới mỗi query." },
+    { term: "postgres-js", meaning: "Tên gói driver `postgres` (tác giả porsager) — tầng thấp nhất Drizzle dùng để nói chuyện với Postgres." },
+    { term: "ORM", meaning: "Object-Relational Mapper — lớp trung gian ánh xạ bảng SQL ↔ object/class trong code." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao `tasks.assigneeId` và `comments.authorId` được khai báo là `uuid(...)` trơn, không `.references()`, trong module này?"
+  options={[
+    "Vì Drizzle không hỗ trợ foreign key cho cột nullable",
+    "Vì bảng `users` chưa tồn tại — nó được tạo ở B05, migration sau sẽ thêm foreign key cho hai cột này",
+    "Vì assignee luôn trùng với người tạo task",
+    "Vì foreign key làm chậm mọi câu SELECT",
+  ]}
+  answerIndex={1}
+  explanation="Spec taskflow-api chốt rõ: users/memberships tạo ở B05. B04 chỉ tạo 4 bảng organizations/projects/tasks/comments, để chỗ cho FK được thêm sau bằng một migration mới."
+/>

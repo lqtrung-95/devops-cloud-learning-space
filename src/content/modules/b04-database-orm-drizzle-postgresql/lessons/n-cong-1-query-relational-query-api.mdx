@@ -1,0 +1,106 @@
+import { NPlusOneQueryCounterDiagram } from "../diagrams/n-plus-one-query-counter-diagram";
+
+<Eli5 title="Đi chợ 1 lần thay vì chạy đi chạy lại 300 lần" emoji="🛒">
+  Bạn cần mua rau cho 300 món ăn. Cách dở: đi chợ 1 lần mua 300 loại thịt, rồi **chạy đi chợ riêng** cho từng món để mua rau đi kèm — tổng cộng 301 chuyến. Cách khôn: đi chợ 1 lần cho thịt, 1 lần nữa hỏi "cho tôi rau của cả 300 món này luôn" — 2 chuyến, dù có bao nhiêu món.
+
+  Đó chính xác là vấn đề **N+1 query**: lấy N task xong, rồi lặp qua từng task để lấy comment riêng — N task thì thêm N chuyến. Drizzle relational query API (`with`) là "hỏi rau của cả lô một lần" — gộp lại thành một (hoặc rất ít) câu SQL.
+</Eli5>
+
+<NPlusOneQueryCounterDiagram />
+
+<Technical>
+
+### Nhận diện N+1 trong code thật
+
+```ts title="❌ Cách viết sinh N+1"
+const allTasks = await db.select().from(tasks).where(eq(tasks.projectId, projectId));
+
+for (const task of allTasks) {
+  const taskComments = await db.select().from(comments).where(eq(comments.taskId, task.id));
+  // ...gắn taskComments vào task để trả về client
+}
+```
+
+Với 3 task, đoạn này chạy **4 query** (1 cho tasks, 3 cho comments — mỗi task một lần). Với 300 task, con số là 301. Dấu hiệu nhận biết: **một câu query nằm bên trong vòng lặp** chạy trên kết quả của query trước đó.
+
+### Sửa bằng relational query API
+
+```ts title="✅ db.query.x.findMany({ with })"
+const projectTasks = await db.query.tasks.findMany({
+  where: (task, { eq }) => eq(task.projectId, projectId),
+  with: {
+    comments: true,
+  },
+});
+
+// projectTasks[0].comments đã có sẵn, không cần vòng lặp gọi thêm query
+```
+
+Điều kiện để dùng được cú pháp này: bảng `tasks` và `comments` đã có `relations()` khai báo đúng chiều (bài trước) và `drizzle(client, { schema })` được truyền `schema` đầy đủ. Drizzle sẽ tự phát ra khoảng 2 câu SQL — một `SELECT` cho `tasks`, một `SELECT ... WHERE task_id IN (id1, id2, id3, ...)` cho toàn bộ comment liên quan — bất kể có 3 hay 3.000 task.
+
+### Join lồng nhiều cấp
+
+```ts title="Lồng tới 2 cấp: project → tasks → comments"
+const project = await db.query.projects.findFirst({
+  where: (proj, { eq }) => eq(proj.id, projectId),
+  with: {
+    tasks: {
+      with: { comments: true },
+    },
+  },
+});
+```
+
+Càng lồng sâu, lợi ích của relational query API càng rõ — viết tay tương đương sẽ là 3 tầng vòng lặp lồng nhau, mỗi tầng thêm N query.
+
+### Khi nào N+1 chấp nhận được
+
+<Callout type="tip" title="Không phải mọi vòng lặp query đều là vấn đề">
+  Nếu N gần như luôn nhỏ và cố định (ví dụ N ≤ 3, một task hiếm khi có quá 3 assignee), phí tổn N+1 có thể không đáng để đổi lấy độ phức tạp của relational query. Đo trước khi tối ưu — bật log SQL của Drizzle (`logger: true` khi khởi tạo `drizzle()`) để đếm query thật, đừng đoán.
+</Callout>
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Bật log SQL để tự đếm số query thực tế", command: "DRIZZLE_LOG=true pnpm dev" },
+    {
+      comment: "Gọi endpoint lấy danh sách task kèm comment — cách viết cũ (vòng lặp)",
+      command: "curl -s localhost:3000/api/v1/projects/$PROJECT_ID/tasks?include=comments | jq length",
+      output: "Query log: 1 SELECT tasks ... + 12 SELECT comments ... (13 query cho 12 task)",
+    },
+    { comment: "Chuyển route sang db.query.tasks.findMany({ with: { comments: true } })", command: "$EDITOR src/routes/tasks.ts" },
+    {
+      comment: "Gọi lại đúng endpoint đó",
+      command: "curl -s localhost:3000/api/v1/projects/$PROJECT_ID/tasks?include=comments | jq length",
+      output: "Query log: 2 SELECT (1 cho tasks, 1 cho comments dùng IN (...))",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Dùng `with: { comments: true }` cho một danh sách 500 task nhưng mỗi task lại có 200 comment — relational query API tránh được N+1 về **số lượng query**, nhưng không tránh được việc tải một payload khổng lồ về cùng lúc. N+1 và "trả quá nhiều dữ liệu" là hai vấn đề khác nhau, cursor pagination (B03) vẫn cần áp dụng cho cấp `tasks`.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "N+1 query", meaning: "1 query lấy danh sách, cộng thêm N query (một cho mỗi phần tử) lấy dữ liệu liên quan — chậm dần theo N." },
+    { term: "relational query API", meaning: "`db.query.<bảng>.findMany/findFirst({ with: {...} })` của Drizzle, gộp join thành ít query." },
+    { term: "batching", meaning: "Gộp nhiều lệnh lấy dữ liệu rời rạc thành một câu truy vấn dùng `WHERE ... IN (...)`." },
+    { term: "eager loading", meaning: "Tải sẵn dữ liệu liên quan (comments) cùng lúc với dữ liệu chính (tasks), thay vì tải riêng khi cần." },
+  ]}
+/>
+
+<QuickCheck
+  question="Route lấy toàn bộ task bằng `db.select().from(tasks)`, sau đó lặp qua từng task và bên trong vòng lặp gọi thêm `db.select().from(comments).where(eq(comments.taskId, task.id))` chỉ để đếm `commentCount`. Đoạn code này có vấn đề gì?"
+  options={[
+    "Không có vấn đề gì, đây là cách viết chuẩn được khuyến nghị",
+    "Đây là N+1 query — với 1000 task sẽ bắn 1001 câu SQL, trong khi có thể gộp bằng relational query API hoặc một câu `GROUP BY`",
+    "Vấn đề duy nhất là thiếu `await` ở dòng khai báo `allTasks`",
+    "Vấn đề là `comments` phải được tạo trước `tasks` trong migration",
+  ]}
+  answerIndex={1}
+  explanation="Bất kỳ query nào đặt bên trong vòng lặp chạy trên kết quả của query trước là N+1 — bất kể mục đích là lấy dữ liệu hay chỉ đếm số lượng."
+/>

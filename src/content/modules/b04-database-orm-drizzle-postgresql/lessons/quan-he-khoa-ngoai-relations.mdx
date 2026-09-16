@@ -1,0 +1,126 @@
+import { RelationCardinalityDiagram } from "../diagrams/relation-cardinality-diagram";
+
+<Eli5 title="Chung cư, tầng, và căn hộ" emoji="🏢">
+  Một **tổ chức** (organization) giống một **chung cư**. Mỗi chung cư có nhiều **project** — giống nhiều **tầng**. Mỗi tầng có nhiều **task** — giống nhiều **căn hộ**. Mỗi căn hộ lại có nhiều **comment** — giống nhiều **cuộc gọi bảo trì** ghi vào căn hộ đó.
+
+  Đây là quan hệ **1-n**: một chung cư có nhiều tầng, nhưng mỗi tầng chỉ thuộc đúng một chung cư. "Chìa khoá" nối chúng lại chính là **foreign key**: mỗi tầng giữ số căn nhà của chung cư nó thuộc về (`organization_id`).
+
+  Có kiểu quan hệ khác gọi là **n-n**: ví dụ một cư dân có thể gửi xe ở nhiều bãi, một bãi xe chứa xe của nhiều cư dân. Không thể ghi "một số căn hộ" vào bãi xe hay ngược lại — phải có một **sổ đăng ký riêng** (bảng nối) ghi từng cặp cư dân-bãi xe.
+</Eli5>
+
+<RelationCardinalityDiagram />
+
+<Technical>
+
+### Foreign key — ràng buộc thật ở tầng Postgres
+
+4 bảng của B04 xếp thành một chuỗi 1-n: `organizations` → `projects` → `tasks` → `comments`. Mỗi mũi tên là một cột `uuid` có `.references()`:
+
+```ts title="src/db/schema.ts (nhắc lại)"
+export const tasks = pgTable("tasks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  projectId: uuid("project_id").notNull().references(() => projects.id),
+  // ...
+});
+```
+
+Postgres sẽ từ chối insert một `task` với `project_id` không tồn tại trong `projects` — đó là **tính toàn vẹn tham chiếu (referential integrity)**, việc engine tự canh giữ, không phải ứng dụng tự nhớ kiểm tra.
+
+### `relations()` — mô tả cách join cho relational query API
+
+`.references()` xong không có nghĩa là code tự biết cách "join" khi bạn muốn lấy `project` kèm `tasks` của nó. Cần khai báo thêm `relations()` — đây thuần là **metadata cho Drizzle**, không tạo constraint nào ở DB:
+
+```ts title="src/db/schema.ts (thêm relations)"
+import { relations } from "drizzle-orm";
+
+export const organizationsRelations = relations(organizations, ({ many }) => ({
+  projects: many(projects),
+}));
+
+export const projectsRelations = relations(projects, ({ one, many }) => ({
+  organization: one(organizations, {
+    fields: [projects.organizationId],
+    references: [organizations.id],
+  }),
+  tasks: many(tasks),
+}));
+
+export const tasksRelations = relations(tasks, ({ one, many }) => ({
+  project: one(projects, {
+    fields: [tasks.projectId],
+    references: [projects.id],
+  }),
+  comments: many(comments),
+}));
+
+export const commentsRelations = relations(comments, ({ one }) => ({
+  task: one(tasks, {
+    fields: [comments.taskId],
+    references: [tasks.id],
+  }),
+}));
+```
+
+- `one(...)`: phía "1" của quan hệ — một `project` thuộc về đúng một `organization`.
+- `many(...)`: phía "n" — một `organization` có nhiều `projects`.
+- Không có dòng nào ở đây sinh ra SQL `ALTER TABLE`. Xoá hết `relations()` thì foreign key ở DB vẫn còn nguyên; chỉ có `db.query.x.findMany({ with: {...} })` (bài sau) là mất khả năng join tự động.
+
+### Vì sao n-n cần bảng nối
+
+taskflow-api hiện tại (B04) không có quan hệ n-n thật nào — bốn bảng đều xếp thành chuỗi 1-n. Nhưng B05 sẽ thêm `memberships`, đúng dạng n-n: một user có thể thuộc nhiều organization, một organization có nhiều user.
+
+```ts title="Ví dụ minh hoạ cấu trúc n-n (memberships, sẽ thêm ở B05)"
+export const memberships = pgTable(
+  "memberships",
+  {
+    userId: uuid("user_id").notNull(),
+    organizationId: uuid("organization_id").notNull(),
+    role: text("role").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.organizationId] })],
+);
+```
+
+Không cột đơn nào trong `users` hay `organizations` biểu diễn được "nhiều-nhiều" — bảng nối (`memberships`) giữ từng **cặp** quan hệ, và khoá chính kết hợp cả hai cột đảm bảo không có cặp trùng lặp.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Thêm relations() vào cuối schema.ts cho cả 4 bảng", command: "$EDITOR src/db/schema.ts" },
+    { comment: "Type check lại — relations() cũng được Drizzle kiểm tra kiểu", command: "pnpm exec tsc --noEmit" },
+    {
+      comment: "Thử relational query đơn giản trong REPL để xác nhận join hoạt động",
+      command: "pnpm exec tsx -e 'import(\"./src/db/client.ts\").then(({ db }) => db.query.organizations.findMany({ with: { projects: true } })).then(console.log)'",
+      output: "[ { id: '...', name: 'Acme Corp', slug: 'acme', projects: [] } ]",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Định nghĩa `.references()` nhưng quên `relations()` (hoặc ngược lại), rồi ngạc nhiên vì `db.query.tasks.findMany({ with: { comments: true } })` trả về `undefined` cho `comments` — hai cơ chế độc lập, phải khai báo cả hai nếu muốn dùng relational query API.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "1-n (one-to-many)", meaning: "Một hàng bảng A khớp nhiều hàng bảng B; FK nằm ở bảng B (bên 'nhiều')." },
+    { term: "n-n (many-to-many)", meaning: "Nhiều hàng bảng A khớp nhiều hàng bảng B; cần bảng nối với FK tới cả hai." },
+    { term: "referential integrity", meaning: "Đảm bảo giá trị FK luôn trỏ tới một hàng thật đang tồn tại — Postgres tự canh giữ." },
+    { term: "relations()", meaning: "Metadata Drizzle mô tả cách join giữa các bảng cho relational query API — không tạo constraint DB." },
+    { term: "bảng nối (junction table)", meaning: "Bảng trung gian giữ từng cặp quan hệ n-n, ví dụ memberships." },
+  ]}
+/>
+
+<QuickCheck
+  question="Xoá hết các khối `relations(...)` khỏi `schema.ts` nhưng giữ nguyên `.references()`. Điều gì xảy ra?"
+  options={[
+    "Foreign key ở Postgres cũng biến mất theo",
+    "Foreign key ở Postgres vẫn còn nguyên; chỉ mất khả năng dùng `db.query.x.findMany({ with: {...} })` để join tự động",
+    "Toàn bộ ứng dụng crash ngay khi khởi động vì thiếu relations()",
+    "Không có gì thay đổi, relations() chỉ là comment không ảnh hưởng gì",
+  ]}
+  answerIndex={1}
+  explanation="`.references()` và `relations()` phục vụ hai tầng khác nhau: một tạo constraint SQL thật, một chỉ là metadata cho relational query API. Xoá một cái không ảnh hưởng cái còn lại."
+/>

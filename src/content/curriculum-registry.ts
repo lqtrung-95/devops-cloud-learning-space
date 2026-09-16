@@ -2,6 +2,7 @@ import type { ModuleDefinition } from "./content-types";
 import { b01NodejsRuntimeProjectArchitectureModule } from "./modules/b01-nodejs-runtime-project-architecture/module-meta";
 import { b02HttpRestApiFastifyModule } from "./modules/b02-http-rest-api-fastify/module-meta";
 import { b03ValidationErrorHandlingApiDesignModule } from "./modules/b03-validation-error-handling-api-design/module-meta";
+import { b04DatabaseOrmDrizzlePostgresqlModule } from "./modules/b04-database-orm-drizzle-postgresql/module-meta";
 import { b05AuthenticationJwtRefreshTokenModule } from "./modules/b05-authentication-jwt-refresh-token/module-meta";
 import { m01LinuxShellModule } from "./modules/m01-linux-shell/module-meta";
 import { m02NetworkingModule } from "./modules/m02-networking/module-meta";
@@ -45,6 +46,7 @@ export const curriculumModules: ModuleDefinition[] = [
   b01NodejsRuntimeProjectArchitectureModule,
   b02HttpRestApiFastifyModule,
   b03ValidationErrorHandlingApiDesignModule,
+  b04DatabaseOrmDrizzlePostgresqlModule,
   b05AuthenticationJwtRefreshTokenModule,
   m01LinuxShellModule,
   m02NetworkingModule,

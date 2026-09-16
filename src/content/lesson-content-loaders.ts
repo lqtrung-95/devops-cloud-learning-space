@@ -48,4 +48,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "b02-http-rest-api-fastify": (lessonSlug) => import(`./modules/b02-http-rest-api-fastify/lessons/${lessonSlug}.mdx`),
   "b05-authentication-jwt-refresh-token": (lessonSlug) => import(`./modules/b05-authentication-jwt-refresh-token/lessons/${lessonSlug}.mdx`),
   "b03-validation-error-handling-api-design": (lessonSlug) => import(`./modules/b03-validation-error-handling-api-design/lessons/${lessonSlug}.mdx`),
+  "b04-database-orm-drizzle-postgresql": (lessonSlug) => import(`./modules/b04-database-orm-drizzle-postgresql/lessons/${lessonSlug}.mdx`),
 };
