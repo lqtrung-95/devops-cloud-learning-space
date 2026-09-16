@@ -10,7 +10,7 @@ import { PlaygroundRequestPathDiagram } from "../diagrams/playground-request-pat
   Chỗ ví von bị hụt: một hệ thống thật thường có *cả hai*. Trang sản phẩm là thư viện, còn luồng ghi log click là sổ chấm công — thiết kế riêng cho từng luồng.
 </Eli5>
 
-Read/write ratio là một trong những con số quyết định kiến trúc mạnh nhất: nó cho biết nên đầu tư vào cache và replica, hay vào partition, batch và queue. Còn **sd-playground** là nơi bạn sẽ kiểm chứng mọi building block trong course — từ load balancer (SD03), cache (SD04), replica (SD06) tới Redpanda (SD07) và Toxiproxy (SD11). Dựng nó cẩn thận một lần, dùng suốt 24 tuần.
+Read/write ratio là một trong những con số quyết định kiến trúc mạnh nhất: nó cho biết nên đầu tư vào cache và replica, hay vào partition, batch và queue. Còn **sd-playground** là nơi bạn sẽ kiểm chứng mọi building block trong course — từ load balancer (SD03), cache (SD04), replica (SD06) tới Redpanda (SD07) và Toxiproxy (SD09). Dựng nó cẩn thận một lần, dùng suốt 24 tuần.
 
 <PlaygroundRequestPathDiagram />
 
@@ -48,7 +48,7 @@ services:
     build: ./app
     ports: ["3000:3000"]
     environment:
-      DATABASE_URL: postgres://playground:playground@postgres:5432/playground
+      DATABASE_URL: postgres://app:app@postgres:5432/app
       REDIS_URL: redis://redis:6379
     depends_on:
       postgres: { condition: service_healthy }
@@ -60,11 +60,11 @@ services:
     depends_on: [app]
   postgres:
     image: postgres:17
-    environment: { POSTGRES_USER: playground, POSTGRES_PASSWORD: playground, POSTGRES_DB: playground }
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: app }
     ports: ["5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data", "./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U playground"]
+      test: ["CMD-SHELL", "pg_isready -U app"]
       interval: 5s
       retries: 10
   redis:
@@ -184,7 +184,7 @@ Smoke test **không** đo giới hạn hệ thống — nó chỉ xác nhận m�
     { command: "curl -s localhost:8080/api/items/42", output: "{\"id\":42,\"name\":\"item-42\",\"price\":518203,\"views\":1}" },
     { comment: "Ghi 'ẩn' đã nằm trong Redis", command: "docker compose exec redis redis-cli GET views:item:42", output: "\"1\"" },
     { comment: "Chạy smoke test (hoặc: docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run - < k6/smoke.js)", command: "k6 run k6/smoke.js", output: "(rút gọn)\n    checks.........................: 100.00% 148 out of 148\n    http_req_duration..............: avg=4.62ms min=1.71ms med=3.9ms max=48.3ms p(90)=7.1ms p(95)=9.84ms\n    http_req_failed................: 0.00%   0 out of 148\n    http_reqs......................: 148     4.87/s" },
-    { comment: "Kiểm tra tỉ lệ ghi thực tế trong DB (100.000 dòng seed ban đầu)", command: "docker compose exec postgres psql -U playground -c \"SELECT count(*) - 100000 AS rows_written FROM items;\"", output: " rows_written \n--------------\n           14\n(1 row)" },
+    { comment: "Kiểm tra tỉ lệ ghi thực tế trong DB (100.000 dòng seed ban đầu)", command: "docker compose exec postgres psql -U app -c \"SELECT count(*) - 100000 AS rows_written FROM items;\"", output: " rows_written \n--------------\n           14\n(1 row)" },
   ]}
 />
 

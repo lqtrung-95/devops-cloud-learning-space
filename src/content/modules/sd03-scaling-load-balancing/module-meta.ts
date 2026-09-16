@@ -69,7 +69,7 @@ export const sd03ScalingLoadBalancingModule: ModuleDefinition = {
       steps: [
         "Thêm endpoint `/api/orders` có query Postgres; mỗi instance dùng `pg.Pool` với `max: 10`",
         "Chạy k6 với `--scale app=1`, `2`, `4`, `6`; mỗi lần ghi throughput, p95 và `docker stats --no-stream` (CPU từng container)",
-        "Trong lúc chạy tải, đếm connection: `docker compose exec postgres psql -U postgres -c \"SELECT count(*) FROM pg_stat_activity;\"` và so với `SHOW max_connections;`",
+        "Trong lúc chạy tải, đếm connection: `docker compose exec postgres psql -U app -c \"SELECT count(*) FROM pg_stat_activity;\"` và so với `SHOW max_connections;`",
         "Vẽ bảng số instance → throughput; đánh dấu điểm throughput ngừng tăng và nguyên nhân (CPU app, CPU Postgres, hết connection, hay giới hạn CPU của Docker VM)",
         "Viết design doc 1 trang theo template Phụ lục A cho 'API đặt hàng chịu 5.000 RPS đỉnh': ước lượng số instance, số connection DB, bảng trade-off (sticky session vs Redis, L4 vs L7)",
       ],

@@ -31,7 +31,7 @@ export const sd04CachingCdnModule: ModuleDefinition = {
       title: "Cache-aside Redis cho endpoint đọc chậm",
       description: "Thêm cache-aside cho `GET /api/products/:id` (query Postgres giả lập ~50ms), đo hit-rate và p95 trước/sau bằng k6.",
       steps: [
-        "Tạo bảng `products` với 10.000 dòng: `docker compose exec postgres psql -U postgres -c \"CREATE TABLE products AS SELECT g AS id, 'Product ' || g AS name, (random()*1000)::int AS price FROM generate_series(1,10000) g; ALTER TABLE products ADD PRIMARY KEY (id);\"`",
+        "Tạo bảng `products` với 10.000 dòng: `docker compose exec postgres psql -U app -c \"CREATE TABLE products AS SELECT g AS id, 'Product ' || g AS name, (random()*1000)::int AS price FROM generate_series(1,10000) g; ALTER TABLE products ADD PRIMARY KEY (id);\"`",
         "Viết endpoint không cache, query có `pg_sleep(0.05)` để giả lập 50ms; chạy `k6 run k6/products-test.js` (id phân bố lệch: 80% request vào 1.000 id đầu) và ghi p95, `http_reqs/s`",
         "Thêm cache-aside: `redis.get(key)` → miss thì query DB → `redis.set(key, value, { EX: 60 })`; rebuild bằng `docker compose up -d --build`",
         "Reset thống kê bằng `docker compose exec redis redis-cli CONFIG RESETSTAT`, chạy lại k6, rồi đọc `redis-cli INFO stats | grep keyspace` để tính hit-rate = hits ÷ (hits + misses)",

@@ -61,6 +61,7 @@ export const sd09ConsistencyReplicationModule: ModuleDefinition = {
       title: "Cắt mạng thật bằng Toxiproxy: chọn CP hay AP",
       description: "Dựng proxy giữa app và replica trong sd-playground, cắt kết nối và quan sát hai chế độ xử lý: từ chối (CP) hay trả dữ liệu cũ (AP).",
       steps: [
+        "Thêm service `toxiproxy` vào `docker-compose.yml` của sd-playground: `image: ghcr.io/shopify/toxiproxy`, `ports: [\"8474:8474\"]` (API), rồi `docker compose up -d toxiproxy`",
         "Tạo proxy trỏ tới `postgres-replica`: `docker compose exec toxiproxy toxiproxy-cli create replica-proxy --listen 0.0.0.0:5433 --upstream postgres-replica:5432`, rồi trỏ biến môi trường `REPLICA_URL` của service `app` sang `toxiproxy:5433` thay vì thẳng tới replica",
         "Thêm hai endpoint trong `app`: `GET /profile/:id?mode=cp` đọc từ replica, timeout 1s, lỗi thì trả `503 Service Unavailable`; `GET /profile/:id?mode=ap` cùng logic nhưng khi lỗi thì trả bản cache gần nhất kèm header `X-Stale: true`",
         "Mô phỏng partition: `docker compose exec toxiproxy toxiproxy-cli toggle replica-proxy` (disable) rồi gọi `curl -i localhost:3000/profile/1?mode=cp` (nhận `503`) và `curl -i localhost:3000/profile/1?mode=ap` (nhận `200` kèm `X-Stale: true`)",

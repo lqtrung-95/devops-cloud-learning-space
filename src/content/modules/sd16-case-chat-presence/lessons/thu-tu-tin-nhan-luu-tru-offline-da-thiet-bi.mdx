@@ -94,7 +94,7 @@ Chứng minh: Bob mất mạng, Alice gửi 2 tin, Bob reconnect và nhận đ�
     { comment: "Bob đang kết nối, kill kết nối phía client (giả lập mất mạng)", command: "node scripts/ws-client.js bob --then-disconnect-after=1s" },
     { comment: "Alice gửi 2 tin trong lúc Bob offline", command: "node scripts/ws-send.js alice '{\"recipientId\":\"bob\",\"body\":\"còn đó không?\"}'" },
     { command: "node scripts/ws-send.js alice '{\"recipientId\":\"bob\",\"body\":\"mai họp lúc 9h nhé\"}'" },
-    { comment: "Kiểm tra 2 tin đã nằm trong DB dù Bob chưa nhận", command: "docker compose exec postgres psql -U postgres -c \"SELECT seq, sender_id, body FROM messages WHERE conversation_id='c1' ORDER BY seq;\"", output: " seq | sender_id |          body           \n-----+-----------+--------------------------\n   1 | alice     | hi\n   2 | bob       | chào\n   3 | alice     | còn đó không?\n   4 | alice     | mai họp lúc 9h nhé" },
+    { comment: "Kiểm tra 2 tin đã nằm trong DB dù Bob chưa nhận", command: "docker compose exec postgres psql -U app -c \"SELECT seq, sender_id, body FROM messages WHERE conversation_id='c1' ORDER BY seq;\"", output: " seq | sender_id |          body           \n-----+-----------+--------------------------\n   1 | alice     | hi\n   2 | bob       | chào\n   3 | alice     | còn đó không?\n   4 | alice     | mai họp lúc 9h nhé" },
     { comment: "Bob reconnect, client tự gọi afterSeq=2 để resync", command: "curl -s 'localhost:8080/conversations/c1/messages?afterSeq=2'", output: "[{\"seq\":3,...},{\"seq\":4,...}]" },
   ]}
 />

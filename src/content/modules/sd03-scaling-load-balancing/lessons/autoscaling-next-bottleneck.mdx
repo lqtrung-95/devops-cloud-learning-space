@@ -75,8 +75,8 @@ Hướng xử lý: **PgBouncer** (transaction pooling) để nhiều client dùn
     { comment: "Lần lượt đo với 1, 2, 4, 6 instance (ví dụ 4)", command: "docker compose up -d --scale app=4 && docker compose exec nginx nginx -s reload" },
     { comment: "Chạy tải lên endpoint có query Postgres", command: "k6 run -e PATH_UNDER_TEST=/api/orders k6/lb-test.js" },
     { comment: "Trong lúc chạy: CPU từng container (số minh hoạ)", command: "docker stats --no-stream --format 'table {{.Name}}\\t{{.CPUPerc}}'", output: "NAME                   CPU %\nsd-playground-app-1    41.3%\nsd-playground-app-2    39.8%\nsd-playground-app-3    43.1%\nsd-playground-app-4    40.6%\nsd-playground-postgres-1 187.5%\nsd-playground-nginx-1  22.4%" },
-    { comment: "Postgres đang có bao nhiêu kết nối, bao nhiêu thật sự bận?", command: "docker compose exec postgres psql -U postgres -c \"SELECT state, count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' GROUP BY state;\"", output: " state  | count\n--------+-------\n active |    18\n idle   |    22\n(2 rows)" },
-    { command: "docker compose exec postgres psql -U postgres -c 'SHOW max_connections;'", output: " max_connections\n-----------------\n 100\n(1 row)" },
+    { comment: "Postgres đang có bao nhiêu kết nối, bao nhiêu thật sự bận?", command: "docker compose exec postgres psql -U app -c \"SELECT state, count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' GROUP BY state;\"", output: " state  | count\n--------+-------\n active |    18\n idle   |    22\n(2 rows)" },
+    { command: "docker compose exec postgres psql -U app -c 'SHOW max_connections;'", output: " max_connections\n-----------------\n 100\n(1 row)" },
     { comment: "Scale lên 12 → 120 kết nối muốn mở: xem lỗi trong log app", command: "docker compose up -d --scale app=12 && docker compose logs app | grep -m1 'too many clients'", output: "app-11  | error: sorry, too many clients already" },
   ]}
 />

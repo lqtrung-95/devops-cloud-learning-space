@@ -77,8 +77,8 @@ Nhưng **p99 vẫn là latency của miss** — cache làm trung bình đẹp, k
   commands={[
     { comment: "Độ trễ tới Redis từ trong mạng Docker (Ctrl+C để dừng; số minh hoạ)", command: "docker compose exec redis redis-cli --latency", output: "min: 0, max: 2, avg: 0.18 (2143 samples)" },
     { comment: "Thời gian một request đọc sản phẩm chưa có cache", command: "curl -s -o /dev/null -w 'total=%{time_total}s\\n' localhost:8080/api/products/42", output: "total=0.058912s" },
-    { comment: "Query giả lập chậm trong Postgres", command: "docker compose exec postgres psql -U postgres -c '\\timing on' -c 'SELECT p.*, pg_sleep(0.05) FROM products p WHERE id = 42;'", output: "Timing is on.\n id |    name    | price | pg_sleep\n----+------------+-------+----------\n 42 | Product 42 |   731 |\n(1 row)\n\nTime: 51.204 ms" },
-    { comment: "Postgres đang đọc từ RAM được bao nhiêu? (tỉ lệ blks_hit)", command: "docker compose exec postgres psql -U postgres -c \"SELECT round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 1) AS buffer_hit_pct FROM pg_stat_database WHERE datname = 'postgres';\"", output: " buffer_hit_pct\n----------------\n           99.2\n(1 row)" },
+    { comment: "Query giả lập chậm trong Postgres", command: "docker compose exec postgres psql -U app -c '\\timing on' -c 'SELECT p.*, pg_sleep(0.05) FROM products p WHERE id = 42;'", output: "Timing is on.\n id |    name    | price | pg_sleep\n----+------------+-------+----------\n 42 | Product 42 |   731 |\n(1 row)\n\nTime: 51.204 ms" },
+    { comment: "Postgres đang đọc từ RAM được bao nhiêu? (tỉ lệ blks_hit)", command: "docker compose exec postgres psql -U app -c \"SELECT round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 1) AS buffer_hit_pct FROM pg_stat_database WHERE datname = 'app';\"", output: " buffer_hit_pct\n----------------\n           99.2\n(1 row)" },
   ]}
 />
 

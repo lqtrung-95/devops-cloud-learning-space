@@ -81,7 +81,7 @@ Lý do tách nội dung khỏi metadata: bảng `pastes` luôn nhỏ và nhanh �
     { comment: "Kiểm tra Redis TRƯỚC lần đọc đầu tiên — chưa có gì (trừ khi đã bật write-through)", command: "docker compose exec redis redis-cli GET short:3F7k2Qz", output: "(nil)" },
     { comment: "Lần đọc đầu tiên — cache miss, App query Postgres rồi tự SET lại Redis", command: "curl -sD - -o /dev/null localhost:8080/3F7k2Qz | grep -i location", output: "location: https://example.com/bai-viet-dai" },
     { comment: "Bây giờ Redis đã có — lần đọc sau sẽ là cache hit", command: "docker compose exec redis redis-cli GET short:3F7k2Qz", output: "\"https://example.com/bai-viet-dai\"" },
-    { comment: "Xác nhận click_count đã tăng (ghi ẩn phía sau một request đọc)", command: "docker compose exec postgres psql -U playground -c \"SELECT click_count FROM urls WHERE short_code='3F7k2Qz';\"", output: " click_count \n-------------\n           1\n(1 row)" },
+    { comment: "Xác nhận click_count đã tăng (ghi ẩn phía sau một request đọc)", command: "docker compose exec postgres psql -U app -c \"SELECT click_count FROM urls WHERE short_code='3F7k2Qz';\"", output: " click_count \n-------------\n           1\n(1 row)" },
   ]}
 />
 
