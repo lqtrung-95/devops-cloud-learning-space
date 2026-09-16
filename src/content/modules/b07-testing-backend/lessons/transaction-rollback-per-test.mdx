@@ -1,0 +1,111 @@
+import { TransactionRollbackLifecycleDiagram } from "../diagrams/transaction-rollback-lifecycle-diagram";
+
+<Eli5 title="Tờ giấy nháp có thể xé bỏ, bản gốc không bao giờ bị đụng tới" emoji="📝">
+  Tưởng tượng bạn tập viết trên một tờ giấy than đặt trên bản gốc: viết gì cũng hiện ra, bạn kiểm tra được nét chữ ổn không — nhưng ngay khi xong, bạn rút tờ giấy than ra và **xé bỏ**. Bản gốc bên dưới không hề có một vết bút nào, sẵn sàng cho người tiếp theo dùng y như lúc đầu.
+
+  `BEGIN` trước mỗi test là đặt tờ giấy than lên. `ROLLBACK` sau mỗi test là xé nó đi. Database `taskflow_test` (từ lesson 2) luôn "sạch như mới" cho test kế tiếp, dù test trước đã insert bao nhiêu bảng.
+</Eli5>
+
+Đây là kỹ thuật giúp bạn có được database test riêng (lesson 2) MÀ KHÔNG phải trả giá bằng tốc độ: không cần `drizzle-kit migrate` lại từ đầu hay xoá thủ công từng bảng trước mỗi test — chỉ cần rollback một transaction, việc mà Postgres làm trong vài mili-giây.
+
+<TransactionRollbackLifecycleDiagram />
+
+<Technical>
+
+### Vì sao phải dùng đúng MỘT connection cho cả beforeEach/test/afterEach
+
+`BEGIN` và `ROLLBACK` là lệnh áp lên một **connection/session** cụ thể, không áp lên toàn bộ database. Nếu `testDb` được cấp phát từ một connection pool (nhiều connection, như `db` production dùng `max: 10`), câu query trong `beforeEach` có thể chạy trên connection A (đã `BEGIN`), còn câu query trong test lại vô tình chạy trên connection B (chưa `BEGIN` gì cả) — dữ liệu ghi qua connection B sẽ bị commit ngầm định (autocommit) và không nằm trong phạm vi `ROLLBACK` sau đó.
+
+```ts title="tests/setup.ts"
+import { afterEach, beforeEach } from "vitest";
+import postgres from "postgres";
+import { drizzle } from "drizzle-orm/postgres-js";
+import * as schema from "../src/db/schema.js";
+
+const testConnectionString = process.env.TEST_DATABASE_URL ?? "postgres://taskflow:taskflow@postgres:5432/taskflow_test";
+
+// max: 1 — CHỈ một connection duy nhất, bắt buộc để BEGIN/ROLLBACK
+// áp đúng lên toàn bộ query của một test case.
+const sql = postgres(testConnectionString, { max: 1 });
+export const testDb = drizzle(sql, { schema });
+
+beforeEach(async () => {
+  await sql`BEGIN`;
+});
+
+afterEach(async () => {
+  await sql`ROLLBACK`;
+});
+```
+
+Route handler trong test phải nhận `testDb` này (qua dependency injection hoặc override khi gọi `buildApp({ db: testDb })`) thay vì import trực tiếp singleton `db` production — nếu không, request đi qua route vẫn dùng connection pool thật, hoàn toàn tách khỏi transaction đang mở trong `tests/setup.ts`.
+
+### Vì sao chạy song song nhiều file test phải tắt (`fileParallelism: false`)
+
+Vì cả bộ test dùng chung MỘT connection (`max: 1`), hai file test chạy song song sẽ cùng gọi `BEGIN` trên connection đó — Postgres không cho một session mở hai transaction lồng kiểu đó theo cách bạn mong đợi. Với pattern này, các file test phải chạy **tuần tự**:
+
+```ts title="vitest.config.mts"
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    setupFiles: ["./tests/setup.ts"],
+    fileParallelism: false, // bắt buộc — tất cả file test dùng chung 1 connection transaction
+  },
+});
+```
+
+Đánh đổi: test chạy tuần tự thay vì song song, chậm hơn một chút ở tổng thời gian CI. Đổi lại: không cần migrate lại schema hàng trăm lần, và không cần lo dọn dẹp dữ liệu thủ công giữa các test.
+
+### Cạm bẫy: transaction lồng bên trong code ứng dụng
+
+`taskflow-api` từ B04 đã có chỗ tự gọi `db.transaction()` bên trong (ví dụ route tạo task ghi luôn `activity_logs` trong cùng một transaction, để đảm bảo cả hai cùng thành công hoặc cùng thất bại). Khi route đó chạy dưới transaction rollback-per-test của B07, nó tạo ra một transaction *lồng bên trong* transaction test đang mở.
+
+Với hầu hết driver Postgres, transaction lồng chỉ tạo ra một **SAVEPOINT** — vẫn nằm trong transaction ngoài cùng, `ROLLBACK` ở `afterEach` vẫn dọn sạch mọi thứ. Nhưng có hai trường hợp cần cẩn thận:
+
+- Code (hoặc một thư viện) gọi `COMMIT` **tường minh** thay vì để `db.transaction()` tự quản lý — điều này commit thật transaction ngoài cùng sớm hơn dự kiến.
+- Một constraint khai báo `DEFERRABLE INITIALLY DEFERRED` có hành vi kiểm tra hoãn tới lúc `COMMIT` — nếu logic của bạn dựa vào thời điểm đó, hành vi trong "transaction nháp" của test có thể khác với hành vi khi chạy thật (vì transaction test không bao giờ thật sự đi tới `COMMIT`).
+
+Khi gặp trong hai trường hợp này, `ROLLBACK` ở `afterEach` không còn transaction nào để rollback — dữ liệu test đã ghi thật vào `taskflow_test`, rò rỉ sang lần chạy sau. Cách phòng: không để code nghiệp vụ tự ý `COMMIT` khi đang chạy dưới môi trường test này; nếu một luồng bắt buộc phải test với `COMMIT` thật (hiếm), tách nó ra một schema riêng được reset thủ công bằng migrate lại, thay vì dựa vào rollback-per-test.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chạy 1 test 2 lần liên tiếp — nếu rollback đúng, lần 2 không gặp lỗi trùng email", command: "pnpm vitest run tests/auth-project-task-flow.test.ts && pnpm vitest run tests/auth-project-task-flow.test.ts", output: "✓ tests/auth-project-task-flow.test.ts (1 test) 138ms\n✓ tests/auth-project-task-flow.test.ts (1 test) 141ms" },
+    { comment: "Kiểm tra bằng psql: sau khi pnpm test chạy xong, bảng users phải RỖNG (mọi thứ đã rollback)", command: "docker compose exec postgres psql -U taskflow -d taskflow_test -c 'SELECT count(*) FROM users'", output: " count \n-------\n     0\n(1 row)" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Quên truyền `testDb` vào `buildApp()` và để route vẫn dùng singleton `db` production. Test vẫn "chạy được" (vì `taskflow_test` đã có schema), nhưng mỗi request tự mở connection riêng từ pool, ngoài transaction `BEGIN` ở `beforeEach` — dữ liệu bị commit thật ngay lập tức, và `taskflow_test` phình to dần sau mỗi lần chạy `pnpm test`.
+</Callout>
+
+<Callout type="info">
+  Coverage cao không đồng nghĩa test tốt. `pnpm test -- --coverage` báo 100% dòng code của route `DELETE /projects/:id` được thực thi không có nghĩa route đó ĐÚNG — nếu assertion chỉ kiểm tra `response.statusCode` tồn tại thay vì đúng giá trị mong đợi (`403` khi khác tổ chức), coverage 100% vẫn có thể đi kèm một lỗ hổng bảo mật thật. 70% coverage với assertion chặt chẽ ở đúng những path quan trọng (auth, RBAC, transaction) có giá trị hơn 100% coverage với assertion hời hợt.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "BEGIN / ROLLBACK", meaning: "Lệnh SQL mở và huỷ một transaction — mọi thay đổi giữa hai lệnh này biến mất sau ROLLBACK." },
+    { term: "connection/session", meaning: "Một kết nối cụ thể tới Postgres — transaction gắn liền với đúng connection đã mở nó." },
+    { term: "SAVEPOINT", meaning: "Điểm đánh dấu bên trong một transaction, cho phép rollback một phần mà không huỷ toàn bộ transaction ngoài." },
+    { term: "fileParallelism", meaning: "Tuỳ chọn Vitest bật/tắt chạy song song nhiều file test — phải tắt khi các file dùng chung 1 connection transaction." },
+    { term: "dependency injection (cho db)", meaning: "Truyền instance database vào app thay vì import cứng singleton — cần thiết để test dùng testDb thay vì db production." },
+    { term: "coverage vô nghĩa", meaning: "Coverage cao nhờ assertion yếu, không thật sự kiểm chứng hành vi đúng/sai của code." },
+  ]}
+/>
+
+<QuickCheck
+  question="Sau khi thêm rollback-per-test, một route tạo task (có gọi `db.transaction()` nội bộ từ B04) khiến `afterEach` không dọn sạch được dữ liệu — `taskflow_test` phình to dần. Nguyên nhân nhiều khả năng nhất?"
+  options={[
+    "Vitest không hỗ trợ transaction lồng nhau",
+    "Route đó (hoặc thư viện nó dùng) đã COMMIT tường minh hoặc kích hoạt hành vi ON COMMIT của một constraint hoãn, khiến transaction ngoài cùng của test bị đóng sớm — ROLLBACK sau đó không còn gì để huỷ",
+    "Postgres tự động giới hạn số ROLLBACK mỗi giờ",
+    "testDb đã hết dung lượng ổ đĩa",
+  ]}
+  answerIndex={1}
+  explanation="Transaction lồng bình thường chỉ tạo SAVEPOINT và vẫn nằm trong phạm vi ROLLBACK ngoài cùng. Nhưng một COMMIT tường minh hoặc hành vi ON COMMIT của constraint DEFERRABLE có thể đóng transaction ngoài cùng sớm hơn dự kiến — đúng caveat của pattern rollback-per-test."
+/>

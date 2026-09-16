@@ -1,0 +1,86 @@
+import { TestDatabaseIsolationDiagram } from "../diagrams/test-database-isolation-diagram";
+
+<Eli5 title="Bếp thử món mới, không phải bếp đang phục vụ khách" emoji="🍳">
+  Một nhà hàng thử công thức mới không làm điều đó ngay trên bếp đang nấu cho khách — lỡ tay đổ muối nhầm, khách đang chờ món phải chịu trận. Họ có một **bếp thử riêng**: cùng loại bếp, cùng gia vị, nhưng không liên quan gì tới bữa ăn khách đang đợi. Thử hỏng thì dọn sạch, thử lại bao nhiêu lần cũng được.
+
+  Database test của `taskflow-api` chính là "bếp thử" đó — cùng một Postgres, nhưng một database riêng tên `taskflow_test`, tách hoàn toàn khỏi `taskflow` (database dev thật) nơi bạn đang xem dữ liệu khi code tay.
+</Eli5>
+
+Đây là điều kiện tiên quyết trước khi viết bất kỳ integration test nào ở lab của module này: nếu test ghi dữ liệu vào cùng chỗ với dữ liệu bạn đang dùng để code/demo, hai bên sẽ giẫm chân nhau — và "giẫm chân" ở đây không phải ẩn dụ, nó là lỗi `unique constraint` thật bạn sẽ gặp.
+
+<TestDatabaseIsolationDiagram />
+
+<Technical>
+
+### Cùng container, khác database — không phải một service mới
+
+Theo spec `taskflow-api` (mục 3 curriculum), service `postgres` đã tồn tại từ B01 với `POSTGRES_USER=taskflow`, `POSTGRES_PASSWORD=taskflow`, `POSTGRES_DB=taskflow`. B07 **không thêm service mới** vào `docker-compose.yml` — chỉ tạo thêm một database khác bên trong đúng instance Postgres đó:
+
+```bash
+# Tạo database test — vẫn dùng chung container postgres, chỉ khác tên database
+docker compose exec postgres psql -U taskflow -c "CREATE DATABASE taskflow_test"
+```
+
+```ini title=".env.test"
+TEST_DATABASE_URL=postgres://taskflow:taskflow@postgres:5432/taskflow_test
+```
+
+Migrate schema vào database mới này giống hệt cách B04 migrate vào `taskflow`, chỉ đổi biến môi trường:
+
+```bash
+DATABASE_URL=$TEST_DATABASE_URL pnpm drizzle-kit migrate
+```
+
+### Cạm bẫy: `db` singleton đọc `DATABASE_URL` lúc import
+
+`src/db/client.ts` (B04) đọc `process.env.DATABASE_URL` **ngay khi module được import lần đầu**, rồi giữ nguyên connection đó cho cả process:
+
+```ts title="src/db/client.ts (nhắc lại từ B04)"
+const connectionString = process.env.DATABASE_URL ?? "postgres://taskflow:taskflow@postgres:5432/taskflow";
+const client = postgres(connectionString, { max: 10 });
+export const db = drizzle(client, { schema });
+```
+
+Nếu test import `buildApp()` (mà `app.ts` import `db` từ file trên) SAU KHI đã set `process.env.DATABASE_URL = TEST_DATABASE_URL`, mọi thứ ổn. Nhưng nếu import diễn ra trước, `db` đã "đóng băng" với connection string cũ — set biến môi trường sau đó không có tác dụng gì nữa vì module đã chạy xong phần khởi tạo. Đây là lý do file cấu hình môi trường test (`.env.test`, nạp qua `dotenv` hoặc qua biến môi trường của lệnh chạy test) phải có hiệu lực **trước** dòng `import` đầu tiên chạm tới `app.ts`.
+
+### Vì sao không chỉ "xoá hết bảng" trên DB dev sau khi test xong
+
+Có người nghĩ: dùng chung DB dev, rồi cuối mỗi test tự `DELETE FROM users; DELETE FROM projects; ...` cho sạch. Vấn đề: (1) dễ quên xoá đúng thứ tự vì foreign key, (2) nếu test crash giữa chừng, bước dọn dẹp không chạy và rác vẫn còn, (3) hai bộ test chạy song song (CI) trên cùng một DB sẽ xoá dữ liệu của nhau. Một database vật lý riêng loại bỏ cả ba vấn đề bằng thiết kế, không cần kỷ luật "nhớ dọn dẹp".
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo database test bên trong container postgres đang chạy", command: "docker compose exec postgres psql -U taskflow -c 'CREATE DATABASE taskflow_test'", output: "CREATE DATABASE" },
+    { comment: "Xác nhận có 2 database: taskflow (dev) và taskflow_test", command: "docker compose exec postgres psql -U taskflow -l", output: "                                 List of databases\n    Name       |  Owner   | Encoding |\n----------------+----------+----------+\n taskflow       | taskflow | UTF8     |\n taskflow_test  | taskflow | UTF8     |\n postgres       | taskflow | UTF8     |" },
+    { comment: "Migrate schema vào database test", command: "DATABASE_URL=postgres://taskflow:taskflow@postgres:5432/taskflow_test pnpm drizzle-kit migrate", output: "[✓] 5 migrations applied to taskflow_test" },
+  ]}
+/>
+
+<Callout type="warning" title="Đừng trỏ CI vào DB dev hay staging 'tạm thời'">
+  Một lần "tạm dùng DB staging cho nhanh" trong CI có thể để lại hàng trăm user rác `test-*@example.com` trong môi trường mà người khác đang demo cho khách hàng. Luôn dùng một database/schema được đánh dấu rõ là "chỉ để test" và không ai được phép coi dữ liệu trong đó là thật.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "test database", meaning: "Database Postgres riêng, chỉ dùng để chạy test, tách biệt khỏi dev/staging/production." },
+    { term: "connection string", meaning: "Chuỗi URL chứa user/password/host/port/tên database để driver kết nối Postgres." },
+    { term: "test pollution", meaning: "Dữ liệu do một lần chạy test để lại, làm nhiễu kết quả của lần chạy sau." },
+    { term: "singleton (module-level)", meaning: "Biến được khởi tạo một lần khi module import, dùng lại cho cả vòng đời process — ở đây là connection `db`." },
+    { term: "migrate", meaning: "Áp các thay đổi schema (bảng, cột, constraint) vào một database cụ thể." },
+  ]}
+/>
+
+<QuickCheck
+  question="File test import `buildApp()` ở dòng đầu tiên, rồi mới set `process.env.DATABASE_URL = testUrl` ở dòng thứ hai. Chuyện gì xảy ra?"
+  options={[
+    "Không sao, `DATABASE_URL` luôn được đọc lại mỗi request",
+    "`src/db/client.ts` đã đọc `DATABASE_URL` cũ (hoặc mặc định) ngay lúc `buildApp()` import nó — set biến môi trường sau đó không có tác dụng, app vẫn nối vào DB dev",
+    "Fastify sẽ tự động đợi biến môi trường được set xong",
+    "TypeScript sẽ báo lỗi biên dịch",
+  ]}
+  answerIndex={1}
+  explanation="`db/client.ts` đọc process.env.DATABASE_URL một lần duy nhất khi module được import và giữ nguyên connection đó. Phải set biến môi trường TRƯỚC bất kỳ import nào chạm tới app.ts/db/client.ts, thường qua .env.test nạp trong setupFiles của Vitest."
+/>

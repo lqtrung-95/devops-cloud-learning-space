@@ -1,0 +1,69 @@
+import { TestPyramidDiagram } from "../diagrams/test-pyramid-diagram";
+
+<Eli5 title="Xưởng may kiểm tra từng đường chỉ, rồi cả áo, rồi mới cho người mẫu mặc đi catwalk" emoji="🧵">
+  Một xưởng may không đợi áo may xong mới kiểm tra. Họ kiểm tra **từng đường chỉ** ngay khi vừa may (nhanh, rẻ, làm hàng nghìn lần một ngày). Rồi kiểm tra **cả chiếc áo ráp xong** — cổ áo có khớp với thân không, khoá kéo có chạy mượt không (chậm hơn, ít lần hơn). Cuối cùng, chỉ một vài mẫu được **cho người mẫu mặc thật đi catwalk** để xem tổng thể — vì làm vậy với mọi chiếc áo thì xưởng phá sản mất.
+
+  `taskflow-api` cũng vậy: "đường chỉ" là một hàm logic thuần, "cả chiếc áo" là một luồng API đi qua route + Postgres thật, còn "catwalk" là chạy cả hệ thống qua Docker Compose và gọi HTTP từ bên ngoài.
+</Eli5>
+
+Từ B01 đến B06, `taskflow-api` đã có auth thật, RBAC thật, CRUD thật trên Postgres — nhưng chưa có bài nào bắt bạn *chứng minh* nó vẫn đúng sau khi sửa code. Từ B07 trở đi, curriculum yêu cầu: mọi lesson thay đổi hành vi phải chỉ ra được test nào sẽ bắt được nếu ai đó vô tình làm hỏng nó. Phân bổ đúng tỉ lệ test là bước đầu tiên để lời hứa đó khả thi — viết 200 e2e test chậm chạp cũng vô dụng như không viết test nào, nếu bạn không đủ kiên nhẫn chạy chúng trước mỗi lần merge.
+
+<TestPyramidDiagram />
+
+<Technical>
+
+### Ba tầng, ba câu hỏi khác nhau
+
+| Tầng | Ví dụ ở `taskflow-api` | Trả lời câu hỏi | Tốc độ |
+|---|---|---|---|
+| Unit | `calculateDueDate(createdAt, priority)` | Logic thuần, tách khỏi hạ tầng, có đúng không? | mili-giây |
+| Integration | `register → login → tạo project → tạo task` qua Fastify + Postgres thật | Route, middleware quyền, DB có ăn khớp không? | chục–trăm mili-giây |
+| E2E / black-box | `docker compose up`, gọi HTTP thật qua nginx (B17) từ ngoài container | Cả hệ thống đã lắp ráp và cấu hình đúng khi triển khai chưa? | vài giây, dễ flaky |
+
+### Vì sao backend API nghiêng về integration nhiều hơn web UI truyền thống
+
+Kim tự tháp test kinh điển (Mike Cohn) vẽ unit test làm đáy to nhất. Với một REST API thuần (không có UI trình duyệt để click), phần lớn "hành vi thật sự đáng lo" nằm ở chỗ **các lớp ráp lại với nhau** — route nhận request, middleware kiểm tra quyền, query chạm Postgres, transaction có rollback đúng lúc lỗi không. Một hàm thuần tách biệt hoàn toàn khỏi các lớp đó (như `calculateDueDate`) chiếm tỉ lệ nhỏ trong codebase của một CRUD-heavy backend.
+
+Đây cũng là lý do Kent C. Dodds đề xuất "Testing Trophy" thay vì pyramid thuần tuý cho nhiều loại ứng dụng: đầu tư nhiều nhất vào integration test, vì nó cho tỉ lệ "niềm tin / chi phí bảo trì" tốt nhất — không quá chậm như e2e, không quá xa thực tế như unit test mock hết mọi thứ xung quanh.
+
+### E2E ở đây nghĩa là gì
+
+`taskflow-api` là một service backend thuần, không có trình duyệt để lái. "E2E" trong ngữ cảnh này là **black-box test qua HTTP thật** của cả stack đã dựng bằng Docker Compose — không import trực tiếp code TypeScript, chỉ gọi `curl`/HTTP client như một client bên ngoài thấy. Loại test này quý giá để bắt lỗi cấu hình (biến môi trường sai, port sai, nginx route sai ở B17) nhưng không phải nơi để test logic nghiệp vụ chi tiết — logic đó thuộc về integration và unit test.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Đếm nhanh số file test hiện có theo loại (quy ước đặt tên: *.test.ts ở gần code, *.integration.test.ts cho luồng qua HTTP)", command: "find src tests -name '*.test.ts' | wc -l" },
+    { comment: "Chạy toàn bộ test, xem thời gian mỗi nhóm", command: "pnpm test -- --reporter=verbose", output: "✓ tests/calculate-due-date.test.ts (4 tests) 6ms\n✓ tests/auth-project-task-flow.test.ts (1 test) 142ms\n✓ tests/rbac-cross-tenant.test.ts (2 tests) 198ms\n\nTest Files  3 passed (3)\n     Tests  7 passed (7)\n  Duration  612ms" },
+    { comment: "Chỉ chạy nhóm unit (nhanh nhất) khi đang code lặp lại nhiều lần", command: "pnpm vitest run tests/calculate-due-date.test.ts" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Viết toàn bộ test dưới dạng unit test bằng cách mock hết service layer và DB. Test chạy rất nhanh và coverage cao, nhưng khi B06 có ai vô tình xoá điều kiện `organization_id`, không test nào đỏ — vì mock luôn giả định phần đó "đã đúng sẵn". Bug rò rỉ dữ liệu xuyên tổ chức chỉ lộ ra khi lên production.
+</Callout>
+
+<Callout type="tip" title="Khung để quyết định viết test loại nào">
+  Hỏi: "Nếu bug này xảy ra, nó nằm ở MỘT hàm logic, hay ở CÁCH các phần ráp lại với nhau?" Logic thuần (tính toán, format, validate) → unit test. Mọi thứ đụng route/middleware/DB → integration test. Chỉ thêm e2e khi nghi ngờ vấn đề cấu hình triển khai.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "kim tự tháp test", meaning: "Mô hình phân bổ số lượng test theo 3 tầng: nhiều unit, ít hơn ở integration, ít nhất ở e2e." },
+    { term: "unit test", meaning: "Test một đơn vị code nhỏ (thường một hàm), cô lập khỏi DB/HTTP/hệ thống ngoài." },
+    { term: "integration test", meaning: "Test nhiều lớp code phối hợp với nhau, ví dụ route + Postgres thật." },
+    { term: "e2e / black-box test", meaning: "Test cả hệ thống đã triển khai, gọi qua giao diện ngoài (HTTP) như client thật." },
+    { term: "test double", meaning: "Tên gọi chung cho mock/stub/fake — vật thay thế một dependency thật khi test." },
+    { term: "flaky test", meaning: "Test đôi khi pass đôi khi fail dù code không đổi — thường do phụ thuộc thời gian/mạng thật." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một PR ở B08 vô tình làm route `PATCH /tasks/:id` không còn kiểm tra `organizationId` của người gọi. Loại test nào trong kim tự tháp CÓ KHẢ NĂNG NHẤT bắt được lỗi này?"
+  options={["Unit test cho hàm format ngày tháng", "Integration test gọi thật route đó bằng token của một tổ chức khác", "Không loại nào bắt được, phải review bằng mắt", "E2E test kiểm tra nginx trả đúng header"]}
+  answerIndex={1}
+  explanation="Lỗi này nằm ở cách route + middleware quyền + query DB phối hợp với nhau — đúng phạm vi của integration test. Unit test cho một hàm không liên quan không chạm tới đường code đó."
+/>

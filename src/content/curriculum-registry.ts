@@ -5,6 +5,7 @@ import { b03ValidationErrorHandlingApiDesignModule } from "./modules/b03-validat
 import { b04DatabaseOrmDrizzlePostgresqlModule } from "./modules/b04-database-orm-drizzle-postgresql/module-meta";
 import { b05AuthenticationJwtRefreshTokenModule } from "./modules/b05-authentication-jwt-refresh-token/module-meta";
 import { b06AuthorizationMultiTenantRbacModule } from "./modules/b06-authorization-multi-tenant-rbac/module-meta";
+import { b07TestingBackendModule } from "./modules/b07-testing-backend/module-meta";
 import { b08FileUploadObjectStorageModule } from "./modules/b08-file-upload-object-storage/module-meta";
 import { b09BackgroundJobsSchedulingModule } from "./modules/b09-background-jobs-scheduling/module-meta";
 import { m01LinuxShellModule } from "./modules/m01-linux-shell/module-meta";
@@ -52,6 +53,7 @@ export const curriculumModules: ModuleDefinition[] = [
   b04DatabaseOrmDrizzlePostgresqlModule,
   b05AuthenticationJwtRefreshTokenModule,
   b06AuthorizationMultiTenantRbacModule,
+  b07TestingBackendModule,
   b08FileUploadObjectStorageModule,
   b09BackgroundJobsSchedulingModule,
   m01LinuxShellModule,

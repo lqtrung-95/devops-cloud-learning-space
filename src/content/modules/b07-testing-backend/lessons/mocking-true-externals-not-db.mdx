@@ -1,0 +1,106 @@
+import { MockingBoundaryDiagram } from "../diagrams/mocking-boundary-diagram";
+
+<Eli5 title="Thử món ăn trên bếp thật, nhưng không gọi hãng giao hàng thật mỗi lần thử" emoji="🛵">
+  Khi thử một công thức mới, bạn vẫn dùng **đúng cái bếp thật** — lửa thật, nồi thật, vì hành vi của bếp chính là thứ bạn đang muốn kiểm chứng (món có chín đúng cách không). Nhưng bạn không gọi **hãng giao hàng thật** mỗi lần thử món, không quẹt **thẻ thanh toán thật** để test tính năng "khách trả tiền" — những dịch vụ đó tốn phí thật, chạy chậm, và bạn không kiểm soát được chúng.
+
+  Trong test của `taskflow-api`: Postgres là "cái bếp" — chạy thật. Một dịch vụ email hay cổng thanh toán (nếu có ở module sau) là "hãng giao hàng" — mock nó.
+</Eli5>
+
+Ranh giới này dễ bị hiểu sai theo hướng "mock càng nhiều càng nhanh, càng tốt". Nhanh không phải mục tiêu duy nhất — một test mock sai chỗ có thể pass mãi mãi trong khi code thật đã hỏng từ lâu. Nguyên tắc ở đây giống hệt tinh thần "code thật, không giả lập" mà chính course này dùng xuyên suốt: chỉ giả lập thứ bạn thật sự không kiểm soát được, còn lại luôn chạy bằng bản thật (hoặc bản test riêng của bản thật).
+
+<MockingBoundaryDiagram />
+
+<Technical>
+
+### Câu hỏi để quyết định: mock hay không?
+
+| Câu hỏi | Nếu CÓ → nên mock | Nếu KHÔNG → chạy thật |
+|---|---|---|
+| Gọi thật có tốn tiền/gửi email thật/thực hiện giao dịch thật không? | Có | Không |
+| Có rate limit hoặc phụ thuộc mạng ngoài bạn không kiểm soát được không? | Có | Không |
+| Hành vi của nó (constraint, transaction, thứ tự) có phải MỘT PHẦN của thứ đang test không? | — | Có, luôn chạy thật |
+
+Postgres rơi vào cột phải ở cả ba dòng: chạy trong Docker Compose của chính bạn, không tốn phí ngoài, và các ràng buộc của nó (`UNIQUE`, foreign key, `CHECK`) chính là một phần logic nghiệp vụ. Mock Postgres nghĩa là bạn tự viết lại phiên bản đơn giản hoá của chính Postgres bằng tay — và test của bạn sau đó chỉ chứng minh code khớp với bản tự viết đó, không khớp với Postgres thật.
+
+### Ví dụ: vì sao mock DB có thể che giấu bug thật
+
+```ts title="ví dụ mock sai — KHÔNG làm theo cách này"
+vi.mock("../src/db/client", () => ({
+  db: {
+    insert: () => ({ values: () => ({ returning: () => [{ id: "fake-id" }] }) }),
+  },
+}));
+
+// Test "pass" dù route thật sự thiếu điều kiện organizationId,
+// vì mock không biết gì về unique constraint hay foreign key thật.
+test("tạo project", async () => {
+  const res = await app.inject({ method: "POST", url: "/api/v1/projects", payload: { name: "Demo" } });
+  expect(res.statusCode).toBe(201);
+});
+```
+
+Mock này luôn trả về `{ id: "fake-id" }` bất kể route truyền gì — kể cả khi route quên hoàn toàn việc gán `organizationId`. Test xanh, nhưng nó không còn kiểm tra hành vi thật của `taskflow-api` với Postgres.
+
+### Đồng hồ hệ thống — trường hợp "tuỳ test"
+
+Không phải mọi thứ chia hai phe rạch ròi. Đồng hồ hệ thống (`Date.now()`, `new Date()`) là code nội bộ của Node.js, không phải dịch vụ ngoài — nhưng khi test hành vi phụ thuộc thời gian (access token 15 phút của B05 đã hết hạn, refresh token 7 ngày đã quá hạn), chờ thời gian trôi qua thật là không thực tế. Ở đây, "mock" đồng hồ (`vi.useFakeTimers()`, hoặc đơn giản hơn là truyền `createdAt`/`expiresAt` làm tham số thay vì gọi `new Date()` bên trong hàm) là hợp lý — không phải vì đồng hồ "ngoài tầm kiểm soát", mà vì kiểm soát nó giúp test xác định (deterministic) thay vì flaky theo tốc độ máy chạy CI.
+
+```ts title="tests/jwt-expiry.test.ts — ví dụ minh hoạ nguyên tắc, không phải code B05 đầy đủ"
+import { describe, expect, test } from "vitest";
+import { buildApp } from "../src/app.js";
+
+test("access token hết hạn bị từ chối", async () => {
+  const app = buildApp();
+  // Ký một token với thời hạn âm — hết hạn ngay khi tạo, không cần chờ 15 phút thật trôi qua
+  const expiredToken = app.jwt.sign({ sub: "user-1" }, { expiresIn: "-1s" });
+
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v1/projects",
+    headers: { authorization: `Bearer ${expiredToken}` },
+  });
+
+  expect(res.statusCode).toBe(401);
+});
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Liệt kê mọi chỗ code test dùng vi.mock — soát lại xem có mock nhầm DB không", command: "grep -rn 'vi.mock' tests/ src/", output: "(không có kết quả — đúng như kỳ vọng ở B07, chưa có external service nào cần mock)" },
+    { comment: "Chạy test JWT hết hạn — không cần đợi 15 phút thật", command: "pnpm vitest run tests/jwt-expiry.test.ts", output: "✓ tests/jwt-expiry.test.ts (1 test) 9ms" },
+  ]}
+/>
+
+<Callout type="warning" title="Mock DB là lỗi im lặng, không phải lỗi ồn ào">
+  Test dùng mock DB sai vẫn "pass" bình thường — nó không báo lỗi cú pháp hay crash. Nó chỉ âm thầm không còn kiểm tra điều bạn nghĩ nó đang kiểm tra. Loại lỗi này khó phát hiện hơn nhiều so với test đỏ rõ ràng, vì mọi thứ trông "xanh" trên CI.
+</Callout>
+
+<Callout type="tip">
+  Nếu bạn thấy mình đang viết `vi.mock` cho bất kỳ thứ gì nằm trong `docker-compose.yml` của chính `taskflow-api` (Postgres, Redis, MinIO sau này...), dừng lại và hỏi: "Mình có đang né việc dựng đúng môi trường test cho nó không, thay vì thật sự không kiểm soát được nó?"
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "mock", meaning: "Vật thay thế giả lập một dependency, trả về giá trị được lập trình sẵn thay vì chạy logic thật." },
+    { term: "true external dependency", meaning: "Dịch vụ thật sự ngoài tầm kiểm soát của bạn: có phí, có mạng ngoài, có rate limit." },
+    { term: "deterministic test", meaning: "Test luôn cho cùng kết quả với cùng input — không phụ thuộc thời gian thật hay may rủi mạng." },
+    { term: "vi.useFakeTimers", meaning: "API của Vitest để đóng băng/điều khiển đồng hồ hệ thống trong lúc test." },
+    { term: "silent failure (của test)", meaning: "Test vẫn pass nhưng không còn kiểm tra đúng hành vi mong muốn — nguy hiểm vì không ai để ý." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một dev đề xuất mock toàn bộ `db` trong integration test của route `POST /api/v1/projects/:id/tasks` để test chạy nhanh hơn, không cần Postgres. Vấn đề lớn nhất với đề xuất này là gì?"
+  options={[
+    "Vitest không hỗ trợ mock module",
+    "Mock DB sẽ khiến test không còn kiểm chứng được các ràng buộc thật (foreign key, organization_id, transaction) — test có thể pass dù code thật sẽ lỗi hoặc rò rỉ dữ liệu khi chạy với Postgres thật",
+    "Mock DB làm coverage report tính sai số dòng code",
+    "Postgres không thể chạy trong môi trường CI nên bắt buộc phải mock",
+  ]}
+  answerIndex={1}
+  explanation="Database không phải 'external ngoài tầm kiểm soát' của taskflow-api — nó chạy trong chính docker-compose.yml của dự án. Hành vi thật của nó (constraint, transaction) là một phần logic đang cần được integration test xác nhận; mock nó biến test thành test cho một mock tự bịa, không phải cho code thật."
+/>
