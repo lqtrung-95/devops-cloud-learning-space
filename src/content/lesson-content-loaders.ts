@@ -50,4 +50,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "b03-validation-error-handling-api-design": (lessonSlug) => import(`./modules/b03-validation-error-handling-api-design/lessons/${lessonSlug}.mdx`),
   "b04-database-orm-drizzle-postgresql": (lessonSlug) => import(`./modules/b04-database-orm-drizzle-postgresql/lessons/${lessonSlug}.mdx`),
   "b06-authorization-multi-tenant-rbac": (lessonSlug) => import(`./modules/b06-authorization-multi-tenant-rbac/lessons/${lessonSlug}.mdx`),
+  "b08-file-upload-object-storage": (lessonSlug) => import(`./modules/b08-file-upload-object-storage/lessons/${lessonSlug}.mdx`),
 };

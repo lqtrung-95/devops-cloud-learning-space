@@ -1,0 +1,101 @@
+import { SizeTypeValidationDecisionTreeDiagram } from "../diagrams/size-type-validation-decision-tree-diagram";
+
+<Eli5 title="Bảo vệ hỏi khai báo ở cổng, nhưng không lục soát túi" emoji="🛂">
+  Trước khi phát phiếu gửi hàng, bảo vệ hỏi bạn: "Kiện hàng nặng bao nhiêu? Bên trong là gì?". Nếu bạn khai "50kg máy giặt" trong khi kho chỉ nhận tối đa 15kg, họ từ chối phát phiếu ngay — đỡ tốn công cả hai bên.
+
+  Nhưng bảo vệ **không mở kiện hàng ra kiểm tra** — họ chỉ tin lời khai. Nếu bạn khai "2kg tài liệu giấy" (qua được cổng) nhưng thực ra nhét một khối kim loại 20kg vào, bảo vệ ở cổng không phát hiện ra. Việc đó phải chờ tới lúc kiện hàng được cân lại trong kho.
+
+  Validate size/type lúc cấp presigned URL đúng là bước "hỏi khai báo ở cổng" — cần thiết, chặn được phần lớn trường hợp, nhưng không phải là kiểm tra tận gốc.
+</Eli5>
+
+<SizeTypeValidationDecisionTreeDiagram />
+
+<Technical>
+
+### Validate TRƯỚC khi tốn công ký URL
+
+Nguyên tắc thứ tự quan trọng: kiểm tra `sizeBytes`/`mimeType` phải xảy ra **trước** lời gọi `getSignedUrl`. Không phải vì ký URL tốn kém (nó rẻ), mà vì để giữ đúng ngữ nghĩa — nếu khai báo sai ngay từ đầu, không nên có bất kỳ URL hợp lệ nào được tạo ra cho request đó.
+
+```ts title="src/routes/attachments.ts"
+const MAX_ATTACHMENT_SIZE_BYTES = 15 * 1024 * 1024; // 15 MB
+const ALLOWED_ATTACHMENT_MIME_TYPES = ["image/png", "image/jpeg", "application/pdf"] as const;
+
+function assertAttachmentClaimAllowed(sizeBytes: number, mimeType: string) {
+  if (sizeBytes > MAX_ATTACHMENT_SIZE_BYTES) {
+    throw new ApiError(400, "VALIDATION_ERROR", `File tối đa ${MAX_ATTACHMENT_SIZE_BYTES / 1024 / 1024}MB, khai báo ${(sizeBytes / 1024 / 1024).toFixed(1)}MB`);
+  }
+  if (!ALLOWED_ATTACHMENT_MIME_TYPES.includes(mimeType as (typeof ALLOWED_ATTACHMENT_MIME_TYPES)[number])) {
+    throw new ApiError(400, "VALIDATION_ERROR", `mimeType "${mimeType}" không được hỗ trợ`);
+  }
+}
+```
+
+Handler gọi hàm này **trước** dòng `getSignedUrl(...)` — nếu ném lỗi, error handler chung (chốt ở B03) bắt và trả `400` theo đúng format `{ error: { code, message } }`, không có S3 client nào được gọi tới.
+
+### Vì sao bước này "cần thiết nhưng chưa đủ"
+
+Tất cả những gì server biết ở bước presign là **client tự khai** — không phải sự thật đã được xác minh. Một presigned PUT URL sau khi được ký chỉ ràng buộc:
+
+- **Method**: phải là `PUT` (không GET/DELETE được)
+- **Key**: phải đúng object key đã ký
+- **Thời hạn**: hết hiệu lực sau `expiresIn` giây
+
+Nó **không** tự động ràng buộc: dung lượng byte thật client gửi trong request PUT, hay nội dung thật của file có khớp với `Content-Type` đã khai hay không. (Muốn ràng buộc dung lượng ở tầng chữ ký, cần dùng **presigned POST với policy conditions** — ví dụ `content-length-range` — một cơ chế khác với presigned PUT mà `taskflow-api` đang dùng ở B08.)
+
+Nghĩa là: một client cố tình khai `sizeBytes: 500000` (500KB, qua được validate) nhưng lúc PUT thật lại gửi file 50MB — request PUT đó **vẫn thành công** vì presigned PUT URL không kiểm tra lại dung lượng. Server chỉ phát hiện ra sai lệch này ở bước sau: `HeadObjectCommand` khi confirm (bài tiếp theo).
+
+<Callout type="warning" title="Không bao giờ tin Content-Length hay đuôi file để quyết định an toàn">
+  `Content-Length` và đuôi file (`.png`, `.pdf`) đều là dữ liệu **client tự đặt**, không phải bằng chứng khách quan. Một file thực thi đổi tên thành `ảnh.png` và khai `Content-Type: image/png` vượt qua validate y hệt một ảnh PNG thật. Validate ở bước presign chặn được người dùng vô ý nhầm định dạng — không chặn được người cố tình giả mạo.
+</Callout>
+
+### Trade-off: chặn chặt ở presign vs. để storage/scan xử lý
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Chỉ validate ở presign (metadata khai báo) | Đơn giản, phản hồi nhanh (400 ngay, không cần upload) | Không chặn được client khai gian lúc PUT thật | Bước lọc đầu tiên, rẻ — luôn nên có |
+| Presigned POST + policy `content-length-range` | S3/MinIO tự chặn ở tầng storage nếu vượt size — không cần chờ tới HEAD check | Phức tạp hơn PUT thường, một số client (đặc biệt upload từ script đơn giản) khó tích hợp | Khi cần ràng buộc size chặt ngay ở storage, không chỉ ở app |
+| HEAD check + scan sau upload (bài tiếp theo, nối B09) | Bắt được cả trường hợp client nói dối lúc PUT | Chạy sau khi file đã tốn dung lượng lưu trữ, cần dọn dẹp nếu phát hiện sai | Lưới an toàn cuối cùng — luôn cần, dù đã có 2 lớp trên |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Request presign với sizeBytes vượt giới hạn — phải bị chặn TRƯỚC khi có URL nào được ký",
+      command: "curl -s -X POST http://localhost:3000/api/v1/tasks/$TASK_ID/attachments/presign -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' -d '{\"filename\":\"video.pdf\",\"mimeType\":\"application/pdf\",\"sizeBytes\":41943040}'",
+      output: '{"error":{"code":"VALIDATION_ERROR","message":"File tối đa 15MB, khai báo 40.0MB"}}',
+    },
+    {
+      comment: "Request presign với mimeType không nằm trong allowlist",
+      command: "curl -s -X POST http://localhost:3000/api/v1/tasks/$TASK_ID/attachments/presign -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' -d '{\"filename\":\"installer.exe\",\"mimeType\":\"application/x-msdownload\",\"sizeBytes\":1048576}'",
+      output: '{"error":{"code":"VALIDATION_ERROR","message":"mimeType \\"application/x-msdownload\\" không được hỗ trợ"}}',
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Đặt logic validate size/type SAU dòng gọi `getSignedUrl` — dù response cuối cùng vẫn đúng (ném lỗi trước khi `return`), việc gọi S3 client trước khi biết request có hợp lệ hay không là lãng phí và dễ để sót nếu code sau này được refactor không cẩn thận (ví dụ ai đó thêm một early return mới ở giữa).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "client-declared metadata", meaning: "Thông tin (filename, mimeType, sizeBytes) do client tự khai trong request presign — chưa được xác minh với dữ liệu thật." },
+    { term: "presigned POST policy", meaning: "Cơ chế S3 khác với presigned PUT, cho phép đính kèm điều kiện (như content-length-range) được storage tự kiểm tra khi nhận upload." },
+    { term: "allowlist", meaning: "Danh sách các giá trị được phép (ở đây là mimeType) — mọi giá trị không nằm trong danh sách đều bị từ chối, khác với 'blocklist' (chặn theo danh sách cấm)." },
+    { term: "necessary but not sufficient", meaning: "Một điều kiện cần có nhưng không đủ để đảm bảo an toàn hoàn toàn — validate ở presign là ví dụ điển hình." },
+  ]}
+/>
+
+<QuickCheck
+  question="Client khai `sizeBytes: 500000` (qua được validate 15MB) lúc gọi /presign, nhưng khi PUT thật lại gửi lên đúng URL đã ký một file 50MB. Điều gì xảy ra?"
+  options={[
+    "Request PUT tự động bị MinIO từ chối vì vượt sizeBytes đã khai lúc ký",
+    "Server sẽ tự động cắt bớt file còn 500000 byte",
+    "Request PUT vẫn thành công — presigned PUT URL không ràng buộc lại dung lượng thật, sai lệch này chỉ bị phát hiện ở bước HEAD check sau đó (confirm)",
+    "getSignedUrl sẽ ném lỗi ngay từ lúc ký vì đã biết trước file sẽ lớn hơn",
+  ]}
+  answerIndex={2}
+  explanation="Presigned PUT chỉ ký chữ ký cho method + key + thời hạn — nó không mang theo điều kiện ràng buộc dung lượng như presigned POST với policy. Validate ở presign chỉ chặn được khai báo sai ngay từ đầu, không chặn được hành vi khai một đằng, PUT một nẻo."
+/>

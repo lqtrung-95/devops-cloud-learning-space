@@ -1,0 +1,108 @@
+import { AppServerMediatedVsPresignedUploadDiagram } from "../diagrams/app-server-mediated-vs-presigned-upload-diagram";
+
+<Eli5 title="Gửi bưu kiện qua văn phòng công ty, hay tự đem thẳng ra kho hàng?" emoji="📦">
+  Cách 1: bạn đem gói hàng tới **văn phòng công ty**, nhân viên nhận, đóng gói lại, rồi tự họ đem ra bưu điện gửi hộ bạn. Bạn chỉ cần đứng đó chờ. Nhưng nếu 1000 người cùng làm vậy một lúc, văn phòng đó chật cứng gói hàng, nhân viên chạy tới chạy lui — công ty trở thành nút thắt cổ chai.
+
+  Cách 2: công ty đưa cho bạn một **phiếu gửi hàng đã điền sẵn** (địa chỉ kho, mã vận đơn, chỉ dùng được cho đúng chuyến này) — bạn tự cầm phiếu đó đem thẳng gói hàng ra kho. Công ty không phải chạm vào gói hàng của bạn, chỉ cần in đúng phiếu.
+
+  `taskflow-api` từ B08 trở đi dùng cách 2: app server (Fastify) không nhận file, chỉ "ký" một tấm phiếu (presigned URL) cho phép client tự đem file thẳng tới kho hàng thật — MinIO.
+</Eli5>
+
+Đây là quyết định kiến trúc quan trọng nhất của module này. Chọn sai — để app server "cõng" file — không sai về mặt chức năng (vẫn chạy được), nhưng sai về khả năng chịu tải: một backend Fastify chạy production chỉ có vài trăm MB RAM và một số kết nối đồng thời giới hạn, trong khi object storage được thiết kế riêng để nhận hàng nghìn upload song song.
+
+<AppServerMediatedVsPresignedUploadDiagram />
+
+<Technical>
+
+### Vì sao không lưu file trong Postgres hay ổ đĩa app server
+
+Ba lý do chính khiến file không nên nằm chung chỗ với dữ liệu quan hệ hay ổ đĩa của container app:
+
+- **Container app là stateless.** `taskflow-api` chạy trong Docker, có thể bị restart, scale ngang (nhiều instance), hoặc thay thế bất cứ lúc nào. Ghi file vào ổ đĩa container nghĩa là file biến mất khi container đó chết.
+- **Postgres không phải chỗ tối ưu cho blob lớn.** Lưu file dưới dạng `bytea` làm phình database, chậm backup/restore, và không tận dụng được CDN hay tính năng lifecycle (tự xoá file cũ) mà object storage có sẵn.
+- **Băng thông app server có hạn.** Mỗi byte file đi qua Fastify là một byte tốn CPU/network của chính app server — tài nguyên đáng lẽ dành cho việc xử lý business logic (auth, validate, query DB).
+
+Vì vậy `taskflow-api` chọn **object storage** — một loại lưu trữ chuyên biệt cho file nhị phân (ảnh, PDF, video), truy cập qua HTTP bằng API kiểu S3 (`PUT`/`GET`/`HEAD` object theo `key`). MinIO là bản S3-compatible tự host được, dùng để dev/test local thay cho AWS S3 thật.
+
+### Hai cách đưa file từ client vào object storage
+
+**App-server-mediated upload** — client gửi file (thường `multipart/form-data`) thẳng tới app server; app server nhận toàn bộ file vào memory/disk tạm, rồi tự dùng S3 SDK để `PutObjectCommand` lên storage:
+
+```ts title="cách KHÔNG dùng ở taskflow-api từ B08"
+app.post("/api/v1/tasks/:id/attachments", async (request, reply) => {
+  const file = await request.file(); // Fastify multipart — toàn bộ file qua RAM/disk của app server
+  const buffer = await file.toBuffer();
+  await s3Client.send(new PutObjectCommand({ Bucket, Key: file.filename, Body: buffer }));
+  // ...
+});
+```
+
+**Presigned URL upload** — app server không nhận byte file nào. Nó chỉ ký một URL có phạm vi giới hạn, trả về cho client, rồi client tự `PUT` thẳng lên storage:
+
+```ts title="src/routes/attachments.ts — cách taskflow-api dùng từ B08"
+const uploadUrl = await getSignedUrl(
+  s3PresignClient,
+  new PutObjectCommand({ Bucket: env.MINIO_BUCKET, Key: key, ContentType: mimeType }),
+  { expiresIn: 300 },
+);
+return reply.send({ uploadUrl, key, expiresAt: new Date(Date.now() + 300_000).toISOString() });
+```
+
+### So sánh hai cách
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| App-server-mediated | Dễ viết, toàn quyền kiểm soát luồng, dễ chèn xử lý đồng bộ ngay (ví dụ resize ảnh trước khi lưu) | Tốn băng thông kép (client→server→storage), chiếm memory/CPU app server, dễ timeout với file lớn, khó scale ngang | File rất nhỏ (vài KB), cần xử lý ngay lập tức trong cùng request |
+| Presigned URL trực tiếp | App server không chạm byte nào, băng thông chỉ đi một chiều thật sự (client→storage), scale tốt theo traffic upload | Cần thêm bước "confirm" riêng để server biết upload đã xong; không kiểm tra được nội dung file trước khi nó đã nằm trong storage | File lớn, traffic upload cao — kiến trúc `taskflow-api` chọn từ B08 |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Thêm service minio vào docker-compose.yml rồi khởi động riêng service này",
+      command: "docker compose up -d minio",
+      output: "[+] Running 2/2\n ✔ Volume \"taskflow-api_minio-data\"  Created\n ✔ Container taskflow-api-minio-1  Started",
+    },
+    {
+      comment: "Xác nhận MinIO đã lắng nghe cổng S3 API (9002) và console (9003)",
+      command: "curl -s -o /dev/null -w '%{http_code}\\n' http://localhost:9002/minio/health/live",
+      output: "200",
+    },
+  ]}
+/>
+
+Mở `http://localhost:9003` bằng trình duyệt, đăng nhập `minioadmin`/`minioadmin`, tạo bucket tên `taskflow-attachments` — đây là "cái kho" mà mọi presigned URL ở các bài sau sẽ trỏ tới.
+
+<Callout type="mistake" title="Nhầm cổng S3 API với cổng console">
+  MinIO expose hai cổng khác nhau: `9002` (S3 API — nơi client thật sự PUT/GET object) và `9003` (console UI cho người quản trị). Trỏ S3 client vào cổng console (`9003`) sẽ luôn lỗi kết nối hoặc `403`.
+</Callout>
+
+<Callout type="tip">
+  MinIO tương thích API với AWS S3 nghĩa là bất kỳ SDK S3 nào (`@aws-sdk/client-s3`, `boto3`, `aws-cli`) đều dùng được với MinIO chỉ bằng cách đổi `endpoint`. Code viết cho MinIO ở local gần như không đổi khi deploy lên S3 thật ở production.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "object storage", meaning: "Kho lưu trữ file nhị phân theo cặp key–value (bucket + key), truy cập qua HTTP, khác hẳn database quan hệ." },
+    { term: "MinIO", meaning: "Object storage S3-compatible, tự host được — dùng thay AWS S3 thật khi dev/test local." },
+    { term: "S3-compatible", meaning: "Hỗ trợ cùng bộ API (PUT/GET/HEAD object, presigned URL...) như AWS S3, dù không phải AWS." },
+    { term: "app-server-mediated upload", meaning: "Kiểu upload mà file đi qua app server trước khi tới storage — app server là trạm trung chuyển." },
+    { term: "presigned URL", meaning: "URL có chữ ký giới hạn phạm vi (đúng thao tác, đúng key, có hạn dùng), cho phép client thao tác trực tiếp với storage mà không cần credential thật." },
+    { term: "bucket", meaning: "'Ngăn kho' cấp cao nhất trong object storage — chứa nhiều object (file), mỗi object có một key duy nhất." },
+  ]}
+/>
+
+<QuickCheck
+  question="1000 người dùng cùng upload ảnh 5MB cùng lúc. Kiến trúc nào khiến app server Fastify chịu tải nặng nhất?"
+  options={[
+    "Presigned URL — vì phải ký 1000 URL cùng lúc",
+    "App-server-mediated — vì Fastify phải nhận và relay lại toàn bộ 5GB dữ liệu ảnh qua chính nó",
+    "Cả hai như nhau vì đều xử lý 1000 request",
+    "Không kiến trúc nào ảnh hưởng vì MinIO tự cân bằng tải",
+  ]}
+  answerIndex={1}
+  explanation="Ký một presigned URL chỉ là một phép tính chữ ký (rẻ, nhanh, không cần network call thật). App-server-mediated thì ngược lại — Fastify phải thực sự nhận đủ 5GB byte ảnh, giữ trong memory/disk tạm, rồi gửi tiếp — đúng là nút thắt cổ chai."
+/>

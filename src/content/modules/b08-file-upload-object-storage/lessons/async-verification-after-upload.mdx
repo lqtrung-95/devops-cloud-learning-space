@@ -1,0 +1,109 @@
+import { PostUploadVerificationSafetyNetDiagram } from "../diagrams/post-upload-verification-safety-net-diagram";
+
+<Eli5 title="Cân lại kiện hàng ở cổng vào kho, soi X-quang thì để ca sau" emoji="🔍">
+  Kiện hàng đã qua cổng bảo vệ (validate lúc presign) và được đem vào sân kho (file đã nằm trong MinIO). Nhân viên kho **cân lại ngay** khi nhận — đây là con số thật, không phải lời khai (giống `HeadObjectCommand`). Nếu số cân khớp hồ sơ, kiện hàng được xếp vào kệ (ghi bảng `attachments`).
+
+  Nhưng việc **mở kiện ra soi X-quang xem bên trong có đúng là hàng khai báo hay không** thì không làm ngay tại cổng — quá chậm nếu mỗi kiện đều mở ra kiểm tra kỹ trong lúc người gửi đứng chờ. Việc đó dồn qua một ca kiểm tra riêng, chạy song song, không bắt ai đứng đợi.
+</Eli5>
+
+Bài trước đã chỉ ra lỗ hổng: client có thể khai đúng lúc presign nhưng gửi khác lúc PUT. Bài này giải quyết một nửa vấn đề đó ngay lập tức (HEAD check lấy số liệu thật), và chỉ ra rõ ràng phần còn lại **cố tình để dành** cho B09 — không phải vì quên, mà vì đó là thiết kế đúng.
+
+<PostUploadVerificationSafetyNetDiagram />
+
+<Technical>
+
+### HEAD check: xác thực dung lượng thật, ngay tại confirm
+
+`HeadObjectCommand` hỏi thẳng MinIO "object này có tồn tại không, và nó thật sự nặng bao nhiêu byte" — không cần tải nội dung file về. Đây là bước đồng bộ, nhanh, và đủ để đóng lỗ hổng "khai nhỏ, PUT to" ở mức dữ liệu ghi vào DB:
+
+```ts title="src/routes/attachments.ts"
+const head = await s3InternalClient.send(new HeadObjectCommand({ Bucket: env.MINIO_BUCKET, Key: key })).catch(() => null);
+
+if (!head) {
+  // Object không tồn tại — có thể client gọi confirm mà chưa từng PUT, hoặc PUT thất bại
+  return reply.code(404).send({ error: { code: "NOT_FOUND", message: "Object chưa tồn tại trên storage, chưa thể xác nhận" } });
+}
+
+// size_bytes lấy từ ContentLength THẬT trả về từ MinIO — không phải sizeBytes client khai lúc presign
+const [attachment] = await db
+  .insert(attachments)
+  .values({
+    taskId,
+    url: `${env.MINIO_PUBLIC_ENDPOINT}/${env.MINIO_BUCKET}/${key}`,
+    filename,
+    sizeBytes: head.ContentLength ?? 0,
+    uploadedBy: request.user.sub,
+  })
+  .returning();
+```
+
+Đây là lý do bảng `attachments` KHÔNG nhận lại `sizeBytes` từ body request confirm — nhận lại coi như lại tin tiếp lời khai, đúng cái lỗ hổng bài trước vừa vạch ra.
+
+### Vì sao HEAD check vẫn chưa phải "lưới an toàn" cuối cùng
+
+`HeadObjectCommand` trả về `ContentType` — nhưng giá trị đó chính là header `Content-Type` mà **client tự gửi kèm lúc PUT**, MinIO chỉ lưu lại chứ không tự phân tích nội dung file để xác minh. Một file thực thi đổi tên thành `avatar.png`, PUT kèm header `Content-Type: image/png`, vẫn cho ra kết quả HEAD check y hệt một ảnh PNG thật:
+
+```json title="HeadObjectCommand response — không phân biệt được file giả mạo"
+{ "ContentLength": 512000, "ContentType": "image/png", "ETag": "\"...\"", "LastModified": "..." }
+```
+
+Việc xác minh **nội dung thật** (đọc magic bytes ở đầu file, hoặc chạy qua virus scanner) đòi hỏi tải và đọc byte thật của file — tốn thời gian, không nên chặn response của endpoint confirm. Đây chính xác là lý do curriculum xếp virus-scan vào diện **bất đồng bộ**, xử lý ở B09 (Background job & scheduling) bằng BullMQ: endpoint confirm trả `201` ngay sau HEAD check, đồng thời đẩy một job vào queue để job đó tự đọc file, phân loại, rồi cập nhật trạng thái attachment sau.
+
+```ts title="Hình dung job ở B09 — CHƯA implement ở B08, chỉ minh hoạ hướng đi"
+// queue.add("scan-attachment", { attachmentId: attachment.id, key })
+// worker: tải object, đọc magic bytes / chạy scanner, rồi
+//   UPDATE attachments SET scan_status = 'clean' | 'quarantined' WHERE id = ...
+```
+
+<Callout type="info" title="Vì sao không chặn ngay ở confirm bằng cách tải cả file để soi">
+  Kỹ thuật có thể làm được — nhưng tải toàn bộ file về app server để soi trước khi trả response lại chính là quay về vấn đề của bài đầu tiên: app server lại trở thành trạm trung chuyển, lần này còn tệ hơn vì phải tải NGUYÊN file (không chỉ nhận, mà còn phải tải lại từ MinIO). Xử lý bất đồng bộ giữ đúng nguyên tắc "app server không cõng file".
+</Callout>
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Confirm với key CHƯA từng được PUT lên MinIO — phải bị từ chối, không được ghi DB dựa trên lời hứa suông",
+      command: "curl -s -X POST http://localhost:3000/api/v1/tasks/$TASK_ID/attachments/confirm -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' -d '{\"key\":\"tasks/fake/khong-ton-tai.pdf\",\"filename\":\"khong-ton-tai.pdf\"}'",
+      output: '{"error":{"code":"NOT_FOUND","message":"Object chưa tồn tại trên storage, chưa thể xác nhận"}}',
+    },
+    {
+      comment: "So sánh size_bytes đã lưu trong DB với ContentLength thật từ MinIO — phải khớp nhau, không khớp sizeBytes lúc presign nếu client khai gian",
+      command: "docker compose exec postgres psql -U taskflow -c \"SELECT filename, size_bytes FROM attachments ORDER BY created_at DESC LIMIT 1;\"",
+      output: " filename   | size_bytes \n------------+------------\n report.pdf |    2097152",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Nhận lại `sizeBytes`/`mimeType` từ body request confirm rồi ghi thẳng vào DB thay vì lấy từ `HeadObjectCommand`. Làm vậy vô hiệu hoá toàn bộ giá trị của bước xác thực — coi như quay lại tin nguyên lời khai ban đầu, đúng lỗ hổng bài trước đã chỉ ra.
+</Callout>
+
+<Callout type="warning" title="Content-Type từ HEAD check vẫn chỉ là header, không phải bằng chứng nội dung">
+  Đừng dùng `ContentType` trả về từ `HeadObjectCommand` để đưa ra quyết định bảo mật quan trọng (ví dụ "vì là image/png nên an toàn để hiển thị trực tiếp cho user khác xem"). Nó chỉ chứng minh MinIO đã LƯU header đó — không chứng minh nội dung file thật khớp với header.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "HEAD check", meaning: "Gọi HeadObjectCommand để lấy metadata thật (size, content-type, ETag) của object đã lưu trong storage, không tải nội dung." },
+    { term: "source of truth", meaning: "Nguồn dữ liệu được coi là sự thật để dựa vào — ở đây là kết quả HeadObjectCommand từ MinIO, không phải lời khai của client." },
+    { term: "magic bytes", meaning: "Vài byte đầu tiên đặc trưng của một định dạng file thật (ví dụ PNG luôn bắt đầu bằng 0x89504E47) — dùng để xác minh nội dung, không chỉ dựa vào Content-Type khai báo." },
+    { term: "async verification", meaning: "Bước xác minh chạy nền, sau khi đã trả response cho client — dùng cho việc tốn thời gian như quét virus, không chặn luồng chính." },
+    { term: "quarantine", meaning: "Trạng thái đánh dấu một file đáng ngờ, tạm khoá không cho truy cập cho tới khi xác minh xong (khái niệm sẽ dùng ở B09)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao B08 chỉ dừng ở HEAD check (xác thực size/content-type header) mà KHÔNG luôn tiện đọc nội dung thật của file để quét virus ngay trong endpoint confirm?"
+  options={[
+    "Vì MinIO không cho phép tải nội dung file ra ngoài",
+    "Vì đọc và phân tích nội dung thật tốn thời gian/CPU, chặn nó trong endpoint confirm bắt client phải chờ lâu và biến app server thành trạm trung chuyển tải lại nguyên file — nên việc này cần chạy bất đồng bộ (nối B09)",
+    "Vì virus scan chỉ hoạt động được với BullMQ, chưa có ở B08",
+    "Vì HEAD check đã đủ để đảm bảo file an toàn 100%",
+  ]}
+  answerIndex={1}
+  explanation="HEAD check nhanh vì chỉ đọc metadata. Đọc nội dung thật (magic bytes, virus scan) đòi hỏi tải cả file — chậm và tốn tài nguyên, nên phải tách ra chạy nền để không chặn response của client. Đây chính là lý do curriculum để dành phần này cho B09 (background job)."
+/>

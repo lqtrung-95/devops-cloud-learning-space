@@ -1,0 +1,150 @@
+import { PresignedUrlRequestSignConfirmDiagram } from "../diagrams/presigned-url-request-sign-confirm-diagram";
+
+<Eli5 title="Phiếu gửi hàng chỉ dùng được một lần, cho đúng một kiện, trong 5 phút" emoji="🎫">
+  Tờ phiếu gửi hàng công ty đưa cho bạn không phải là "chìa khoá vào kho" — nó chỉ ghi đúng: gửi MỘT kiện, tới ĐÚNG ô kệ này, và phải dùng trong 5 phút tới. Bảo vệ kho nhìn phiếu, khớp đúng những điều đó thì cho qua — không hỏi thêm gì, và cũng không cho bạn lấy đồ ra hay bỏ vào ô khác.
+
+  Đó chính xác là những gì một **presigned PUT URL** làm: nó không phải một "mật khẩu chung" để làm bất cứ gì với storage — nó chỉ là chữ ký hợp lệ cho đúng một hành động, đúng một địa chỉ, trong một khoảng thời gian.
+</Eli5>
+
+<PresignedUrlRequestSignConfirmDiagram />
+
+<Technical>
+
+### Ba nhân vật, hai request HTTP đi thẳng, một request "vắng mặt"
+
+Luồng presigned URL có ba bên: **client**, **taskflow-api**, **MinIO**. Điều dễ gây nhầm lẫn nhất: bước upload thật (bước 5 trong diagram) là request giữa client và MinIO — taskflow-api hoàn toàn không tham gia, không biết request đó đang diễn ra.
+
+### Bước 1–2: request presign & validate
+
+```ts title="src/routes/attachments.ts"
+const presignBodySchema = z.object({
+  filename: z.string().min(1).max(255),
+  mimeType: z.string(),
+  sizeBytes: z.number().int().positive(),
+});
+
+app.post("/api/v1/tasks/:id/attachments/presign", { preHandler: app.authenticate }, async (request, reply) => {
+  const { id: taskId } = request.params as { id: string };
+  const body = presignBodySchema.parse(request.body); // ném lỗi 400 nếu sai kiểu — bắt bằng error handler chung của B03
+
+  const task = await requireTaskInUserOrganization(taskId, request.user.sub); // 404 nếu không thấy, 403 nếu khác tổ chức
+  assertAttachmentClaimAllowed(body.sizeBytes, body.mimeType); // chi tiết ở bài "Giới hạn size & type" — 400 nếu vượt
+
+  const key = `tasks/${task.id}/${randomUUID()}-${body.filename}`;
+  const uploadUrl = await getSignedUrl(
+    s3PresignClient,
+    new PutObjectCommand({ Bucket: env.MINIO_BUCKET, Key: key, ContentType: body.mimeType }),
+    { expiresIn: 300 },
+  );
+
+  return reply.send({ uploadUrl, key, expiresAt: new Date(Date.now() + 300_000).toISOString() });
+});
+```
+
+### Vì sao cần HAI S3 client, không phải một
+
+Điểm dễ bỏ sót nhất khi ghép MinIO vào Docker Compose: container `api` và máy chạy `curl`/browser của bạn **không cùng một mạng**. Container `api` gọi MinIO qua tên service Docker (`http://minio:9000`), nhưng client thật (script test, browser) chạy trên máy host, chỉ biết `http://localhost:9002`.
+
+```ts title="src/lib/s3-client.ts"
+import { S3Client } from "@aws-sdk/client-s3";
+import { env } from "./env.js";
+
+const credentials = { accessKeyId: env.MINIO_ACCESS_KEY, secretAccessKey: env.MINIO_SECRET_KEY };
+
+// Dùng cho các lệnh gọi THẬT từ chính container api (HeadObjectCommand ở bài xác nhận upload)
+export const s3InternalClient = new S3Client({
+  endpoint: env.MINIO_INTERNAL_ENDPOINT, // http://minio:9000 — tên service trong mạng Docker
+  region: "us-east-1", // MinIO không dùng region thật, nhưng SDK bắt buộc phải có giá trị
+  forcePathStyle: true,
+  credentials,
+});
+
+// Chỉ dùng để KÝ presigned URL — URL này sẽ được client bên ngoài mạng Docker gọi trực tiếp
+export const s3PresignClient = new S3Client({
+  endpoint: env.MINIO_PUBLIC_ENDPOINT, // http://localhost:9002 — endpoint client thật có thể gõ vào trình duyệt
+  region: "us-east-1",
+  forcePathStyle: true,
+  credentials,
+});
+```
+
+`getSignedUrl` **không tạo kết nối mạng thật** tới MinIO — nó chỉ tính chữ ký HMAC dựa trên endpoint, key, method và credentials đã cấu hình trong client. Vì vậy `s3PresignClient` không cần thật sự "kết nối được" tới `localhost:9002` từ bên trong container để hoạt động — nó chỉ cần đúng THÔNG TIN để tính ra chữ ký khớp với những gì MinIO sẽ kiểm tra khi nhận request PUT thật.
+
+### Bước 5–6: PUT trực tiếp rồi confirm
+
+```bash
+# Bước 5 — client tự PUT, KHÔNG qua taskflow-api
+curl -X PUT --upload-file ./report.pdf \
+  -H "Content-Type: application/pdf" \
+  "http://localhost:9002/taskflow-attachments/tasks/.../....pdf?X-Amz-Signature=..."
+```
+
+```ts title="src/routes/attachments.ts — endpoint confirm"
+app.post("/api/v1/tasks/:id/attachments/confirm", { preHandler: app.authenticate }, async (request, reply) => {
+  const { key, filename } = confirmBodySchema.parse(request.body);
+
+  const head = await s3InternalClient.send(new HeadObjectCommand({ Bucket: env.MINIO_BUCKET, Key: key })).catch(() => null);
+  if (!head) return reply.code(404).send({ error: { code: "NOT_FOUND", message: "Object chưa tồn tại trên storage" } });
+
+  const [attachment] = await db
+    .insert(attachments)
+    .values({ taskId: request.params.id, url: `${env.MINIO_PUBLIC_ENDPOINT}/${env.MINIO_BUCKET}/${key}`, filename, sizeBytes: head.ContentLength ?? 0, uploadedBy: request.user.sub })
+    .returning();
+
+  return reply.code(201).send(attachment);
+});
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Bước 1-4: request presign, nhận uploadUrl + key",
+      command: "curl -s -X POST http://localhost:3000/api/v1/tasks/$TASK_ID/attachments/presign -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' -d '{\"filename\":\"report.pdf\",\"mimeType\":\"application/pdf\",\"sizeBytes\":2097152}'",
+      output: '{"uploadUrl":"http://localhost:9002/taskflow-attachments/tasks/...?X-Amz-Signature=...","key":"tasks/.../....pdf","expiresAt":"2025-...Z"}',
+    },
+    {
+      comment: "Bước 5: PUT thẳng file lên MinIO bằng uploadUrl vừa nhận",
+      command: 'curl -s -o /dev/null -w "%{http_code}\\n" -X PUT --upload-file ./report.pdf -H "Content-Type: application/pdf" "$UPLOAD_URL"',
+      output: "200",
+    },
+    {
+      comment: "Bước 6: confirm để server ghi bảng attachments",
+      command: 'curl -s -X POST http://localhost:3000/api/v1/tasks/$TASK_ID/attachments/confirm -H "Authorization: Bearer $TOKEN" -H \'Content-Type: application/json\' -d "{\\"key\\":\\"$KEY\\",\\"filename\\":\\"report.pdf\\"}"',
+      output: '{"id":"...","taskId":"...","filename":"report.pdf","sizeBytes":2097152,"createdAt":"..."}',
+    },
+  ]}
+/>
+
+<Callout type="mistake" title="Ký URL bằng endpoint nội bộ Docker">
+  Nếu lỡ dùng `MINIO_INTERNAL_ENDPOINT` (`http://minio:9000`) để ký presigned URL, `uploadUrl` trả về sẽ chứa host `minio` — trình duyệt hoặc `curl` chạy trên máy host của bạn không resolve được hostname đó, request PUT sẽ lỗi `Could not resolve host`. Presigned URL luôn phải được ký bằng endpoint mà BÊN GỌI THẬT (client) tới được.
+</Callout>
+
+<Callout type="warning" title="Presigned URL không phải access key dùng chung">
+  Đừng nhầm presigned URL với việc phát access key/secret key thật cho client. URL chỉ hợp lệ cho đúng `key` + method (`PUT`) đã ký, hết hạn sau 300 giây — không dùng lại được cho thao tác khác (GET, DELETE) hay object khác.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "getSignedUrl", meaning: "Hàm của `@aws-sdk/s3-request-presigner` tính chữ ký cho một command S3 cụ thể, không tạo kết nối mạng thật khi gọi." },
+    { term: "PutObjectCommand", meaning: "Command S3 mô tả thao tác ghi một object — dùng làm tham số cho getSignedUrl khi cần presigned PUT URL." },
+    { term: "HeadObjectCommand", meaning: "Command S3 lấy metadata thật của object đã lưu (size, content-type) mà không tải nội dung — dùng để xác thực sau upload." },
+    { term: "internal vs public endpoint", meaning: "Endpoint container dùng để tự gọi MinIO (tên service Docker) khác với endpoint client bên ngoài gọi tới (host:port map ra ngoài)." },
+    { term: "expiresIn", meaning: "Thời gian sống (giây) của presigned URL — hết hạn là chữ ký không còn hợp lệ, bất kể URL còn ai giữ." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao `s3PresignClient` cấu hình `endpoint: http://localhost:9002` vẫn ký được URL hợp lệ, dù bản thân container `api` không thể tự kết nối tới `localhost:9002` của chính nó để chạm MinIO?"
+  options={[
+    "Vì Docker tự động forward mọi request localhost ra ngoài container",
+    "Vì getSignedUrl chỉ tính toán chữ ký cục bộ dựa trên endpoint/key/credentials đã cấu hình — không cần thực sự kết nối mạng tới endpoint đó để tạo ra URL",
+    "Vì MinIO tự phát hiện container nào đang gọi và đổi endpoint cho phù hợp",
+    "Vì đây là lỗi và URL đó thực ra không dùng được",
+  ]}
+  answerIndex={1}
+  explanation="Ký một request S3 là một phép toán HMAC cục bộ (dùng credentials + thông tin request) — SDK không cần 'gõ cửa' MinIO để tạo chữ ký. Việc URL có hoạt động hay không chỉ được kiểm tra khi AI ĐÓ THẬT SỰ gửi request PUT tới URL đó — lúc này endpoint phải đúng là nơi bên gọi tới được."
+/>
