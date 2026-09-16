@@ -1,0 +1,111 @@
+import { FourStepFrameworkDiagram } from "../diagrams/four-step-framework-diagram";
+
+<Eli5 title="Thiết kế hệ thống giống như kiến trúc sư thiết kế một ngôi nhà" emoji="🏗️">
+  Viết code một feature giống như **đóng một cái tủ**: kích thước rõ ràng, làm xong là dùng được. Thiết kế hệ thống giống như **thiết kế cả ngôi nhà**: phải biết nhà mấy người ở, có định cho thuê tầng trệt không, ngân sách bao nhiêu, đất nền yếu hay chắc.
+
+  Không kiến trúc sư giỏi nào cầm bút vẽ ngay. Họ **hỏi gia chủ trước**, nhẩm diện tích và chi phí, phác thảo mặt bằng, rồi mới đi vào chi tiết khó: móng, cầu thang, chống thấm.
+
+  Và không có "ngôi nhà đúng": nhà phố 4 tầng hay biệt thự 1 tầng đều đúng — tuỳ đất, tuỳ tiền, tuỳ người ở. Cái sai là chọn mà **không nói được vì sao**.
+
+  Chỗ ví von bị hụt: nhà xây xong ít khi đổi, còn hệ thống phần mềm thay đổi liên tục — nên ta thiết kế sao cho **đổi ý được** khi số liệu thay đổi.
+</Eli5>
+
+Ở công việc thật, quyết định kiến trúc sai (chọn nhầm database, tách service quá sớm) tốn hàng tháng để sửa. Trong phỏng vấn system design, interviewer chấm **cách bạn dẫn dắt**: có hỏi đúng câu không, có dùng số liệu để chọn không, có nói ra trade-off không — chứ không chấm "sơ đồ giống bài mẫu". Một framework cố định giúp bạn không bị cuốn vào chi tiết khi còn chưa biết mình đang giải bài gì.
+
+<FourStepFrameworkDiagram />
+
+<Technical>
+
+### System design khác "code một feature" ở đâu?
+
+| Khía cạnh | Code một feature | Thiết kế hệ thống |
+|---|---|---|
+| Đầu vào | Ticket rõ ràng, API đã có | Yêu cầu mơ hồ ("làm cái giống Twitter") |
+| Câu hỏi chính | Viết thế nào cho đúng? | Làm gì, quy mô bao nhiêu, hỏng thì sao? |
+| Đơn vị | Hàm, class, module | Service, database, cache, queue, network |
+| Đúng/sai | Test pass hay fail | Trade-off hợp lý với yêu cầu hay không |
+| Chi phí sửa sai | Vài giờ – vài ngày | Vài tuần – vài tháng (migrate dữ liệu!) |
+
+### Framework 4 bước
+
+**① Làm rõ yêu cầu.** Tách *functional* (hệ thống làm gì) và *non-functional* (làm tốt tới mức nào: latency, availability, consistency, durability, cost). Chốt **out of scope** để giới hạn bài toán. Câu hỏi hay dùng:
+
+- Ai là user, những hành động nào là cốt lõi?
+- Bao nhiêu user hoạt động mỗi ngày (DAU)? Tăng trưởng thế nào?
+- Đọc nhiều hay ghi nhiều? Dữ liệu có cần nhất quán tức thì không?
+- Chấp nhận mất dữ liệu không? Downtime bao lâu thì "chết"?
+
+**② Ước lượng.** Nhẩm QPS đọc/ghi (trung bình và đỉnh), storage theo năm, băng thông. Mục đích không phải con số đẹp mà là **quyết định**: 50 QPS thì một Postgres là thừa; 50.000 QPS ghi thì phải nghĩ tới partition.
+
+**③ High-level design.** Định nghĩa API chính, data model, rồi vẽ các khối cho luồng quan trọng nhất. Hãy làm cho luồng chạy được *từ đầu tới cuối* trước khi tối ưu bất cứ thứ gì.
+
+**④ Đào sâu & trade-off.** Chọn 2–3 điểm khó nhất — thường là chỗ NFR khắt khe nhất hoặc chỗ interviewer hỏi — và so sánh các phương án. Kết thúc bằng bottleneck, failure mode và cách mở rộng.
+
+### Vì sao "không có đáp án đúng"?
+
+Mỗi lựa chọn là mua một thứ bằng một thứ khác. Cache làm đọc nhanh hơn **nhưng** dữ liệu có thể cũ. Replication làm bền hơn **nhưng** có replication lag. Microservices cho team deploy độc lập **nhưng** thêm network call, thêm chỗ hỏng. Một câu trả lời mạnh luôn có dạng:
+
+> Chọn X vì yêu cầu Y (có số). Chấp nhận nhược điểm Z. Nếu Y thay đổi thành W thì sẽ đổi sang phương án V.
+
+### Tiếp cận: bắt đầu đơn giản hay thiết kế cho quy mô lớn ngay?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Bắt đầu đơn giản (1 app + 1 DB), tiến hoá dần | Nhanh ra sản phẩm, ít thứ vận hành, dễ hiểu | Phải refactor khi tăng trưởng; một số quyết định (shard key, ID) khó đổi về sau | Sản phẩm mới, quy mô chưa rõ, team nhỏ |
+| Thiết kế cho quy mô mục tiêu ngay từ đầu | Tránh migrate đau đớn; phù hợp khi tải đã biết trước | Tốn công, dễ over-engineering cho tải không bao giờ tới | Hệ thống thay thế cái cũ đã có số liệu, hoặc bài phỏng vấn đã cho quy mô |
+| Đơn giản nhưng giữ "cửa thoát" (ID toàn cục, API ổn định, tách đọc/ghi trong code) | Cân bằng giữa tốc độ và khả năng mở rộng | Cần kinh nghiệm để biết cửa thoát nào đáng giữ | Phần lớn trường hợp thực tế |
+
+Đổi ý khi: số liệu thật (metrics, load test) cho thấy điểm nghẽn sắp tới trong vài tháng — lúc đó chi phí thiết kế lại rẻ hơn chi phí sự cố.
+
+</Technical>
+
+## Thực hành
+
+Chuẩn bị "bàn làm việc" cho cả course: kiểm tra công cụ cho playground (dựng ở bài 5) và tạo design doc đầu tiên để tập bước ① ②.
+
+<Terminal
+  commands={[
+    { comment: "Cần Docker + Compose v2 (lệnh 'docker compose', không phải 'docker-compose')", command: "docker compose version" },
+    { comment: "k6 để load test — cài bằng brew install k6, hoặc dùng image grafana/k6", command: "k6 version" },
+    { comment: "Node 22 để chạy app TypeScript ngoài container khi cần", command: "node --version", output: "v22.12.0" },
+    { comment: "Thư mục làm việc: playground + design docs", command: "mkdir -p ~/sd-course/sd-playground ~/sd-course/design-docs && cd ~/sd-course" },
+    { comment: "Khung design doc: chỉ điền mục 1–2 trong 10 phút bấm giờ", command: "printf '# URL shortener\\n\\n## 1. Requirements\\n- Functional:\\n- NFR:\\n- Out of scope:\\n\\n## 2. Ước lượng\\n' > design-docs/url-shortener.md" },
+    { command: "grep -c '^## ' design-docs/url-shortener.md", output: "2" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Vẽ ngay khi nghe đề.** "Thiết kế Twitter" → vẽ LB, app, Cassandra, Kafka trong 2 phút. Interviewer sẽ hỏi "vì sao Cassandra?" và bạn không có số nào để trả lời. Luôn dành 5–8 phút đầu cho yêu cầu và ước lượng.
+</Callout>
+
+<Callout type="mistake">
+  **Dùng buzzword thay cho lập luận.** "Dùng Kafka cho scalable" không phải lý do. Nói cụ thể: "ghi ~20.000 event/giây vào đỉnh, consumer xử lý chậm hơn ⇒ cần buffer có retention để consumer đuổi kịp".
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Interviewer thường để đề mơ hồ **có chủ đích** để xem bạn có hỏi làm rõ không. Câu trả lời mạnh: tóm tắt lại yêu cầu trong 1 phút, nói rõ bạn sẽ đi theo 4 bước, hỏi interviewer muốn đào sâu phần nào, và **quản lý thời gian thành tiếng** ("mình dành thêm 2 phút cho data model rồi chuyển sang deep dive nhé"). Với vị trí senior, chủ động nêu failure mode và điều kiện đổi ý là điểm cộng lớn.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "System design", meaning: "Quyết định các thành phần, cách chúng giao tiếp và lưu dữ liệu để đạt yêu cầu ở một quy mô cụ thể." },
+    { term: "Functional requirement", meaning: "Hệ thống làm được gì (user tạo link, gửi tin nhắn…)." },
+    { term: "Non-functional requirement (NFR)", meaning: "Hệ thống làm tốt tới mức nào: latency, availability, durability, consistency, cost." },
+    { term: "Out of scope", meaning: "Những gì chủ động không làm để giới hạn bài toán." },
+    { term: "High-level design", meaning: "Sơ đồ các khối chính và luồng dữ liệu, chưa đi vào chi tiết từng khối." },
+    { term: "Deep dive", meaning: "Đào sâu 2–3 điểm khó nhất, so sánh phương án." },
+    { term: "Trade-off", meaning: "Được cái này thì mất cái kia; kèm lý do và điều kiện đổi ý." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn còn 15 phút trong buổi phỏng vấn, đã có high-level design chạy được. Nên làm gì tiếp?"
+  options={[
+    "Vẽ thêm thật nhiều service phụ cho đầy đủ",
+    "Chọn 2 điểm khó nhất (ví dụ sinh short code, cache) và so sánh phương án kèm trade-off",
+    "Viết code chi tiết cho API tạo link",
+    "Quay lại hỏi thêm yêu cầu mới từ đầu",
+  ]}
+  answerIndex={1}
+  explanation="Như kiến trúc sư đã có mặt bằng: giờ là lúc giải quyết móng và cầu thang — những chỗ khó nhất — chứ không phải vẽ thêm phòng hay chọn màu gạch."
+/>

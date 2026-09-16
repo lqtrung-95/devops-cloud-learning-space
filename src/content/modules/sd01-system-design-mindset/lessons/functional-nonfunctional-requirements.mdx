@@ -1,0 +1,116 @@
+import { NfrScenarioPriorityDiagram } from "../diagrams/nfr-scenario-priority-diagram";
+
+<Eli5 title="Requirements giống như đặt tiệc cưới với nhà hàng" emoji="💒">
+  Khi đặt tiệc, bạn nói với nhà hàng hai loại yêu cầu. Loại thứ nhất là **thực đơn**: gỏi, lẩu, chè — đó là *functional requirements*, hệ thống "làm được gì".
+
+  Loại thứ hai quan trọng không kém: **500 khách**, món lên trong **15 phút**, **không ai ngộ độc**, tiệc không được **huỷ phút chót**, ngân sách **80 triệu**. Đó là *non-functional requirements* — làm tốt tới mức nào.
+
+  Cùng một thực đơn, tiệc 50 khách và tiệc 5.000 khách cần một cái bếp hoàn toàn khác. Hệ thống phần mềm cũng vậy: NFR mới là thứ quyết định kiến trúc.
+
+  Chỗ ví von bị hụt: nhà hàng có thể hỏi lại bạn trước tiệc; còn hệ thống đã chạy thì NFR mơ hồ sẽ lộ ra dưới dạng sự cố lúc nửa đêm.
+</Eli5>
+
+"Hệ thống phải nhanh và ổn định" không giúp ai ra quyết định. "p99 API checkout dưới 300ms, availability 99,95%/tháng, không mất đơn hàng đã xác nhận" thì giúp: bạn biết có cần cache không, có cần replica không, ghi đồng bộ hay bất đồng bộ. Trong phỏng vấn, viết NFR có số là cách nhanh nhất để cho thấy bạn nghĩ như người vận hành hệ thống thật.
+
+<NfrScenarioPriorityDiagram />
+
+<Technical>
+
+### Functional requirements: ít mà trúng
+
+Viết dạng "User có thể…", giới hạn **3–5 hành động cốt lõi**. Mọi thứ còn lại đưa vào *out of scope* một cách chủ động:
+
+```markdown title="design-docs/url-shortener.md"
+## 1. Requirements
+- Functional:
+  - User tạo short link từ URL dài (tuỳ chọn alias)
+  - Ai có short link đều được redirect tới URL gốc
+  - Link có thể có ngày hết hạn
+- Out of scope: analytics chi tiết, đăng nhập, sửa link đã tạo
+```
+
+### Non-functional requirements: phải đo được
+
+| NFR | Viết mơ hồ | Viết đo được |
+|---|---|---|
+| Latency | "Redirect nhanh" | p99 redirect ≤ 50ms tại region chính |
+| Availability | "Luôn chạy" | 99,99% request redirect thành công mỗi tháng |
+| Durability | "Không mất dữ liệu" | Link đã trả về cho user không bao giờ mất (RPO = 0 cho bảng links) |
+| Consistency | "Dữ liệu đúng" | Link mới có thể trễ ≤ 1s mới redirect được ở mọi region |
+| Scale | "Chịu tải lớn" | 100M link mới/tháng, đọc gấp ~100 lần ghi |
+| Cost | "Rẻ" | Hạ tầng dưới $X/tháng ở tải mục tiêu |
+
+### Vì sao dùng percentile (p95, p99) thay vì trung bình?
+
+Trung bình **che mất đuôi chậm**. 99 request 10ms + 1 request 2s cho trung bình ~30ms — trông ổn, nhưng cứ 100 user có 1 người chờ 2 giây.
+
+Đuôi còn **khuếch đại** khi một trang gọi nhiều service: nếu mỗi service có 1% request chậm và trang gọi 10 service song song rồi chờ đủ, xác suất ít nhất một call chậm là `1 − 0,99¹⁰ ≈ 9,6%`. Vì vậy hệ thống lớn đặt NFR theo p99, thậm chí p99.9.
+
+### Consistency và durability — hai thứ hay bị nhầm
+
+- **Durability**: dữ liệu *đã xác nhận* có còn sau khi máy hỏng không? (replication, fsync, backup)
+- **Consistency** (theo nghĩa phân tán): mọi người đọc có thấy *cùng một phiên bản mới nhất* không? *Strong* = đọc luôn thấy bản ghi mới nhất đã commit; *eventual* = sau một lúc các bản sao sẽ khớp. Module SD09 sẽ nói kỹ; ở đây chỉ cần ghi rõ **loại dữ liệu nào cần mức nào**.
+
+### Chọn mức NFR là chọn trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Strong consistency | Không bao giờ đọc dữ liệu cũ, logic đơn giản | Chậm hơn, khó phân tán, có thể phải từ chối request khi mạng có sự cố | Số dư ví, tồn kho khi thanh toán, đặt chỗ |
+| Eventual consistency | Nhanh, dễ scale đọc, chịu lỗi tốt | User có thể thấy dữ liệu cũ vài trăm ms – vài giây | Like count, feed, profile, redirect link |
+| Availability rất cao (99,99%+) | Downtime vài phút/tháng | Cần multi-AZ, deploy không downtime, on-call tự động — rất đắt | Sản phẩm cốt lõi tạo doanh thu trực tiếp |
+| Availability vừa (99,5–99,9%) | Rẻ và đơn giản hơn nhiều | Vài chục phút – vài giờ downtime/tháng | Tool nội bộ, batch job, báo cáo |
+
+Đổi ý khi: nghiệp vụ thay đổi (ví dụ like count bắt đầu dùng để trả tiền cho creator ⇒ cần chính xác hơn), hoặc số liệu cho thấy chi phí giữ NFR cao vượt xa thiệt hại khi vi phạm.
+
+</Technical>
+
+## Thực hành
+
+Requirements tốt dựa trên dữ liệu thật. Từ access log của một service (định dạng có `rt=$request_time`), rút ra read/write ratio và latency percentile:
+
+<Terminal
+  commands={[
+    { comment: "Log mẫu: method + path, status, bytes, thời gian xử lý", command: "head -2 access.log", output: "10.0.1.7 - - [15/Sep/2026:09:12:01 +0700] \"GET /api/products/812 HTTP/1.1\" 200 1834 rt=0.014\n10.0.1.9 - - [15/Sep/2026:09:12:01 +0700] \"POST /api/orders HTTP/1.1\" 201 412 rt=0.087" },
+    { comment: "Đếm theo HTTP method để ước read/write ratio", command: "awk '{print $6}' access.log | tr -d '\"' | sort | uniq -c | sort -rn", output: "  48210 GET\n   1904 POST\n    312 PUT\n     95 DELETE" },
+    { comment: "Trung bình trông rất đẹp…", command: "awk -F'rt=' '{s+=$2} END {printf \"avg=%.3f\\n\", s/NR}' access.log", output: "avg=0.031" },
+    { comment: "…nhưng percentile mới cho thấy đuôi chậm", command: "grep -o 'rt=[0-9.]*' access.log | cut -d= -f2 | sort -n | awk '{a[NR]=$1} END {print \"p50=\"a[int(NR*0.5)], \"p95=\"a[int(NR*0.95)], \"p99=\"a[int(NR*0.99)]}'", output: "p50=0.018 p95=0.094 p99=0.412" },
+  ]}
+/>
+
+Đọc kết quả: ~48k GET so với ~2,3k ghi ⇒ read:write cỡ **20:1**. p99 gấp ~13 lần trung bình — NFR "p99 ≤ 200ms" hiện đang **bị vi phạm** dù trung bình chỉ 31ms.
+
+<Callout type="mistake">
+  **Liệt kê 15 functional requirement.** Trong 45 phút bạn không thể thiết kế sâu 15 thứ. Chọn 3–5 hành động cốt lõi, nói rõ phần còn lại là out of scope — interviewer sẽ đánh giá cao khả năng khoanh vùng.
+</Callout>
+
+<Callout type="mistake">
+  **NFR không có số hoặc "càng cao càng tốt".** "Availability 100%, latency 0ms, strong consistency toàn cầu" không phải yêu cầu mà là điều ước. Mỗi NFR khắt khe phải đi kèm lý do nghiệp vụ.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Sau khi hỏi xong, hãy **đọc lại requirements thành tiếng** kèm con số và hỏi "mình hiểu vậy đúng không?". Câu trả lời mạnh phân biệt NFR theo **từng loại dữ liệu/luồng** (ví dụ: redirect cần availability cao + eventual consistency; tạo link cần durability), và nói ngay NFR nào sẽ chi phối kiến trúc. Nhắc tới p99 thay vì "trung bình" là tín hiệu kinh nghiệm vận hành.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Latency p50 / p95 / p99", meaning: "Mức thời gian mà 50% / 95% / 99% request nhanh hơn hoặc bằng." },
+    { term: "Tail latency", meaning: "Phần đuôi chậm của phân phối latency; bị khuếch đại khi gọi nhiều service." },
+    { term: "Availability", meaning: "Tỉ lệ thời gian hoặc request hệ thống phục vụ thành công, thường ghi bằng %." },
+    { term: "Durability", meaning: "Khả năng dữ liệu đã xác nhận không bị mất khi phần cứng hỏng." },
+    { term: "Strong consistency", meaning: "Mọi lần đọc thấy bản ghi mới nhất đã commit." },
+    { term: "Eventual consistency", meaning: "Các bản sao sẽ khớp nhau sau một khoảng thời gian nếu không có ghi mới." },
+    { term: "RPO", meaning: "Recovery Point Objective — lượng dữ liệu tối đa chấp nhận mất khi sự cố (đo bằng thời gian)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Service có latency trung bình 40ms nhưng p99 là 1,5s. NFR là 'p99 ≤ 300ms'. Kết luận nào đúng?"
+  options={[
+    "Đạt yêu cầu vì trung bình thấp hơn 300ms nhiều",
+    "Không đạt: 1% request chậm hơn 1,5s, trung bình che mất phần đuôi",
+    "Không kết luận được nếu thiếu p50",
+    "Đạt yêu cầu nếu availability trên 99,9%",
+  ]}
+  answerIndex={1}
+  explanation="Như tiệc cưới cam kết 'mọi bàn có món trong 15 phút': trung bình 8 phút nhưng vài bàn chờ 45 phút thì nhà hàng vẫn thất hứa. NFR theo percentile đo đúng trải nghiệm của những người chờ lâu nhất."
+/>

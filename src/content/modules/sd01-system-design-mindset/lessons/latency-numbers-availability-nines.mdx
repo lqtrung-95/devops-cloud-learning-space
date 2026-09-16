@@ -1,0 +1,118 @@
+import { LatencyLadderDiagram } from "../diagrams/latency-ladder-diagram";
+import { AvailabilityCompositionDiagram } from "../diagrams/availability-composition-diagram";
+
+<Eli5 title="Latency giống như lấy đồ ở túi áo, trong tủ, hay phải ra chợ" emoji="🎒">
+  Cần cái chìa khoá: nếu nó ở **túi áo** (RAM) thì lấy ngay. Ở **tủ trong phòng** (SSD) thì mất vài bước. Phải **chạy sang nhà hàng xóm** mượn (gọi service khác trong datacenter) thì lâu hơn nữa. Còn **gửi thư ra nước ngoài** chờ hồi âm (mạng xuyên lục địa) thì tính bằng ngày.
+
+  Những khoảng cách này không chênh nhau vài lần mà **hàng nghìn, hàng triệu lần**. Vì vậy người thiết kế giỏi luôn hỏi: "dữ liệu này nên để ở túi áo hay trong kho?".
+
+  Còn **availability** giống giờ mở cửa của một cửa hàng 24/7. "Ba số 9" (99,9%) nghĩa là mỗi năm chỉ được đóng cửa cỡ 8 tiếng. Mỗi số 9 thêm vào, thời gian được phép đóng cửa chia cho 10 — và tiền thuê người trực đêm tăng lên gấp bội.
+</Eli5>
+
+Hai bảng số này là "thước đo trực giác" của người thiết kế. Latency numbers giúp bạn nhìn một sơ đồ và đoán ngay request chậm ở đâu (thường là số round trip mạng, không phải CPU). Bảng số 9 giúp bạn biến "hệ thống phải ổn định" thành con số downtime cụ thể — và nhận ra mỗi thành phần nối tiếp đang **kéo tụt** availability tổng.
+
+<LatencyLadderDiagram />
+
+<Technical>
+
+### Latency numbers — thứ tự độ lớn
+
+| Thao tác | Cỡ | Hệ quả thiết kế |
+|---|---|---|
+| Đọc RAM | ~100 ns | Cache trong RAM (Redis, in-process) nhanh hơn đọc đĩa hàng nghìn lần |
+| Đọc ngẫu nhiên 4KB từ SSD | ~150 µs | Index trên SSD vẫn nhanh; tránh quét toàn bảng |
+| Round trip trong datacenter | ~0,5 ms | Mỗi query/service call tốn ít nhất chừng này; N+1 query = N × 0,5ms |
+| Đọc tuần tự 1MB từ SSD | ~1 ms | Đọc tuần tự rẻ ⇒ log, append-only có lợi thế |
+| Disk seek HDD | ~10 ms | HDD chỉ hợp cho dữ liệu lạnh, đọc tuần tự |
+| Gói tin CA → Hà Lan → CA | ~150 ms | Không cache nào sửa được khoảng cách ⇒ đặt dữ liệu gần user (CDN, multi-region) |
+
+Số liệu gốc từ danh sách phổ biến của Jeff Dean; phần cứng hiện nay nhanh hơn ở vài dòng, nhưng **tỉ lệ giữa các tầng** vẫn đúng — đó mới là thứ cần nhớ.
+
+Quy tắc ngón tay cái:
+
+- **Bớt round trip trước khi tối ưu code.** 5 query tuần tự tới DB ở region khác (RTT ~200ms) = 1 giây, dù mỗi query chỉ tốn 1ms xử lý.
+- **Gộp và song song hoá:** batch query, pipeline Redis, gọi service song song thay vì tuần tự.
+- **Nén trước khi gửi qua mạng chậm**, đặc biệt dữ liệu text/JSON lớn.
+
+### Availability và "số 9"
+
+| Mức | Downtime / năm | Downtime / tháng |
+|---|---|---|
+| 99% | ~3,65 ngày | ~7,3 giờ |
+| 99,9% | ~8,77 giờ | ~43,8 phút |
+| 99,99% | ~52,6 phút | ~4,4 phút |
+| 99,999% | ~5,3 phút | ~26 giây |
+
+Ở 99,99%, một lần deploy lỗi mất 10 phút để rollback thủ công đã **vượt ngân sách cả tháng**. Muốn đạt mức này phải có rollback tự động, multi-AZ, và không có bước nào cần con người phản ứng.
+
+<AvailabilityCompositionDiagram />
+
+### Ghép thành phần: nối tiếp nhân, song song cộng dồn
+
+- **Nối tiếp** (request cần cả A và B): `A_tổng = A₁ × A₂`. App 99,9% × DB 99,9% ≈ **99,8%**. Thêm LB, cache, auth service… mỗi khâu lại kéo tụt.
+- **Song song / dự phòng** (chỉ cần 1 trong N sống): `A_tổng = 1 − (1 − A)ᴺ`. Hai app 99,9% độc lập ⇒ `1 − 0,001² = 99,9999%`.
+- **Cảnh báo quan trọng:** công thức song song giả định **hỏng độc lập**. Hai instance cùng AZ, cùng bản deploy lỗi, cùng phụ thuộc một DNS thì sập cùng lúc — con số thật thấp hơn nhiều.
+
+### Nhắm mức availability nào?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| 99,9% (1 region, multi-AZ cơ bản) | Chi phí và độ phức tạp vừa phải | ~43 phút downtime/tháng | Phần lớn sản phẩm SaaS, API nội bộ quan trọng |
+| 99,95–99,99% (multi-AZ đầy đủ, deploy an toàn, failover tự động) | Downtime vài phút/tháng | Đắt hơn đáng kể; cần on-call, canary, automation | Luồng tạo doanh thu trực tiếp: checkout, login, thanh toán |
+| 99,999% (multi-region active-active) | Sống sót cả khi mất một region | Rất đắt; consistency xuyên region khó; ít tổ chức thực sự đạt | Hạ tầng lõi (DNS, hệ thống thanh toán quy mô lớn) |
+
+Đổi ý khi: chi phí một giờ downtime (doanh thu mất, phạt SLA, uy tín) lớn hơn chi phí vận hành thêm một số 9 trong năm.
+
+</Technical>
+
+## Thực hành
+
+Tự đo khoảng cách mạng và tính availability bằng máy thay vì học thuộc:
+
+<Terminal
+  commands={[
+    { comment: "Round trip tới một resolver gần (anycast) — cỡ vài ms", command: "ping -c 5 1.1.1.1 | tail -1", output: "round-trip min/avg/max/stddev = 2.914/3.380/4.102/0.412 ms" },
+    { comment: "Thời gian bắt tay TCP tới endpoint AWS ở Singapore (từ Việt Nam)", command: "curl -s -o /dev/null -w 'tcp_connect=%{time_connect}s\\n' https://ec2.ap-southeast-1.amazonaws.com", output: "tcp_connect=0.038s" },
+    { comment: "…và tới Ireland: xa hơn ~10.000 km, chậm hơn cả bậc", command: "curl -s -o /dev/null -w 'tcp_connect=%{time_connect}s\\n' https://ec2.eu-west-1.amazonaws.com", output: "tcp_connect=0.231s" },
+    { comment: "SLO 99,95% cho phép bao nhiêu phút downtime mỗi tháng (30 ngày)?", command: "python3 -c \"print(round((1 - 0.9995) * 30 * 24 * 60, 1), 'phút')\"", output: "21.6 phút" },
+    { comment: "LB 99,99% → app 99,95% → DB 99,9% nối tiếp", command: "python3 -c \"print(round(0.9999 * 0.9995 * 0.999 * 100, 3), '%')\"", output: "99.84 %" },
+  ]}
+/>
+
+Số của bạn sẽ khác tuỳ vị trí và nhà mạng — điều cần thấy là **chênh lệch bậc độ lớn** giữa gần và xa.
+
+<Callout type="mistake">
+  **Tưởng availability tổng bằng thành phần yếu nhất.** Thực ra nó còn **thấp hơn** thành phần yếu nhất, vì các khâu nối tiếp nhân với nhau. Ba khâu 99,9% nối tiếp chỉ còn ~99,7%.
+</Callout>
+
+<Callout type="mistake">
+  **Cộng dồn "số 9" từ vendor.** Cloud cam kết 99,99% cho một dịch vụ không có nghĩa hệ thống của bạn đạt 99,99% — code, deploy, config và các phụ thuộc khác mới là nguồn downtime chính.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi interviewer hỏi "làm sao giảm latency?", câu trả lời mạnh bắt đầu bằng **đếm round trip** trên đường đi của request và chỉ ra tầng chậm nhất theo thứ tự độ lớn, rồi mới nói cache/CDN/đặt gần user. Khi nói availability, hãy nêu mục tiêu bằng số 9, quy ra downtime/tháng, và giải thích dự phòng loại bỏ **single point of failure** nào — kèm câu "giả định hỏng độc lập, nên tách AZ".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Latency", meaning: "Thời gian từ lúc gửi yêu cầu tới lúc nhận kết quả." },
+    { term: "RTT (round-trip time)", meaning: "Thời gian gói tin đi và về giữa hai điểm." },
+    { term: "Availability (số 9)", meaning: "Tỉ lệ phục vụ thành công; 99,9% = 'ba số 9'." },
+    { term: "Downtime budget", meaning: "Lượng thời gian được phép hỏng suy ra từ mục tiêu availability." },
+    { term: "Nối tiếp (serial)", meaning: "Cần mọi thành phần cùng sống; availability nhân với nhau." },
+    { term: "Dự phòng (redundancy)", meaning: "Nhiều bản sao song song; chỉ sập khi tất cả cùng sập." },
+    { term: "Single point of failure", meaning: "Thành phần mà hỏng một mình là cả hệ thống ngừng." },
+  ]}
+/>
+
+<QuickCheck
+  question="Trang profile gọi tuần tự 8 API nội bộ, mỗi API tự nó xử lý 2ms, nhưng các service nằm ở region khác với RTT ~60ms. Cải tiến nào hiệu quả nhất?"
+  options={[
+    "Viết lại các API bằng ngôn ngữ nhanh hơn",
+    "Tăng RAM cho server",
+    "Chuyển sang HDD dung lượng lớn",
+    "Đặt service cùng region và gọi song song hoặc gộp thành 1 API tổng hợp",
+  ]}
+  answerIndex={3}
+  explanation="8 × 60ms ≈ 480ms nằm ở mạng, chỉ 16ms ở xử lý. Như 8 lần chạy ra chợ xa để mua 8 món: dời bếp gần chợ và đi một chuyến mua đủ, thay vì học nấu nhanh hơn."
+/>

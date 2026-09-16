@@ -1,0 +1,227 @@
+import { PlaygroundRequestPathDiagram } from "../diagrams/playground-request-path-diagram";
+
+<Eli5 title="Đọc nhiều hay ghi nhiều giống như thư viện so với sổ chấm công" emoji="📚">
+  Một **thư viện** có hàng nghìn người đến đọc mỗi ngày nhưng chỉ vài cuốn sách mới được nhập. Muốn phục vụ tốt, thư viện đầu tư vào **nhiều quầy mượn, nhiều bản photo** của sách hot — tối ưu cho việc *đọc*.
+
+  Còn **sổ chấm công** ở nhà máy thì ngược lại: mỗi phút có hàng trăm người quẹt thẻ, nhưng cả tháng mới có một lần kế toán mở ra xem. Ở đây cần **ghi thật nhanh, không làm mất dòng nào** — tối ưu cho việc *ghi*.
+
+  Để biết hệ thống của mình giống cái nào, ta cần một **phòng thí nghiệm** trên máy: dựng hệ thống thu nhỏ, bắn tải giả lập, và nhìn con số — thay vì đoán.
+
+  Chỗ ví von bị hụt: một hệ thống thật thường có *cả hai*. Trang sản phẩm là thư viện, còn luồng ghi log click là sổ chấm công — thiết kế riêng cho từng luồng.
+</Eli5>
+
+Read/write ratio là một trong những con số quyết định kiến trúc mạnh nhất: nó cho biết nên đầu tư vào cache và replica, hay vào partition, batch và queue. Còn **sd-playground** là nơi bạn sẽ kiểm chứng mọi building block trong course — từ load balancer (SD03), cache (SD04), replica (SD06) tới Redpanda (SD07) và Toxiproxy (SD11). Dựng nó cẩn thận một lần, dùng suốt 24 tuần.
+
+<PlaygroundRequestPathDiagram />
+
+<Technical>
+
+### Read/write ratio của vài hệ thống điển hình
+
+| Hệ thống | Read:write (cỡ, tuỳ sản phẩm) | Hệ quả |
+|---|---|---|
+| URL shortener | ~100:1 | Cache mapping, CDN cho redirect |
+| News feed / mạng xã hội | ~10:1 tới 100:1 | Tính sẵn timeline, cache mạnh |
+| E-commerce trang sản phẩm | ~100:1 | Cache + CDN; luồng checkout lại cần consistency |
+| Chat | ~1:1 | Cả ghi lẫn đọc đều phải nhanh; lưu trữ tối ưu ghi |
+| Log, metrics, IoT | ~1:100 (ghi áp đảo) | Append-only, batch, time-series/LSM storage |
+
+Hãy đo tỉ lệ theo **từng luồng**, không phải cả hệ thống, và nhớ các ghi "ẩn": đếm lượt xem, cập nhật `last_seen`, ghi audit log.
+
+### Kiến trúc sd-playground
+
+```text
+sd-playground/
+├── docker-compose.yml
+├── app/            # Node 22 + TypeScript (Fastify)
+│   ├── Dockerfile
+│   ├── package.json
+│   └── src/server.ts
+├── db/init.sql     # schema + dữ liệu mẫu
+├── nginx/default.conf
+└── k6/smoke.js
+```
+
+```yaml title="docker-compose.yml"
+services:
+  app:
+    build: ./app
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgres://playground:playground@postgres:5432/playground
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+  nginx:
+    image: nginx:1.27
+    ports: ["8080:80"]
+    volumes: ["./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro"]
+    depends_on: [app]
+  postgres:
+    image: postgres:17
+    environment: { POSTGRES_USER: playground, POSTGRES_PASSWORD: playground, POSTGRES_DB: playground }
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data", "./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U playground"]
+      interval: 5s
+      retries: 10
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+volumes:
+  pgdata:
+```
+
+```ts title="app/src/server.ts"
+import Fastify from "fastify";
+import pg from "pg";
+import { Redis } from "ioredis";
+
+const app = Fastify({ logger: true });
+const db = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
+const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
+
+app.get("/health", async () => {
+  await db.query("SELECT 1");
+  await redis.ping();
+  return { status: "ok" };
+});
+
+app.get<{ Params: { id: string } }>("/api/items/:id", async (req, reply) => {
+  const { rows } = await db.query("SELECT id, name, price FROM items WHERE id = $1", [req.params.id]);
+  if (rows.length === 0) return reply.code(404).send({ error: "not found" });
+  const views = await redis.incr(`views:item:${req.params.id}`); // ghi "ẩn" trong một request đọc
+  return { ...rows[0], views };
+});
+
+app.post<{ Body: { name: string; price: number } }>("/api/items", async (req, reply) => {
+  const { rows } = await db.query("INSERT INTO items (name, price) VALUES ($1, $2) RETURNING id", [req.body.name, req.body.price]);
+  return reply.code(201).send(rows[0]);
+});
+
+await app.listen({ port: 3000, host: "0.0.0.0" });
+```
+
+`app/package.json` cần `"type": "module"`, dependencies `fastify`, `pg`, `ioredis`, `tsx` (và `@types/pg` cho editor). Dockerfile tối giản: `FROM node:22-slim`, `npm install`, `CMD ["npx", "tsx", "src/server.ts"]` — đủ cho playground; production nên build ra JavaScript.
+
+```sql title="db/init.sql"
+CREATE TABLE items (
+  id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name TEXT NOT NULL,
+  price INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO items (name, price)
+SELECT 'item-' || g, (random() * 1000000)::int FROM generate_series(1, 100000) AS g;
+```
+
+```nginx title="nginx/default.conf"
+upstream app_upstream {
+  server app:3000;
+  keepalive 32;               # giữ kết nối tới app, tránh bắt tay lại mỗi request
+}
+server {
+  listen 80;
+  location / {
+    proxy_pass http://app_upstream;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+  }
+}
+```
+
+### k6 smoke test với read/write ratio 9:1
+
+```js title="k6/smoke.js"
+import http from "k6/http";
+import { check, sleep } from "k6";
+
+const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
+
+export const options = {
+  vus: 5,
+  duration: "30s",
+  thresholds: { http_req_failed: ["rate<0.01"], http_req_duration: ["p(95)<200"] },
+};
+
+export default function () {
+  if (Math.random() < 0.1) {
+    const res = http.post(`${BASE_URL}/api/items`, JSON.stringify({ name: "k6", price: 1000 }), {
+      headers: { "Content-Type": "application/json" },
+    });
+    check(res, { "ghi trả 201": (r) => r.status === 201 });
+  } else {
+    const id = Math.floor(Math.random() * 100000) + 1;
+    check(http.get(`${BASE_URL}/api/items/${id}`), { "đọc trả 200": (r) => r.status === 200 });
+  }
+  sleep(1);
+}
+```
+
+Smoke test **không** đo giới hạn hệ thống — nó chỉ xác nhận mọi thứ chạy đúng dưới tải nhẹ và cho bạn một baseline. Load test thật nằm ở SD03.
+
+### Tối ưu cho đọc hay cho ghi?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Tối ưu đọc: cache, read replica, denormalize, CDN | Đọc nhanh, scale đọc gần như tuyến tính | Dữ liệu có thể cũ; ghi phức tạp hơn (invalidate, cập nhật nhiều bản) | Read:write từ ~10:1 trở lên, chấp nhận eventual consistency |
+| Tối ưu ghi: append-only, batch, queue, partition | Chịu được lưu lượng ghi lớn, ít lock | Đọc chậm hơn hoặc trễ; truy vấn tổng hợp phải xử lý riêng | Log, metrics, event, chat, IoT |
+| Tách luồng (CQRS-lite): ghi vào store tối ưu ghi, đọc từ view tối ưu đọc | Mỗi phía tối ưu độc lập | Thêm độ trễ đồng bộ và thêm thành phần vận hành | Hai luồng có tỉ lệ và NFR rất khác nhau |
+
+Đổi ý khi: số đo thực tế cho thấy tỉ lệ khác giả định — ví dụ tính năng "đếm lượt xem realtime" biến một luồng đọc thành luồng ghi nặng.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Dựng toàn bộ playground (lần đầu sẽ build image app)", command: "cd ~/sd-course/sd-playground && docker compose up -d --build" },
+    { command: "docker compose ps --format 'table {{.Service}}\\t{{.Status}}\\t{{.Ports}}'", output: "SERVICE    STATUS                    PORTS\napp        Up 12 seconds             0.0.0.0:3000->3000/tcp\nnginx      Up 11 seconds             0.0.0.0:8080->80/tcp\npostgres   Up 18 seconds (healthy)   0.0.0.0:5432->5432/tcp\nredis      Up 18 seconds             0.0.0.0:6379->6379/tcp" },
+    { comment: "Kiểm tra từng tầng: app trực tiếp, rồi qua Nginx", command: "curl -s localhost:3000/health", output: "{\"status\":\"ok\"}" },
+    { command: "curl -s localhost:8080/api/items/42", output: "{\"id\":42,\"name\":\"item-42\",\"price\":518203,\"views\":1}" },
+    { comment: "Ghi 'ẩn' đã nằm trong Redis", command: "docker compose exec redis redis-cli GET views:item:42", output: "\"1\"" },
+    { comment: "Chạy smoke test (hoặc: docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run - < k6/smoke.js)", command: "k6 run k6/smoke.js", output: "(rút gọn)\n    checks.........................: 100.00% 148 out of 148\n    http_req_duration..............: avg=4.62ms min=1.71ms med=3.9ms max=48.3ms p(90)=7.1ms p(95)=9.84ms\n    http_req_failed................: 0.00%   0 out of 148\n    http_reqs......................: 148     4.87/s" },
+    { comment: "Kiểm tra tỉ lệ ghi thực tế trong DB (100.000 dòng seed ban đầu)", command: "docker compose exec postgres psql -U playground -c \"SELECT count(*) - 100000 AS rows_written FROM items;\"", output: " rows_written \n--------------\n           14\n(1 row)" },
+  ]}
+/>
+
+~14 ghi trên 148 request ≈ 9,5% — khớp tỉ lệ 9:1 đã cấu hình. p95 cỡ 10ms trên laptop **không** nói gì về production (không có network thật, dữ liệu nhỏ, không có tải khác); giá trị của nó là **baseline để so sánh** khi bạn thay đổi kiến trúc ở các module sau.
+
+<Callout type="mistake">
+  **Dùng `localhost` bên trong container.** Trong container app, `localhost` là chính container đó. Gọi service khác bằng **tên service** (`postgres`, `redis`) — Compose tạo DNS nội bộ cho mạng `sd-playground_default`. Tương tự, k6 chạy trong Docker phải gọi `host.docker.internal` (macOS/Windows) hoặc join network của Compose.
+</Callout>
+
+<Callout type="warning">
+  `docker-entrypoint-initdb.d/init.sql` **chỉ chạy khi volume dữ liệu còn trống**. Sửa `init.sql` rồi `docker compose up` sẽ không thấy thay đổi — cần `docker compose down -v` (xoá volume, mất dữ liệu playground) rồi dựng lại.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Sau khi chốt requirements, hãy nói thẳng: "Hệ thống này read-heavy cỡ 100:1, nên mình sẽ tối ưu đường đọc" — hoặc chỉ ra luồng nào write-heavy. Câu trả lời mạnh tách tỉ lệ **theo luồng** và nhắc tới ghi ẩn (view count, last seen). Nếu được hỏi "làm sao biết thiết kế chịu được tải?", nói về load test có kịch bản đúng read/write ratio, đo p95/p99 chứ không chỉ throughput.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Read/write ratio", meaning: "Tỉ lệ số thao tác đọc so với ghi; nên đo theo từng luồng." },
+    { term: "Read-heavy / write-heavy", meaning: "Hệ thống bị chi phối bởi đọc / bởi ghi, dẫn tới hướng tối ưu khác nhau." },
+    { term: "sd-playground", meaning: "Hệ thống thu nhỏ bằng Docker Compose dùng để thử và đo mọi building block trong course." },
+    { term: "Docker Compose service", meaning: "Một container được khai báo trong compose file; tên service cũng là hostname nội bộ." },
+    { term: "Healthcheck", meaning: "Lệnh kiểm tra container đã sẵn sàng phục vụ, dùng cho depends_on." },
+    { term: "Smoke test", meaning: "Load test nhẹ để xác nhận hệ thống chạy đúng và lấy baseline." },
+    { term: "Virtual user (VU)", meaning: "Một luồng user giả lập trong k6, chạy lặp lại hàm default." },
+  ]}
+/>
+
+<QuickCheck
+  question="Service analytics nhận 50.000 event click/giây, dashboard được vài chục người mở mỗi giờ. Hướng tối ưu nào hợp lý?"
+  options={[
+    "Thêm nhiều read replica và cache cho dashboard",
+    "Đặt CDN trước API nhận event",
+    "Dùng một bảng Postgres có 10 index để dashboard truy vấn nhanh",
+    "Tối ưu ghi: nhận event vào buffer/queue, ghi theo batch vào storage append-only, tổng hợp định kỳ cho dashboard",
+  ]}
+  answerIndex={3}
+  explanation="Đây là 'sổ chấm công', không phải 'thư viện': ghi áp đảo đọc. Nhiều index làm mỗi lần ghi đắt hơn; cần ghi nhanh theo lô và tính sẵn số liệu cho vài người đọc."
+/>

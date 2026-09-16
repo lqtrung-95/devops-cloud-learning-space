@@ -1,0 +1,120 @@
+import { EstimationCalculatorDiagram } from "../diagrams/estimation-calculator-diagram";
+
+<Eli5 title="Ước lượng giống như cô bán phở nhẩm xem sáng mai nấu bao nhiêu" emoji="🍜">
+  Cô bán phở không có Excel. Cô nhẩm: "Khu này sáng nào cũng cỡ **300 khách**, đông nhất 6–8 giờ, mỗi tô **200g bánh**" ⇒ cần cỡ 60kg bánh, nồi nước dùng phải to gấp đôi cái cũ.
+
+  Cô không cần biết chính xác 287 hay 312 khách. Cô chỉ cần biết là **300 chứ không phải 30 hay 3.000** — vì 30 khách thì một nồi nhỏ là đủ, còn 3.000 khách thì phải thuê mặt bằng khác.
+
+  Back-of-the-envelope estimation là đúng kiểu nhẩm đó: vài giả định rõ ràng, vài phép nhân, ra **thứ tự độ lớn** để chọn kiến trúc.
+
+  Chỗ ví von bị hụt: khách của cô tăng từ từ, còn hệ thống phần mềm có thể tăng 10× sau một bài viral — nên luôn ước lượng thêm cho tăng trưởng.
+</Eli5>
+
+Con số quyết định kiến trúc. 100 QPS thì một app + một Postgres là quá đủ; 100.000 QPS đọc thì bắt buộc có cache và nhiều replica; vài PB media thì phải nghĩ tới object storage và chi phí băng thông. Trong phỏng vấn, ước lượng tốt không phải để khoe tính nhẩm mà để **biện minh** cho các hộp bạn sắp vẽ.
+
+<EstimationCalculatorDiagram />
+
+<Technical>
+
+### Bộ công cụ nhẩm (Phụ lục B)
+
+- **1 ngày ≈ 86.400 giây ≈ 10⁵ giây.** Sai ~15%, hoàn toàn chấp nhận được.
+- **1 triệu request/ngày ≈ 12 QPS.** Nhớ con số này là đổi được mọi thứ.
+- **Peak ≈ 2–3× trung bình** — là *giả định*, nói rõ khi dùng. Sự kiện đặc biệt (flash sale, bóng đá) có thể 10×+.
+- **Bậc 2:** 2¹⁰ ≈ nghìn (KB), 2²⁰ ≈ triệu (MB), 2³⁰ ≈ tỷ (GB), 2⁴⁰ ≈ nghìn tỷ (TB).
+- **Năm:** 365 ngày; 5 năm ≈ 1.825 ngày ≈ 2.000 ngày khi nhẩm thô.
+
+### Công thức
+
+```text
+QPS trung bình  = DAU × (số request mỗi user/ngày) / 10⁵
+QPS đỉnh        = QPS trung bình × hệ số peak
+Storage/ngày    = số bản ghi mới/ngày × kích thước mỗi bản ghi
+Storage N năm   = Storage/ngày × 365 × N × hệ số replication
+Băng thông      = dung lượng truyền/ngày / 86.400 (đổi byte → bit: × 8)
+Số máy (thô)    = QPS đỉnh / QPS một máy chịu được (phải benchmark)
+```
+
+### Ví dụ đầy đủ: hệ thống kiểu Twitter
+
+| Đại lượng | Giả định | Kết quả |
+|---|---|---|
+| DAU | 200M user hoạt động/ngày | 2 × 10⁸ |
+| Ghi tweet | mỗi user 2 tweet/ngày ⇒ 4 × 10⁸ tweet/ngày | ~4.000 QPS TB, ~12.000 QPS đỉnh (×3) |
+| Đọc timeline | mỗi user mở timeline 20 lần/ngày ⇒ 4 × 10⁹ lần/ngày | ~40.000 QPS TB, ~120.000 QPS đỉnh |
+| Read:write | 40.000 / 4.000 | ~10:1 (tính theo request) |
+| Storage text | ~300 byte/tweet (text + metadata) | ~120 GB/ngày ⇒ ~220 TB/5 năm (chưa ×3 replication) |
+| Storage media | 10% tweet có ảnh ~500 KB | ~20 TB/ngày ⇒ ~36 PB/5 năm |
+| Băng thông upload ảnh | 20 TB/ngày × 8 / 86.400 s | cỡ 2 Gbps trung bình |
+| App server | giả định 1 instance chịu cỡ 1.000–2.000 QPS (cần benchmark) | cỡ 60–120 instance cho đường đọc lúc đỉnh |
+
+Rút ra quyết định: text nhỏ và tăng chậm (hàng trăm TB) ⇒ database phân tán vừa đủ; media lớn hơn text cỡ 100+ lần ⇒ **object storage + CDN** là bắt buộc; đường đọc gấp 10 lần ghi ⇒ timeline phải được **tính sẵn hoặc cache**, không thể query join mỗi lần mở app.
+
+### Vài thói quen giúp không sai bậc
+
+- **Viết giả định trước, phép tính sau.** Người nghe có thể không đồng ý giả định, nhưng sẽ theo được lập luận.
+- **Làm tròn mạnh tay:** 86.400 → 10⁵, 365 → 400 nếu cần nhẩm nhanh. Ghi "cỡ", "~".
+- **Tách phần lớn nhất:** media thường áp đảo text; chỉ cần tính kỹ phần chiếm >90%.
+- **Kiểm tra lại bằng trực giác:** 36 PB có hợp lý không? Một ổ HDD lớn cỡ 20 TB ⇒ ~2.000 ổ trước replication — nghe hợp lý cho quy mô đó.
+- **Không đọc thuộc QPS của Postgres/Redis.** Throughput phụ thuộc query, kích thước dữ liệu, phần cứng — luôn nói "cỡ… cần benchmark".
+
+### Chọn độ chính xác bao nhiêu?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Nhẩm thứ tự độ lớn (vài phút) | Nhanh, đủ để chọn loại kiến trúc | Sai 2–3× là bình thường; không dùng để mua hạ tầng | Phỏng vấn, brainstorm, so sánh phương án |
+| Bảng tính chi tiết (vài giờ) | Có hệ số tăng trưởng, replication, headroom | Tốn thời gian; vẫn dựa trên giả định | Design doc, dự trù ngân sách |
+| Đo thật: metrics production + load test | Chính xác cho workload hiện tại | Cần hệ thống đang chạy; không dự báo được tính năng mới | Capacity planning (SD13), trước sự kiện lớn |
+
+Đổi ý khi: con số ước lượng nằm sát ngưỡng quyết định (ví dụ 8.000 QPS ghi — một hay nhiều database?) — lúc đó nhẩm không đủ, phải load test.
+
+</Technical>
+
+## Thực hành
+
+Dùng `bc` và `python3` như một cuốn sổ nháp — kiểm tra lại bảng Twitter ở trên:
+
+<Terminal
+  commands={[
+    { comment: "Kiểm chứng quy tắc: 1 triệu request/ngày ≈ 12 QPS", command: "echo '1000000 / 86400' | bc -l", output: "11.57407407407407407407" },
+    { comment: "QPS đọc timeline trung bình (dùng 10^5 giây như khi nhẩm)", command: "echo '200000000 * 20 / 100000' | bc", output: "40000" },
+    { comment: "Storage text 5 năm: 4×10^8 tweet × 300 byte × 1.825 ngày, đổi ra TB", command: "python3 -c \"print(400e6 * 300 * 1825 / 1e12, 'TB')\"", output: "219.0 TB" },
+    { comment: "Storage ảnh 5 năm: 10% tweet × 500 KB", command: "python3 -c \"print(40e6 * 500e3 * 1825 / 1e15, 'PB')\"", output: "36.5 PB" },
+    { comment: "Băng thông upload ảnh trung bình (byte → bit)", command: "python3 -c \"print(round(20e12 * 8 / 86400 / 1e9, 2), 'Gbps')\"", output: "1.85 Gbps" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Quên hệ số peak và replication.** Thiết kế cho QPS trung bình thì sập đúng giờ cao điểm; tính storage không nhân replication (thường ×3) và index thì thiếu gấp vài lần.
+</Callout>
+
+<Callout type="mistake">
+  **Tính đến 4 chữ số thập phân.** "Cần 1.157,4 QPS" gây ấn tượng sai về độ chính xác và tốn thời gian. Nói "cỡ 1.000 QPS, đỉnh cỡ 3.000" rồi đi tiếp.
+</Callout>
+
+<Callout type="tip">
+  Nhầm lẫn phổ biến nhất là **bit và byte**: băng thông mạng tính bằng bit/giây (Gbps), dung lượng tính bằng byte. 1 Gbps ≈ 125 MB/s.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Hỏi interviewer trước: "Anh/chị muốn mình ước lượng chi tiết không, hay mình nhẩm nhanh những số ảnh hưởng tới thiết kế?" — nhiều interviewer chỉ muốn vài con số then chốt. Câu trả lời mạnh: nói giả định trước, làm tròn, rồi **kết luận ngay một hệ quả** ("~120k QPS đọc đỉnh ⇒ không thể đọc thẳng DB, cần cache timeline"). Con số không dẫn tới quyết định nào thì không cần tính.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Back-of-the-envelope", meaning: "Ước lượng nhanh bằng giả định + tính nhẩm, ra thứ tự độ lớn." },
+    { term: "DAU", meaning: "Daily Active Users — số user hoạt động mỗi ngày." },
+    { term: "QPS", meaning: "Queries (requests) per second — số request mỗi giây." },
+    { term: "Peak factor", meaning: "Hệ số nhân từ lưu lượng trung bình lên giờ cao điểm (giả định 2–3×)." },
+    { term: "Thứ tự độ lớn", meaning: "Bậc lũy thừa của 10: 10³ khác hẳn 10⁴ về kiến trúc." },
+    { term: "Replication factor", meaning: "Số bản sao dữ liệu lưu trữ, nhân trực tiếp vào storage." },
+    { term: "Headroom", meaning: "Phần công suất dư để chịu đột biến và tăng trưởng." },
+  ]}
+/>
+
+<QuickCheck
+  question="App chat có 50M DAU, mỗi user gửi 40 tin/ngày, mỗi tin ~100 byte. Storage tin nhắn (chưa replication) mỗi năm cỡ bao nhiêu?"
+  options={["Cỡ 7 GB", "Cỡ 70 GB", "Cỡ 700 GB", "Cỡ 70 TB"]}
+  answerIndex={3}
+  explanation="50M × 40 = 2 × 10⁹ tin/ngày × 100 byte = 200 GB/ngày × 365 ≈ 73 TB/năm. Như cô bán phở: chỉ cần biết là 'chục TB' chứ không phải 'trăm GB' — đủ để hiểu cần storage phân tán cho tin nhắn."
+/>

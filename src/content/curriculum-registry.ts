@@ -16,6 +16,7 @@ import { m14GitopsArgocdModule } from "./modules/m14-gitops-argocd/module-meta";
 import { m15ObservabilityModule } from "./modules/m15-observability/module-meta";
 import { m16SrePracticesModule } from "./modules/m16-sre-practices/module-meta";
 import { m17DevsecopsModule } from "./modules/m17-devsecops/module-meta";
+import { sd01SystemDesignMindsetModule } from "./modules/sd01-system-design-mindset/module-meta";
 import { sd05DatabaseFundamentalsModule } from "./modules/sd05-database-fundamentals/module-meta";
 import { sd06ScalingDatabasesModule } from "./modules/sd06-scaling-databases/module-meta";
 import { sd07AsyncMessagingModule } from "./modules/sd07-async-messaging/module-meta";
@@ -39,6 +40,7 @@ export const curriculumModules: ModuleDefinition[] = [
   m15ObservabilityModule,
   m16SrePracticesModule,
   m17DevsecopsModule,
+  sd01SystemDesignMindsetModule,
   sd05DatabaseFundamentalsModule,
   sd06ScalingDatabasesModule,
   sd07AsyncMessagingModule,
