@@ -46,4 +46,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "sd18-case-proximity-booking-payment": (lessonSlug) => import(`./modules/sd18-case-proximity-booking-payment/lessons/${lessonSlug}.mdx`),
   "b01-nodejs-runtime-project-architecture": (lessonSlug) => import(`./modules/b01-nodejs-runtime-project-architecture/lessons/${lessonSlug}.mdx`),
   "b02-http-rest-api-fastify": (lessonSlug) => import(`./modules/b02-http-rest-api-fastify/lessons/${lessonSlug}.mdx`),
+  "b05-authentication-jwt-refresh-token": (lessonSlug) => import(`./modules/b05-authentication-jwt-refresh-token/lessons/${lessonSlug}.mdx`),
 };

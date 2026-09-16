@@ -1,0 +1,99 @@
+import { JwtCommonPitfallsDiagram } from "../diagrams/jwt-common-pitfalls-diagram";
+
+<Eli5 title="JWT giống như một tấm biển tên đeo ở hội nghị, không phải chìa khoá phòng" emoji="📛">
+  Tấm biển tên hội nghị ghi rõ "Trung — Backend Dev" — ai đi ngang cũng đọc được, không cần hỏi ban tổ chức. Nó chứng minh bạn *đã được* ban tổ chức duyệt (có con dấu thật ở góc), nhưng **không hề bí mật**.
+
+  Nhiều dev vô tình đối xử với JWT như một chiếc **hộp khoá kín** ("đã ký thì chắc an toàn rồi") trong khi nó chỉ là tấm biển tên có con dấu — ai cầm cũng đọc được nội dung.
+</Eli5>
+
+Phần lớn lỗ hổng JWT trong thực tế không phải ở thuật toán ký (đã được nghiên cứu kỹ), mà ở cách người viết code **hiểu sai bản chất** của nó.
+
+<JwtCommonPitfallsDiagram />
+
+<Technical>
+
+### Pitfall 1 — Nhét dữ liệu nhạy cảm vào payload
+
+Đã nói ở lesson trước nhưng đủ quan trọng để nhắc lại: payload chỉ base64url-encode. `jwt.io` có ô "Debugger" decode payload của bất kỳ JWT nào chỉ bằng cách dán vào — không cần biết secret.
+
+```bash
+echo "eyJzdWIiOiIxMjMiLCJlbWFpbCI6ImFuQHRhc2tmbG93LmRldiJ9" | base64 -d
+# {"sub":"123","email":"an@taskflow.dev"}
+```
+
+### Pitfall 2 — Không set hoặc không kiểm tra `exp`
+
+Một JWT không có `exp` sống mãi mãi cho tới khi secret bị đổi. Với `@fastify/jwt`, `sign: { expiresIn: "15m" }` ở cấp plugin đã tự thêm `exp` vào mọi token — nhưng nếu ai đó tự viết lại logic sign bằng thư viện `jsonwebtoken` thô mà quên option `expiresIn`, lỗi này rất dễ lọt qua review vì token "vẫn hoạt động bình thường".
+
+### Pitfall 3 — Tin thuật toán (`alg`) do client gửi lên
+
+Header JWT có field `alg` (ví dụ `HS256`, `RS256`, hoặc thậm chí `none`). Một số thư viện cũ có bug: nếu server "linh hoạt" đọc `alg` từ token để chọn cách verify, attacker gửi token với `alg: "none"` (không chữ ký) và một số implementation lỏng lẻo chấp nhận luôn. `@fastify/jwt` không có lỗ hổng này — nhưng nếu tự viết verify thủ công, luôn **cứng hoá thuật toán mong đợi ở phía server**, không đọc từ token.
+
+```ts
+// SAI — để attacker quyết định cách verify
+const decoded = jwt.decode(token); // decode không verify!
+if (decoded.alg === "none") { /* ... */ }
+
+// ĐÚNG — server tự quyết alg, verify thật
+jwt.verify(token, secret, { algorithms: ["HS256"] });
+```
+
+### Pitfall 4 — Coi access token là revoke được
+
+Đây là hiểu lầm phổ biến nhất: "user đổi mật khẩu / bị khoá tài khoản, sao access token cũ vẫn gọi API được thêm vài phút?". Vì access token verify chỉ bằng chữ ký + `exp`, không tra DB — đây là đánh đổi **có chủ đích** để lấy tốc độ. Cách giảm thiểu:
+
+| Vấn đề | Cách xử lý ở `taskflow-api` |
+|---|---|
+| Cần revoke ngay lập tức (tài khoản bị khoá khẩn cấp) | Chấp nhận độ trễ tối đa = thời hạn access token (15 phút) — đây là lý do thời hạn phải NGẮN |
+| Refresh token cần revoke được | Lưu hash trong DB, kiểm tra `revoked_at` mỗi lần `/auth/refresh` |
+| Muốn revoke access token ngay tức khắc (case cực đoan) | Cần thêm blocklist (ví dụ Redis set các `jti` đã revoke, TTL = thời gian còn lại của token) — đánh đổi lại việc phải query mỗi request, chỉ nên làm khi thực sự cần |
+
+Cột cuối là lý do vì sao B06 (authorization) và B10 (caching) sẽ quay lại chủ đề này với Redis — B05 chưa cần blocklist vì access token đã đủ ngắn cho hầu hết trường hợp.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Decode payload của một JWT bất kỳ mà không cần biết secret — chứng minh nó không hề bí mật",
+      command: "node -e \"console.log(JSON.parse(Buffer.from(process.argv[1].split('.')[1], 'base64url')))\" eyJzdWIiOiIxMjMiLCJpYXQiOjE3MTcwMDAwMDAsImV4cCI6MTcxNzAwMDkwMH0",
+      output: "{ sub: '123', iat: 1717000000, exp: 1717000900 }",
+    },
+    {
+      comment: "Thử verify một token với alg khác secret mong đợi — phải bị từ chối",
+      command: "node -e \"require('jsonwebtoken').verify(token, secret, { algorithms: ['HS256'] })\"",
+      output: "JsonWebTokenError: invalid algorithm",
+    },
+  ]}
+/>
+
+<Callout type="warning" title="Không tự viết lại logic verify nếu đã có plugin">
+  `@fastify/jwt` đã xử lý đúng các pitfall ở trên (cứng hoá algorithm, kiểm tra exp, không tin input từ client). Tự viết lại bằng `jsonwebtoken` thô "cho linh hoạt hơn" chỉ nên làm khi có lý do rõ ràng, và phải tự đảm bảo lặp lại đúng các kiểm tra này.
+</Callout>
+
+<Callout type="mistake">
+  Log toàn bộ JWT ra file log để "debug cho dễ". Access token trong log tồn tại lâu hơn chính token đó (log thường lưu hàng tháng) — coi log level phù hợp và redact token giống như redact password.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "jti", meaning: "Claim JWT ID — định danh duy nhất cho một token, cần thiết nếu muốn xây blocklist revoke access token." },
+    { term: "alg confusion", meaning: "Lỗ hổng khi server tin field alg do client cung cấp thay vì tự cố định thuật toán verify." },
+    { term: "blocklist", meaning: "Danh sách (thường ở Redis) các token/jti đã bị revoke sớm, dùng khi cần vô hiệu hoá access token ngay lập tức." },
+    { term: "claim", meaning: "Một trường dữ liệu trong payload JWT, ví dụ sub, iat, exp." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một endpoint admin cho phép khoá tài khoản user ngay lập tức. Sau khi khoá, user đó vẫn gọi được API thành công trong 10 phút tiếp theo bằng access token cũ. Đây có phải bug không?"
+  options={[
+    "Có, đây chắc chắn là bug cần sửa ngay bằng cách xoá access token khỏi client",
+    "Không hẳn — đây là đánh đổi có chủ đích của access token JWT (verify không query DB); nếu cần revoke tức khắc phải thêm blocklist, không phải bug của thiết kế cơ bản",
+    "Có, vì JWT không bao giờ nên có thời hạn",
+    "Không, vì access token không thể bị vô hiệu hoá trong bất kỳ trường hợp nào",
+  ]}
+  answerIndex={1}
+  explanation="Access token JWT đánh đổi tốc độ (không query DB) lấy độ trễ revoke tối đa bằng thời hạn token. Đây là thiết kế có chủ đích, không phải lỗi — miễn là thời hạn đủ ngắn và team hiểu rõ đánh đổi này."
+/>

@@ -1,0 +1,93 @@
+import { CookieVsHeaderXssDiagram } from "../diagrams/cookie-vs-header-xss-diagram";
+
+<Eli5 title="Cất chìa khoá trong túi quần khoá kéo, hay để trên bàn làm việc" emoji="🔒">
+  Cookie `httpOnly` giống như **túi quần có khoá kéo**: chìa khoá (token) ở trong đó, và có một quy tắc cứng là "không tay nào được thò vào trừ chính chủ nhà (trình duyệt) khi đi qua cửa". JavaScript trên trang — kể cả JavaScript độc hại nếu trang có lỗ hổng — không thò tay vào được.
+
+  Lưu token trong `localStorage` rồi tự đọc ra gắn vào header giống như **để chìa khoá trên bàn làm việc mở**: tiện cho chính bạn lấy dùng, nhưng bất kỳ ai (hoặc bất kỳ đoạn script nào) đứng cạnh bàn cũng nhặt được.
+</Eli5>
+
+Không có lựa chọn nào "luôn đúng" — nó phụ thuộc client là gì. Nhưng chọn sai chỗ là một trong những lỗi bảo mật phổ biến nhất khi làm auth.
+
+<CookieVsHeaderXssDiagram />
+
+<Technical>
+
+### Hai nơi lưu token phổ biến
+
+**1. Cookie `httpOnly; Secure; SameSite`** — trình duyệt tự gắn cookie vào mọi request tới đúng domain, code JavaScript của trang không đọc được giá trị cookie `httpOnly`.
+
+```ts title="src/routes/auth.ts"
+reply.setCookie("refreshToken", raw, {
+  httpOnly: true, // JS không đọc được — chặn XSS lấy token
+  secure: true, // chỉ gửi qua HTTPS
+  sameSite: "strict", // không gửi kèm request cross-site — giảm CSRF
+  path: "/api/v1/auth", // chỉ gắn cookie cho route auth, không phải mọi route
+  maxAge: 60 * 60 * 24 * 7, // 7 ngày, khớp thời hạn refresh token
+});
+```
+
+**2. Authorization header** — client tự lưu token (biến trong RAM, secure storage của mobile OS, hoặc — kém an toàn hơn — `localStorage`) và tự gắn `Authorization: Bearer <token>` vào mỗi request.
+
+```ts
+// Client (mobile app / CLI / service-to-service) — không có khái niệm cookie httpOnly
+fetch("/api/v1/projects", { headers: { Authorization: `Bearer ${accessToken}` } });
+```
+
+### Chọn theo loại client
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Cookie `httpOnly` | JS không đọc được token → chặn được kênh cắp token phổ biến nhất qua XSS | Cần phòng CSRF riêng (`SameSite`, CSRF token cho request state-changing); không dùng được cho client không phải trình duyệt | Web app chính của `taskflow-api` (SPA/SSR chạy trong browser) |
+| Authorization header (lưu trong RAM/secure storage) | Hoạt động với mọi loại client: mobile app, CLI, service gọi service | Nếu lưu ở `localStorage`, một lỗ hổng XSS bất kỳ trên trang đọc được token ngay | Mobile app, script CI/CD, service-to-service gọi `notification-service` sau này |
+| Authorization header lưu ở `localStorage` | Dễ code nhất | **Rủi ro cao nhất** — bất kỳ XSS nào trên trang đều lấy được token trực tiếp | Hầu như không nên dùng cho web app có xử lý input người dùng |
+
+`taskflow-api` dùng cookie `httpOnly` cho refresh token (vì client chính là trình duyệt) và trả access token trong response body để client giữ tạm trong bộ nhớ (biến JS, không phải localStorage) — access token sống ngắn nên rủi ro nếu bị đọc qua XSS cũng chỉ kéo dài tối đa 15 phút.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Kiểm tra cookie refresh token có đúng cờ httpOnly/Secure/SameSite không",
+      command: "curl -i -X POST http://localhost:3000/api/v1/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"an@taskflow.dev\",\"password\":\"matkhau123\"}' | grep -i set-cookie",
+      output: "Set-Cookie: refreshToken=k7Hs...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict",
+    },
+    {
+      comment: "Thử đọc cookie này bằng JavaScript trong DevTools console của browser",
+      command: "document.cookie",
+      output: '""  // không thấy refreshToken — vì nó là httpOnly, đúng như kỳ vọng',
+    },
+  ]}
+/>
+
+<Callout type="warning" title="httpOnly không thay thế được HTTPS">
+  Cookie `Secure` chỉ được gửi qua HTTPS. Nếu `taskflow-api` chạy HTTP thuần ở production (không nên!), cờ `Secure` sẽ khiến cookie không bao giờ được gửi đi — dev/local có thể tắt tạm nhưng production bắt buộc HTTPS.
+</Callout>
+
+<Callout type="mistake">
+  Đặt `SameSite: "none"` "cho tiện" vì frontend và backend khác domain, mà quên rằng `SameSite: "none"` bắt buộc đi kèm `Secure` và mở toang cửa cho CSRF nếu không có lớp phòng thủ khác (CSRF token, kiểm tra `Origin` header).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "httpOnly", meaning: "Cờ cookie chặn JavaScript phía client đọc giá trị — chỉ trình duyệt tự gắn vào request." },
+    { term: "SameSite", meaning: "Cờ cookie kiểm soát việc có gửi kèm request cross-site hay không, giảm rủi ro CSRF." },
+    { term: "XSS (Cross-Site Scripting)", meaning: "Lỗ hổng cho phép attacker chạy JavaScript tuỳ ý trên trang của nạn nhân." },
+    { term: "CSRF (Cross-Site Request Forgery)", meaning: "Lỗ hổng khiến trình duyệt tự gửi cookie hợp lệ tới một request do trang khác khởi tạo." },
+    { term: "localStorage", meaning: "Bộ nhớ trình duyệt mà mọi JavaScript trên trang đều đọc/ghi được — không an toàn để lưu token nhạy cảm." },
+  ]}
+/>
+
+<QuickCheck
+  question="`taskflow-api` có một lỗ hổng XSS nhỏ ở phần hiển thị comment (chưa escape đúng). Nếu refresh token được lưu ở `localStorage`, điều gì xảy ra? Nếu lưu ở cookie `httpOnly`?"
+  options={[
+    "Cả hai trường hợp đều an toàn như nhau",
+    "localStorage: script độc hại đọc được token trực tiếp. Cookie httpOnly: script chạy được nhưng không đọc được giá trị cookie đó",
+    "Cookie httpOnly nguy hiểm hơn vì token được gửi tự động",
+    "Cả hai trường hợp đều mất token vào tay attacker như nhau",
+  ]}
+  answerIndex={1}
+  explanation="httpOnly là lớp phòng thủ đặc biệt cho đúng tình huống này: chặn `document.cookie` và mọi API JS khác đọc giá trị cookie đó, dù script độc hại vẫn chạy được trên trang."
+/>

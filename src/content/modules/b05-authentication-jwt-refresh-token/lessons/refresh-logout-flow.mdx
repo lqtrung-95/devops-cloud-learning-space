@@ -1,0 +1,125 @@
+import { LogoutRevokeFlowDiagram } from "../diagrams/logout-revoke-flow-diagram";
+
+<Eli5 title="Logout giống như báo mất thẻ ra vào, không phải chỉ nhét thẻ vào ngăn kéo" emoji="🚪">
+  Nếu bạn nghỉ việc và chỉ **cất thẻ ra vào công ty vào ngăn kéo** ở nhà, thẻ vẫn còn hoạt động — ai nhặt được thẻ đó (hoặc bạn vô tình để quên ở đâu) vẫn quẹt cửa vào được bình thường.
+
+  Logout đúng cách giống như **gọi cho bộ phận an ninh để báo huỷ thẻ trong hệ thống** — dù thẻ vật lý còn nguyên trong túi ai đó, hệ thống cửa đã biết thẻ này không còn hiệu lực và từ chối mọi lần quẹt.
+</Eli5>
+
+Refresh token cũng vậy: "logout" thật sự phải là một thay đổi **ở phía server (trong DB)**, không phải chỉ xoá cookie ở phía client.
+
+<LogoutRevokeFlowDiagram />
+
+<Technical>
+
+### Refresh: kiểm tra 3 điều kiện, không chỉ "có tồn tại"
+
+```ts title="src/routes/auth.ts"
+app.post("/api/v1/auth/refresh", async (request, reply) => {
+  const raw = request.cookies.refreshToken;
+  if (!raw) return reply.code(401).send({ error: { code: "UNAUTHORIZED", message: "Thiếu refresh token" } });
+
+  const tokenHash = createHash("sha256").update(raw).digest("hex");
+  const [row] = await db.select().from(refreshTokens).where(eq(refreshTokens.tokenHash, tokenHash)).limit(1);
+
+  // Cùng một lỗi 401 chung cho cả 3 trường hợp — không tiết lộ lý do cụ thể ra ngoài.
+  const isInvalid = !row || row.revokedAt !== null || row.expiresAt < new Date();
+  if (isInvalid) {
+    return reply.code(401).send({ error: { code: "UNAUTHORIZED", message: "Refresh token không hợp lệ" } });
+  }
+
+  // Xoay vòng: revoke token cũ, phát token mới — giới hạn thời gian sống nếu token bị lộ.
+  await db.update(refreshTokens).set({ revokedAt: new Date() }).where(eq(refreshTokens.id, row.id));
+  const { raw: newRaw, tokenHash: newHash } = generateRefreshToken();
+  await db.insert(refreshTokens).values({
+    userId: row.userId,
+    tokenHash: newHash,
+    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+  });
+
+  reply.setCookie("refreshToken", newRaw, { httpOnly: true, secure: true, sameSite: "strict", path: "/api/v1/auth" });
+  const accessToken = await reply.jwtSign({ sub: row.userId });
+  return { accessToken };
+});
+```
+
+Ba điều kiện bị từ chối — **không tồn tại**, **đã revoke**, **đã hết hạn** — đều trả cùng một `401` với cùng message. Nếu trả lỗi khác nhau cho từng trường hợp, attacker dò được thêm thông tin (ví dụ: "token này *đã từng* tồn tại nhưng bị revoke" khác với "token này chưa bao giờ tồn tại").
+
+### Logout: revoke trước, xoá cookie sau
+
+```ts title="src/routes/auth.ts"
+app.post("/api/v1/auth/logout", async (request, reply) => {
+  const raw = request.cookies.refreshToken;
+  if (raw) {
+    const tokenHash = createHash("sha256").update(raw).digest("hex");
+    // Revoke ngay cả khi không tìm thấy row cũng không sao — logout luôn trả 200,
+    // không tiết lộ token đó có từng tồn tại hay không.
+    await db.update(refreshTokens).set({ revokedAt: new Date() }).where(eq(refreshTokens.tokenHash, tokenHash));
+  }
+  reply.clearCookie("refreshToken", { path: "/api/v1/auth" });
+  return reply.code(204).send();
+});
+```
+
+Bước `UPDATE ... SET revoked_at = now()` mới là "logout thật". `clearCookie` chỉ dọn dẹp phía trình duyệt của đúng người vừa bấm logout — không ảnh hưởng gì tới bản sao refresh token mà attacker có thể đã lấy được từ trước (log, XSS, thiết bị dùng chung...).
+
+### Vì sao không đủ nếu chỉ xoá cookie
+
+Nếu logout chỉ `clearCookie` mà không đụng tới DB: refresh token gốc **vẫn còn hợp lệ trong `refresh_tokens`** (`revoked_at` vẫn NULL). Bất kỳ ai đang giữ bản sao chuỗi đó — kể cả chính bạn ở một trình duyệt khác chưa logout — vẫn gọi `/auth/refresh` thành công. "Đăng xuất" lúc này chỉ là ảo giác trên một thiết bị, không phải vô hiệu hoá quyền truy cập thật.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Login để lấy refresh token (lưu vào cookies.txt)",
+      command: "curl -c cookies.txt -X POST http://localhost:3000/api/v1/auth/login -d '{\"email\":\"an@taskflow.dev\",\"password\":\"matkhau123\"}' -H 'Content-Type: application/json'",
+    },
+    {
+      comment: "Refresh bình thường — nhận access token mới",
+      command: "curl -b cookies.txt -c cookies.txt -X POST http://localhost:3000/api/v1/auth/refresh",
+      output: "{\"accessToken\":\"eyJhbGciOi...\"}",
+    },
+    {
+      comment: "Logout — server phải revoke refresh token trong DB",
+      command: "curl -b cookies.txt -X POST http://localhost:3000/api/v1/auth/logout -i",
+      output: "HTTP/1.1 204 No Content",
+    },
+    {
+      comment: "Thử refresh lại bằng đúng cookie cũ — phải bị từ chối",
+      command: "curl -b cookies.txt -X POST http://localhost:3000/api/v1/auth/refresh -i",
+      output: 'HTTP/1.1 401 Unauthorized\n{"error":{"code":"UNAUTHORIZED","message":"Refresh token không hợp lệ"}}',
+    },
+  ]}
+/>
+
+<Callout type="warning" title="Trả cùng một lỗi cho mọi lý do refresh thất bại">
+  Không phân biệt response giữa "token không tồn tại", "token đã revoke", "token hết hạn". Cùng `401`, cùng message — tránh lộ thông tin giúp attacker suy luận về vòng đời của một token cụ thể.
+</Callout>
+
+<Callout type="mistake">
+  Chỉ test happy path (login → refresh thành công) mà quên test đúng trường hợp lab yêu cầu: refresh bằng token đã logout phải thất bại. Đây là lỗi dễ lọt qua review nhất vì "trông vẫn chạy được".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "revoke", meaning: "Đánh dấu một refresh token không còn hiệu lực trong DB, dù chuỗi vật lý vẫn còn tồn tại." },
+    { term: "token rotation", meaning: "Mỗi lần refresh thành công, revoke token cũ và phát token mới — dùng một lần." },
+    { term: "revoked_at", meaning: "Cột timestamp nullable trong refresh_tokens; NULL = còn hiệu lực, có giá trị = đã bị thu hồi." },
+    { term: "logout ảo", meaning: "Logout chỉ xoá cookie phía client mà không revoke DB — refresh token gốc vẫn dùng được ở nơi khác." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một tester report bug: 'Tôi bấm logout, xoá cookie trong DevTools thủ công để giả lập, rồi dùng Postman gọi /auth/refresh với refresh token đã lưu từ trước — vẫn nhận được access token mới!'. Nguyên nhân nhiều khả năng nhất là gì?"
+  options={[
+    "Postman có bug không đọc đúng cookie",
+    "Endpoint /auth/logout chỉ clearCookie ở response mà chưa UPDATE revoked_at trong bảng refresh_tokens",
+    "Access token bị lỗi không hết hạn",
+    "Database bị cache kết quả cũ",
+  ]}
+  answerIndex={1}
+  explanation="Đây đúng là tình huống 'logout ảo' — xoá cookie không ảnh hưởng gì tới row trong DB. Nếu revoked_at chưa được set, refresh token đó vẫn hợp lệ bất kể client nào gọi tới."
+/>

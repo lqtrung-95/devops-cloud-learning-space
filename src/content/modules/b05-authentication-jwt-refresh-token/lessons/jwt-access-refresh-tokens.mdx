@@ -1,0 +1,131 @@
+import { JwtTokenLifecycleDiagram } from "../diagrams/jwt-token-lifecycle-diagram";
+
+<Eli5 title="Access token là vé xem phim, refresh token là thẻ thành viên rạp" emoji="🎟️">
+  Bạn mua **vé xem phim** (access token): soát vé chỉ liếc qua, không gọi điện hỏi rạp gốc — vé có ngày giờ in sẵn, hết giờ là hết hiệu lực, không ai kiểm tra thêm gì.
+
+  Nhưng để mua vé mới mỗi lần, bạn cần xuất trình **thẻ thành viên** (refresh token) — thẻ này rạp lưu trong hệ thống của họ, và nếu bạn báo mất thẻ, họ khoá nó ngay lập tức trong hệ thống, không ai dùng thẻ đó mua vé được nữa dù thẻ vật lý còn cầm trên tay.
+</Eli5>
+
+Đây là lý do `taskflow-api` dùng **hai loại token khác nhau** thay vì một session dài hạn duy nhất: access token nhanh nhưng không revoke được, refresh token revoke được nhưng không dùng trực tiếp để gọi API.
+
+<JwtTokenLifecycleDiagram />
+
+<Technical>
+
+### JWT access token: ký, không mã hoá
+
+JWT (JSON Web Token) gồm 3 phần nối bằng dấu chấm: `header.payload.signature`. Header và payload chỉ **base64url-encode**, ai cũng decode đọc được. Chỉ `signature` là bằng chứng "server đã ký cái này, chưa ai sửa".
+
+```ts title="src/plugins/jwt.ts"
+import fastifyJwt from "@fastify/jwt";
+import fp from "fastify-plugin";
+import { env } from "../lib/env.js";
+
+export default fp(async (app) => {
+  app.register(fastifyJwt, {
+    secret: env.JWT_ACCESS_SECRET, // KHÔNG commit secret này vào git
+    sign: { expiresIn: "15m" },
+  });
+
+  app.decorate("authenticate", async (request, reply) => {
+    try {
+      await request.jwtVerify(); // kiểm tra chữ ký + exp trong một lần gọi
+    } catch {
+      reply.code(401).send({ error: { code: "UNAUTHORIZED", message: "Token không hợp lệ hoặc đã hết hạn" } });
+    }
+  });
+});
+```
+
+Payload chỉ nên chứa dữ liệu **định danh, không nhạy cảm**, vì bất kỳ ai cầm token đều đọc được:
+
+```json title="access token payload (đã decode)"
+{ "sub": "3f9e2b1a-...-c8d4", "iat": 1717000000, "exp": 1717000900 }
+```
+
+### Refresh token: opaque, hash, lưu DB
+
+Refresh token **không phải JWT** — chỉ là một chuỗi ngẫu nhiên (opaque string), không mang thông tin gì bên trong. Server phải tra DB để biết nó thuộc về ai và còn hiệu lực không.
+
+```ts title="src/routes/auth.ts"
+import { randomBytes, createHash } from "node:crypto";
+
+function generateRefreshToken() {
+  const raw = randomBytes(32).toString("base64url"); // 256 bit entropy — không thể đoán
+  const tokenHash = createHash("sha256").update(raw).digest("hex");
+  return { raw, tokenHash }; // raw trả cho client, tokenHash mới lưu DB
+}
+```
+
+Bảng `refresh_tokens` (thiết kế riêng cho module này, không có trong bảng domain model cố định của mục 3 curriculum):
+
+```ts title="src/db/schema.ts"
+export const refreshTokens = pgTable("refresh_tokens", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id),
+  tokenHash: text("token_hash").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+```
+
+Chỉ lưu `tokenHash` — giống hệt nguyên tắc lưu mật khẩu, và cũng là cách chính hệ thống magic-link login của Learning Space lưu token (`storeToken: "hashed"`): nếu DB rò rỉ, kẻ tấn công có hash chứ không có chuỗi thật để dùng lại.
+
+### Vì sao hai loại token, không phải một
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Chỉ dùng session dài hạn trong DB | Revoke được ngay lập tức | Mỗi request đều phải query DB — chậm hơn ở quy mô lớn | App nhỏ, ít traffic, ưu tiên đơn giản |
+| Chỉ dùng JWT dài hạn (vd 7 ngày), không refresh token | Nhanh, không cần query DB | Không revoke được — nếu token lộ, kẻ tấn công dùng được tới khi hết hạn | Hầu như không nên dùng cho hệ thống thật |
+| Access token ngắn (JWT) + refresh token dài (DB) | Verify nhanh (JWT) + revoke được (refresh) — cân bằng cả hai | Phức tạp hơn: cần endpoint `/refresh`, cần bảng riêng | `taskflow-api` và phần lớn hệ thống production |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Đăng nhập, nhận access token trong body + refresh token trong cookie",
+      command: "curl -i -c cookies.txt -X POST http://localhost:3000/api/v1/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"an@taskflow.dev\",\"password\":\"matkhau123\"}'",
+      output: "HTTP/1.1 200 OK\nSet-Cookie: refreshToken=...; HttpOnly; Secure; SameSite=Strict\n\n{\"accessToken\":\"eyJhbGciOi...\"}",
+    },
+    {
+      comment: "Gọi route bảo vệ bằng access token",
+      command: "curl http://localhost:3000/api/v1/projects -H 'Authorization: Bearer eyJhbGciOi...'",
+      output: "{\"data\":[{\"id\":\"...\",\"name\":\"Website redesign\"}]}",
+    },
+  ]}
+/>
+
+<Callout type="warning" title="Không nhét dữ liệu nhạy cảm vào JWT">
+  JWT chỉ ký, không mã hoá — mọi client (và bất kỳ ai chặn được request) đều đọc được payload. Không bao giờ đặt mật khẩu, số thẻ, hay quyền hạn chi tiết cần giữ bí mật vào payload JWT.
+</Callout>
+
+<Callout type="mistake">
+  Dùng cùng một secret cho access token và cho việc ký thứ khác (ví dụ webhook signature). Nếu secret đó lộ ở một chỗ, mọi thứ dùng chung secret đều bị ảnh hưởng — mỗi mục đích nên có secret riêng.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "access token", meaning: "JWT thời hạn ngắn (15 phút), verify chỉ bằng chữ ký + exp, không cần query DB." },
+    { term: "refresh token", meaning: "Chuỗi ngẫu nhiên thời hạn dài (7 ngày), lưu hash trong DB, dùng để lấy access token mới." },
+    { term: "opaque token", meaning: "Token không tự mang thông tin — phải tra DB mới biết nó thuộc về ai." },
+    { term: "payload", meaning: "Phần dữ liệu của JWT — chỉ base64url-encode, ai cũng đọc được, không được mã hoá." },
+    { term: "signature", meaning: "Chữ ký JWT chứng minh token chưa bị sửa — không chứng minh nội dung là bí mật." },
+    { term: "entropy", meaning: "Độ ngẫu nhiên của một chuỗi — refresh token 256-bit có entropy đủ cao để không thể đoán được." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao access token có thể verify nhanh mà không cần query database mỗi request?"
+  options={[
+    "Vì access token được lưu cache ở Redis",
+    "Vì JWT tự chứa chữ ký — server chỉ cần kiểm tra chữ ký và exp bằng secret đã biết, không cần tra cứu ở đâu khác",
+    "Vì access token không cần bảo mật",
+    "Vì Fastify tự động cache mọi request",
+  ]}
+  answerIndex={1}
+  explanation="JWT mang theo 'bằng chứng' (chữ ký) ngay trong chính nó — giống vé xem phim có in sẵn ngày giờ, soát vé không cần gọi điện xác nhận với rạp gốc."
+/>
