@@ -1,0 +1,108 @@
+import { DeprecationSunsetTimelineDiagram } from "../diagrams/deprecation-sunset-timeline-diagram";
+
+<Eli5 title="Biển báo 'sắp đóng cửa' dán trước cả tháng, không phải sáng hôm đóng cửa mới dán" emoji="🚧">
+  Tưởng tượng một cửa hàng sắp chuyển địa điểm. Cách làm tệ: sáng hôm chuyển, dán tờ giấy "đóng cửa hôm nay" lên kính — khách quen tới nơi mới biết, không kịp chuẩn bị.
+
+  Cách làm đúng: dán biển "sẽ chuyển địa điểm từ ngày 1/3" ngay từ bây giờ (6 tháng trước), kèm địa chỉ mới. Khách có cả nửa năm để quen dần, chuyển từ từ. Header `Deprecation` chính là tấm biển đó — dán sớm. Header `Sunset` là ngày ghi trên biển — ngày THẬT SỰ đóng, không phải hôm nay.
+</Eli5>
+
+`/api/v1/tasks` vẫn hoạt động y hệt sau B18 — chỉ thêm hai header báo trước. Bài học này thêm header đó bằng đúng công cụ Fastify đã dùng suốt course: hook, tận dụng encapsulation để header chỉ xuất hiện ở `v1`, không lan sang `v2`.
+
+<DeprecationSunsetTimelineDiagram />
+
+<Technical>
+
+### Hai header, hai ý nghĩa khác nhau
+
+| Header | Giá trị | Ý nghĩa |
+|---|---|---|
+| `Deprecation` | HTTP-date (hoặc `true`) | "Version này ĐÃ được đánh dấu deprecated kể từ mốc này" — cảnh báo, KHÔNG phải hành động |
+| `Sunset` | HTTP-date | "Version này SẼ ngừng hoạt động vào đúng ngày này" — cam kết một mốc thời gian cụ thể trong tương lai |
+
+Khoảng cách giữa hai mốc là phần quan trọng nhất, quan trọng hơn cả cú pháp header: nó chính là thời gian client được cấp để migrate. `taskflow-api` chọn `Deprecation: 01/09/2026` và `Sunset: 01/03/2027` — cách nhau 6 tháng. Không có con số "đúng" tuyệt đối cho mọi API, nhưng đặt cả hai trùng ngày (hoặc gần nhau) phủ nhận hoàn toàn mục đích của cơ chế: client không còn thời gian phản ứng, khác gì gỡ đột ngột không báo trước.
+
+### Thêm header bằng Fastify hook có phạm vi
+
+Fastify plugin có tính chất **encapsulation**: mọi hook/decorator đăng ký bên trong một plugin chỉ áp dụng cho chính plugin đó và các plugin con được đăng ký bên trong nó — không rò ra ngoài. Đây là lý do hook `onSend` đặt trong plugin `v1` không bao giờ chạy cho route `v2`, dù cả hai cùng sống trong một Fastify instance.
+
+```ts title="src/plugins/v1-deprecation-headers.ts"
+import type { FastifyPluginAsync } from "fastify";
+
+const DEPRECATION_DATE = "Tue, 01 Sep 2026 00:00:00 GMT";
+const SUNSET_DATE = "Mon, 01 Mar 2027 00:00:00 GMT";
+
+/** Gắn Deprecation/Sunset cho MỌI response gửi ra từ route mà plugin này bao bọc. */
+export const v1DeprecationHeaders: FastifyPluginAsync = async (fastify) => {
+  fastify.addHook("onSend", async (_request, reply, payload) => {
+    reply.header("Deprecation", DEPRECATION_DATE);
+    reply.header("Sunset", SUNSET_DATE);
+    reply.header("Link", '<https://docs.taskflow-api.example/migrating-to-v2>; rel="deprecation"');
+    return payload; // onSend PHẢI trả lại payload, kể cả khi không đổi gì
+  });
+};
+```
+
+```ts title="src/routes/v1/tasks.ts"
+import type { FastifyPluginAsync } from "fastify";
+import { v1DeprecationHeaders } from "../../plugins/v1-deprecation-headers";
+import { listTasksByProject } from "../../services/tasks-service";
+import { serializeTaskV1 } from "../../serializers/task-serializer";
+
+export const tasksV1Routes: FastifyPluginAsync = async (fastify) => {
+  await fastify.register(v1DeprecationHeaders); // đăng ký TRƯỚC route — áp dụng cho mọi route bên dưới
+
+  fastify.get("/tasks", async (request) => {
+    const { projectId } = request.query as { projectId: string };
+    const tasks = await listTasksByProject(projectId);
+    return { data: tasks.map(serializeTaskV1) };
+  });
+};
+```
+
+Vì `tasksV2Routes` (bài trước) được đăng ký ở `src/app.ts` như một plugin HOÀN TOÀN riêng — không phải plugin con của `tasksV1Routes` — nó không bao giờ thấy `onSend` hook này. Đây không phải trùng hợp: chính encapsulation của Fastify là cơ chế khiến việc "chỉ v1 có header, v2 thì không" trở nên tự nhiên, không cần viết điều kiện `if (version === "v1")` ở bất kỳ đâu.
+
+### Vì sao `onSend` chứ không phải `onRequest`
+
+`onRequest` chạy TRƯỚC khi route handler xử lý — lúc đó chưa có response để gắn header theo ý muốn cuối cùng. `onSend` chạy NGAY TRƯỚC khi response thật sự rời khỏi server, sau khi handler đã set mọi thứ khác — đúng thời điểm để "dán thêm nhãn" vào response mà không ảnh hưởng logic xử lý.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Gọi v1 — kiểm tra header cảnh báo", command: "curl -i localhost:3000/api/v1/tasks | head -8", output: "HTTP/1.1 200 OK\nDeprecation: Tue, 01 Sep 2026 00:00:00 GMT\nSunset: Mon, 01 Mar 2027 00:00:00 GMT\nLink: <https://docs.taskflow-api.example/migrating-to-v2>; rel=\"deprecation\"\ncontent-type: application/json; charset=utf-8" },
+    { comment: "Gọi v2 — không có header cảnh báo nào", command: "curl -i localhost:3000/api/v2/tasks | head -6", output: "HTTP/1.1 200 OK\ncontent-type: application/json; charset=utf-8\ncontent-length: 214" },
+    { comment: "Test tự động cho toàn bộ route v1", command: "pnpm test -- v1-deprecation-headers", output: "✓ mọi route v1 có header Deprecation + Sunset (18ms)\n✓ route v2 không có header đó (6ms)\n\nTest Files  1 passed (1)" },
+  ]}
+/>
+
+<Callout type="warning" title="Quên `return payload` trong onSend">
+  Hook `onSend` PHẢI trả lại `payload` (dù không đổi nội dung). Quên `return payload` khiến Fastify coi như response body bị xoá — client nhận header đúng nhưng body rỗng, một lỗi im lặng rất dễ bị bỏ sót nếu chỉ kiểm tra header bằng `curl -i` mà không xem body.
+</Callout>
+
+<Callout type="mistake">
+  Đăng ký `v1DeprecationHeaders` như một plugin TOÀN CỤC ở `src/app.ts` (`fastify.register(v1DeprecationHeaders)` không nằm trong prefix nào) thay vì đăng ký bên trong plugin `tasksV1Routes`. Làm vậy hook áp dụng cho MỌI route kể cả `v2` — đúng thứ Deprecation header không nên xuất hiện.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Deprecation header", meaning: "Báo hiệu một version đã được đánh dấu sẽ ngừng hỗ trợ, kèm mốc thời gian bắt đầu cảnh báo." },
+    { term: "Sunset header", meaning: "Ngày cụ thể (HTTP-date) mà version đó sẽ ngừng hoạt động thật sự." },
+    { term: "onSend hook", meaning: "Hook Fastify chạy ngay trước khi response rời server — nơi phù hợp để gắn thêm header." },
+    { term: "encapsulation (Fastify)", meaning: "Hook/decorator đăng ký trong một plugin chỉ ảnh hưởng plugin đó và các plugin con, không rò ra plugin anh em." },
+    { term: "migration window", meaning: "Khoảng thời gian giữa Deprecation và Sunset — thời gian thực tế client có để chuyển sang version mới." },
+  ]}
+/>
+
+<QuickCheck
+  question="Nếu `v1DeprecationHeaders` được đăng ký bên trong `tasksV1Routes` (không phải toàn cục ở `app.ts`), route `/api/v2/tasks` có nhận được header `Deprecation`/`Sunset` không? Vì sao?"
+  options={[
+    "Có, vì mọi hook trong Fastify luôn áp dụng toàn cục bất kể đăng ký ở đâu",
+    "Không — nhờ encapsulation của Fastify, hook đăng ký trong một plugin chỉ áp dụng cho chính plugin đó và các plugin con của nó; `tasksV2Routes` là một plugin độc lập, không phải con của `tasksV1Routes`",
+    "Có, nhưng chỉ nếu cả hai route dùng chung một file",
+    "Không, nhưng chỉ vì tên plugin bắt đầu bằng 'v1'",
+  ]}
+  answerIndex={1}
+  explanation="Encapsulation là cơ chế cốt lõi giúp Fastify tổ chức plugin theo phạm vi rõ ràng — đây chính là lý do B18 không cần viết bất kỳ điều kiện `if (version === 'v1')` nào để tách hành vi giữa hai version."
+/>

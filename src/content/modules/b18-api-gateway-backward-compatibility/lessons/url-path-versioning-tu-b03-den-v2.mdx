@@ -1,0 +1,136 @@
+import { V1V2SharedDataDiagram } from "../diagrams/v1-v2-shared-data-diagram";
+
+<Eli5 title="Bưu điện mở thêm quầy mới, không đóng quầy cũ" emoji="🏤">
+  Bưu điện quen thuộc có quầy "Gửi hàng" ở cửa số 1 (`/api/v1`) từ ngày đầu mở cửa. Khách quen cứ đi đúng cửa số 1, quen thao tác, quen mẫu đơn.
+
+  Giờ bưu điện muốn đổi mẫu đơn cho gọn hơn — thay vì bắt tất cả khách đổi ngay, họ mở thêm cửa số 2 (`/api/v2`) với mẫu đơn mới, đặt ngay cạnh cửa số 1. Khách quen vẫn đi cửa số 1 y như cũ, không ai ép họ đổi. Khách mới hoặc khách muốn dùng mẫu gọn thì tự đi cửa số 2. Cả hai cửa cùng dẫn vào MỘT kho hàng phía sau — không phải hai bưu điện riêng biệt.
+</Eli5>
+
+Từ B03, `taskflow-api` đã cố định base path `/api/v1` — lúc đó lý do chưa rõ ràng lắm, nhưng đó chính xác là quyết định giúp module này (B18) có "cửa số 2" để mở mà không phải phá cửa số 1. Bài học hôm nay: hiểu tại sao URL-path versioning được chọn, và cách thêm `/api/v2/tasks` mà không chạm một dòng nào của `/api/v1/tasks`.
+
+<V1V2SharedDataDiagram />
+
+<Technical>
+
+### Ba cách versioning phổ biến
+
+| Cách | Ví dụ | Ưu | Nhược | Dùng khi |
+|---|---|---|---|---|
+| URL path | `/api/v1/tasks`, `/api/v2/tasks` | Hiện rõ trên URL, dễ debug bằng `curl`/log, gateway route theo path cực đơn giản (đúng thứ B18 dùng ở nginx) | URL không còn "thuần" chỉ định danh resource — thay đổi version đổi luôn URL | API công khai, nhiều client bên ngoài, cần công cụ hạ tầng đơn giản route được |
+| Header (`Accept: application/vnd.taskflow.v2+json`) | Media type versioning | URL "sạch", đúng tinh thần REST thuần tuý | Khó debug bằng trình duyệt/`curl` mặc định, khó route ở tầng gateway nếu không hỗ trợ content negotiation | Nội bộ, team đã quen tooling xử lý header |
+| Query param (`?version=2`) | `/tasks?version=2` | Dễ thêm không cần đổi routing | Dễ bị quên, dễ bị cache proxy hiểu sai (query param đôi khi bị strip) | Ít dùng cho production API nghiêm túc |
+
+`taskflow-api` chọn URL path vì hai lý do cụ thể cho course này: (1) B18 cần nginx route `v1`/`v2` về đúng nơi — `location /api/v1/` và `location /api/v2/` là cấu hình nginx đơn giản nhất có thể viết; (2) khi debug bằng `curl` hay đọc access log, version đang được gọi hiện ngay trên dòng log, không cần parse header.
+
+### Breaking change vs non-breaking change
+
+Đây là ranh giới quan trọng nhất của cả module — quyết định có cần `v2` hay không:
+
+| Thay đổi | Breaking? | Vì sao |
+|---|---|---|
+| Thêm field mới, optional (`assigneeName?: string`) | Không | Client cũ đọc field cũ vẫn đúng, chỉ là không biết field mới tồn tại |
+| Thêm endpoint mới (`GET /api/v1/tasks/:id/history`) | Không | Không ai gọi endpoint đó bị ảnh hưởng, endpoint cũ không đổi |
+| Đổi kiểu một field đang tồn tại (`status: string` → `status: object`) | **Có** | Code client cũ (`if (status === "todo")`) luôn sai kết quả dù không đổi dòng nào |
+| Xoá một field đang tồn tại | **Có** | Client đọc field đó nhận `undefined`, có thể crash |
+| Đổi ý nghĩa một field mà không đổi kiểu (ví dụ `createdAt` từ giờ local sang UTC) | **Có** | Kiểu dữ liệu giống hệt nhưng giá trị sai lệch — vẫn là breaking, chỉ khó phát hiện hơn |
+
+Trường hợp B18: đổi `status` từ string sang `{ value, label }` rõ ràng là breaking change kiểu "đổi kiểu field". Có hai lựa chọn: (a) chấp nhận phá `v1` và bắt mọi client migrate ngay, hoặc (b) giữ `v1` y nguyên, đưa shape mới vào `v2`. Lab này chọn (b) — đúng tinh thần "thêm tính năng mới mà không phá client cũ" của cả module.
+
+### Cùng một service, khác serializer
+
+```ts title="src/serializers/task-serializer.ts"
+import type { TaskRow } from "../services/tasks-service";
+
+const STATUS_LABEL_VI: Record<TaskRow["status"], string> = {
+  todo: "Cần làm",
+  in_progress: "Đang làm",
+  done: "Xong",
+};
+
+/** Shape v1: `status` giữ nguyên là string — KHÔNG được đổi từ B03. */
+export function serializeTaskV1(task: TaskRow) {
+  return {
+    id: task.id,
+    projectId: task.projectId,
+    title: task.title,
+    status: task.status, // vẫn là "todo" | "in_progress" | "done"
+    assigneeId: task.assigneeId,
+    createdAt: task.createdAt,
+  };
+}
+
+/** Shape v2: `status` trở thành object có value + label. */
+export function serializeTaskV2(task: TaskRow) {
+  return {
+    id: task.id,
+    projectId: task.projectId,
+    title: task.title,
+    status: { value: task.status, label: STATUS_LABEL_VI[task.status] },
+    assigneeId: task.assigneeId,
+    createdAt: task.createdAt,
+  };
+}
+```
+
+```ts title="src/routes/v2/tasks.ts"
+import type { FastifyPluginAsync } from "fastify";
+import { listTasksByProject } from "../../services/tasks-service"; // hàm CHUNG với v1, không đổi
+import { serializeTaskV2 } from "../../serializers/task-serializer";
+
+export const tasksV2Routes: FastifyPluginAsync = async (fastify) => {
+  fastify.get("/tasks", async (request) => {
+    const { projectId } = request.query as { projectId: string };
+    const tasks = await listTasksByProject(projectId); // cùng nguồn dữ liệu với v1
+    return { data: tasks.map(serializeTaskV2) };
+  });
+};
+```
+
+```ts title="src/app.ts"
+fastify.register(tasksV1Routes, { prefix: "/api/v1" }); // đã có từ B02, KHÔNG sửa
+fastify.register(tasksV2Routes, { prefix: "/api/v2" }); // mới thêm ở B18
+```
+
+Điểm mấu chốt: `listTasksByProject` không hề biết về "v1" hay "v2" — nó chỉ trả dữ liệu thô từ Postgres. Việc trình bày khác nhau hoàn toàn nằm ở serializer, tại tầng route. Nếu sau này phát hiện bug logic đọc dữ liệu (ví dụ N+1 query), sửa MỘT chỗ là cả hai version đều được lợi.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Gọi v1 — status vẫn là string như trước B18", command: "curl -s localhost:3000/api/v1/tasks/7f2e... | jq .status", output: '"todo"' },
+    { comment: "Gọi v2 cùng task đó — status giờ là object", command: "curl -s localhost:3000/api/v2/tasks/7f2e... | jq .status", output: '{\n  "value": "todo",\n  "label": "Cần làm"\n}' },
+    { comment: "Chạy test đảm bảo cả hai đọc đúng cùng một hàng dữ liệu", command: "pnpm test -- tasks-versioning", output: "✓ v1 giữ nguyên status string (12ms)\n✓ v2 trả status dạng object cho cùng task (9ms)\n\nTest Files  1 passed (1)" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Viết một hàm `listTasksByProjectV2` riêng "cho chắc" thay vì tái dùng `listTasksByProject`. Làm vậy tạo ra hai đường đọc dữ liệu song song — nếu sau này sửa logic lọc task đã xoá mềm (soft delete) ở một hàm mà quên hàm kia, `v1` và `v2` sẽ trả kết quả khác nhau cho cùng một trạng thái dữ liệu, một loại bug rất khó phát hiện qua test thủ công.
+</Callout>
+
+<Callout type="tip">
+  Khi phân vân "cái này có cần `v2` không?", tự hỏi: "nếu tôi là client `v1` đang chạy production, code của tôi có tiếp tục chạy đúng sau khi deploy thay đổi này không?" — nếu câu trả lời là có ở MỌI trường hợp hợp lệ, đó là non-breaking.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "URL-path versioning", meaning: "Đặt số hiệu version ngay trên đường dẫn (`/api/v1`, `/api/v2`) thay vì trong header hay query param." },
+    { term: "breaking change", meaning: "Thay đổi khiến code client hợp lệ trước đó có thể chạy sai hoặc crash mà không đổi gì ở phía client." },
+    { term: "non-breaking change", meaning: "Thay đổi (thường là thêm mới) không ảnh hưởng tới client đang dùng shape cũ." },
+    { term: "serializer", meaning: "Hàm chuyển dữ liệu thô (từ DB) thành shape JSON cụ thể trả về client — nơi khác biệt version nên nằm ở đây." },
+    { term: "contract", meaning: "Cam kết về shape/kiểu dữ liệu một API version trả về — vi phạm contract là breaking change dù server không lỗi." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao `/api/v2/tasks` gọi lại đúng `listTasksByProject()` thay vì viết một hàm đọc dữ liệu riêng cho v2?"
+  options={[
+    "Vì Fastify bắt buộc các route phải dùng chung hàm service",
+    "Vì cả hai version phục vụ CÙNG một nguồn dữ liệu thật — tái dùng đảm bảo v1 và v2 không bao giờ lệch nhau về logic đọc dữ liệu, chỉ khác cách trình bày ở serializer",
+    "Vì viết hàm riêng sẽ chậm hơn về hiệu năng",
+    "Vì TypeScript không cho phép hai route dùng chung một import",
+  ]}
+  answerIndex={1}
+  explanation="Tách biệt đúng chỗ: logic đọc dữ liệu (service) dùng chung, logic trình bày (serializer) khác nhau theo version. Nếu để lệch ở tầng đọc dữ liệu, hai version có thể âm thầm trả về hai 'sự thật' khác nhau cho cùng một task."
+/>

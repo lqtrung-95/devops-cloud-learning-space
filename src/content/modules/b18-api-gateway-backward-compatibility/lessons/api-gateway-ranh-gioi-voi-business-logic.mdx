@@ -1,0 +1,117 @@
+import { GatewayVsServiceBoundaryDiagram } from "../diagrams/gateway-vs-service-boundary-diagram";
+
+<Eli5 title="Bảo vệ ở sảnh, không phải nhân viên trong văn phòng" emoji="🛡️">
+  Bảo vệ đứng ở sảnh toà nhà làm ba việc: kiểm tra thẻ ra vào (auth passthrough), đếm số người vào mỗi phút để tránh quá tải thang máy (rate limit), và chỉ đúng tầng cho khách (routing). Bảo vệ KHÔNG biết — và không cần biết — công ty ở tầng 5 đang duyệt hợp đồng gì, hay công ty ở tầng 8 tính lương nhân viên ra sao. Đó là việc của từng văn phòng.
+
+  `nginx` trong `taskflow-api` chính là bảo vệ đó. Nó route `/api/v1` và `/api/v2` về đúng `api`, đếm request mỗi giây — nhưng không hề mở payload JSON ra đọc `status` là gì.
+</Eli5>
+
+<GatewayVsServiceBoundaryDiagram />
+
+<Technical>
+
+### Gateway làm gì ở biên hệ thống
+
+| Trách nhiệm | Ở gateway (`nginx`) | Ở service (`api`) |
+|---|---|---|
+| Routing | Có — theo path (`/api/v1/` → `api_upstream`) | Không |
+| Rate limit | Có — theo IP, không quan tâm nội dung request | Không (trừ rate limit rất đặc thù theo nghiệp vụ, ví dụ giới hạn số lần mời thành viên/ngày — đó lại là business rule, thuộc `api`) |
+| TLS termination, chuẩn hoá header | Có | Không |
+| Auth passthrough (chuyển tiếp token) | Có — chỉ chuyển tiếp | Không — nhưng **quyết định** token có hợp lệ và có quyền gì thuộc về `api` |
+| Business validation (`title` không rỗng) | Không | Có — Zod schema từ B03 |
+| Authorization theo domain (role trong `organization`) | Không | Có — middleware từ B06 |
+| Chọn serializer v1/v2 | Không | Có — nằm ngay trong route handler |
+
+Ranh giới rút gọn: **gateway xử lý những gì giống nhau bất kể request đang làm gì** (path nào, bao nhiêu request/giây, ai đang gọi ở tầng hạ tầng) — còn **service xử lý những gì phụ thuộc vào ý nghĩa của request đó** (tạo task, xoá comment, ai được phép làm gì).
+
+### Vì sao trộn hai thứ là nguy hiểm
+
+Nếu đặt business validation (ví dụ kiểm tra `title` task không rỗng) vào `nginx` bằng Lua script: mỗi lần đổi một quy tắc nghiệp vụ nhỏ (thêm điều kiện `title` tối đa 200 ký tự), người phải động vào là đội hạ tầng quản lý `nginx.conf`, không phải đội backend đang sở hữu domain đó. Việc deploy gateway (vốn nên hiếm khi đổi) bị trói vào tốc độ thay đổi của business logic (vốn đổi liên tục) — ngược hoàn toàn với lý do tách gateway ra làm một lớp riêng.
+
+### Cấu hình `nginx` — rate limit + routing cho cả hai version
+
+`nginx` đã được thêm ở B17 như reverse proxy trần (`ports: ["8081:80"]`, `proxy_pass http://api:3000`). B18 KHÔNG thêm service mới vào `docker-compose.yml` — chỉ sửa `nginx.conf` để nó thật sự làm việc của một gateway.
+
+```nginx title="nginx/nginx.conf"
+http {
+  # 10 request/giây cho mỗi IP, bộ nhớ đếm 10MB (đủ theo dõi hàng trăm nghìn IP)
+  limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+
+  upstream api_upstream {
+    server api:3000; # đúng tên service + port trong docker-compose.yml, không đổi
+  }
+
+  server {
+    listen 80;
+
+    location /api/v1/ {
+      limit_req zone=api_limit burst=20 nodelay;
+      proxy_pass http://api_upstream;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location /api/v2/ {
+      limit_req zone=api_limit burst=20 nodelay;
+      proxy_pass http://api_upstream;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+    }
+  }
+}
+```
+
+Cả hai `location` trỏ về CÙNG một `upstream api_upstream` — đúng như lesson 1: hai version chia sẻ một service, gateway chỉ định tuyến theo path chứ không tách hạ tầng theo version. `burst=20 nodelay` cho phép request dồn dập ngắn hạn (ví dụ trình duyệt gọi vài request gần như đồng thời khi tải trang) không bị chặn oan, trong khi vẫn giữ giới hạn trung bình `10r/s`.
+
+| Tham số | Ý nghĩa |
+|---|---|
+| `rate=10r/s` | Tốc độ trung bình cho phép mỗi IP |
+| `burst=20` | Số request được xếp hàng chờ thay vì bị từ chối ngay khi vượt rate |
+| `nodelay` | Xử lý request trong `burst` ngay lập tức thay vì làm chậm lại (trade-off: phản hồi nhanh hơn nhưng dễ chạm giới hạn `burst` hơn) |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra cú pháp trước khi reload", command: "docker compose exec nginx nginx -t", output: "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok\nnginx: configuration file /etc/nginx/nginx.conf test is successful" },
+    { comment: "Áp dụng cấu hình mới, không cần restart container", command: "docker compose exec nginx nginx -s reload", output: "" },
+    { comment: "Gọi qua gateway (cổng 8081) thay vì gọi thẳng api:3000", command: "curl -s localhost:8081/api/v1/tasks | jq '.data | length'", output: "12" },
+    {
+      comment: "Vượt rate limit — các request đầu OK, sau đó bị nginx chặn",
+      command: "for i in $(seq 1 40); do curl -s -o /dev/null -w '%{http_code}\\n' localhost:8081/api/v1/tasks; done | sort | uniq -c",
+      output: "     22 200\n     18 503",
+    },
+  ]}
+/>
+
+<Callout type="warning" title="503 từ nginx không phải lỗi của api">
+  Khi thấy `503` trong log, đừng vội mở log `api` tìm nguyên nhân — với `nodelay`, request vượt `burst` bị `nginx` từ chối NGAY TẠI GATEWAY, `api` không hề nhận được request đó. Log của `api` sẽ hoàn toàn sạch trong lúc `nginx` đang chặn. Kiểm tra `docker compose logs nginx` trước.
+</Callout>
+
+<Callout type="mistake">
+  Đặt `limit_req_zone` bên trong block `server {}` thay vì `http {}`. Directive này định nghĩa một zone (vùng nhớ chia sẻ) nên phải khai báo ở phạm vi `http`, sau đó mới được tham chiếu bằng `limit_req zone=... ;` bên trong `location`. Khai báo sai chỗ khiến `nginx -t` báo lỗi cú pháp ngay lập tức — dễ phát hiện, nhưng dễ mất thời gian nếu không biết nhìn đúng chỗ.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "API Gateway", meaning: "Lớp trung gian ở biên hệ thống xử lý routing, rate limit và các việc chung khác cho mọi request, tách biệt khỏi business logic của service." },
+    { term: "cross-cutting concern", meaning: "Mối quan tâm áp dụng đồng đều cho mọi request bất kể nội dung nghiệp vụ — ví dụ rate limit, logging, TLS." },
+    { term: "upstream (nginx)", meaning: "Nhóm server phía sau mà nginx chuyển tiếp request tới — ở đây chỉ có một: `api:3000`." },
+    { term: "limit_req_zone", meaning: "Directive nginx định nghĩa vùng nhớ đếm request theo một khoá (ở đây là IP) để áp rate limit." },
+    { term: "burst / nodelay", meaning: "Tham số kiểm soát request vượt rate trung bình: burst là hàng đợi cho phép, nodelay xử lý ngay thay vì làm chậm." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một dev đề xuất thêm đoạn kiểm tra `title` task không được rỗng ngay trong `nginx.conf` bằng Lua, để 'chặn sớm request lỗi trước khi tới api'. Vì sao đây là ý tưởng đi ngược lại ranh giới gateway/service của bài học?"
+  options={[
+    "Vì nginx không có khả năng chạy bất kỳ đoạn script nào",
+    "Vì việc kiểm tra `title` là business validation gắn với domain `taskflow-api` (đã ở B03 với Zod) — đặt nó ở gateway làm hạ tầng và nghiệp vụ bị trói vào nhau, mỗi lần đổi rule nghiệp vụ nhỏ lại phải đụng vào cấu hình gateway, và logic bị nhân đôi ở hai nơi",
+    "Vì Lua chạy chậm hơn JavaScript nên không nên dùng trong mọi trường hợp",
+    "Vì nginx chỉ được phép route request, tuyệt đối không được từ chối bất kỳ request nào",
+  ]}
+  answerIndex={1}
+  explanation="Gateway nên chỉ xử lý cross-cutting concern (routing, rate limit) — những gì áp dụng như nhau bất kể request làm gì. Business validation thay đổi theo domain và nên ở một chỗ duy nhất (service) để tránh trôi lệch logic giữa hai nơi."
+/>
