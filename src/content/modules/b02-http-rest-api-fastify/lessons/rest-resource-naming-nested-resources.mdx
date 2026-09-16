@@ -1,0 +1,126 @@
+import { RestNestedResourceRoutingDiagram } from "../diagrams/rest-nested-resource-routing-diagram";
+
+<Eli5 title="URL là địa chỉ nhà, không phải câu lệnh" emoji="🏠">
+  Địa chỉ nhà không bao giờ viết "hãy đi tới nhà số 5" — nó chỉ ghi "nhà số 5, ngõ 3, phố ABC". Ai muốn "đi tới" hay "rời khỏi" là việc của người đọc địa chỉ (method HTTP), không phải của bản thân địa chỉ.
+
+  REST URL cũng vậy: `/api/v1/projects/prj_123` là **địa chỉ của một project**, không phải "lệnh lấy project". Muốn đọc thì dùng `GET`, muốn sửa thì dùng `PATCH` — cùng một địa chỉ, khác method là khác việc.
+
+  Khi một thứ luôn "sống bên trong" thứ khác — như task luôn thuộc về đúng 1 project — địa chỉ của nó nên thể hiện quan hệ đó: `/projects/:id/tasks`, giống ghi "phòng 5, tầng 3, toà B" thay vì chỉ ghi "phòng 5" trống không biết ở toà nào.
+</Eli5>
+
+<RestNestedResourceRoutingDiagram />
+
+<Technical>
+
+### Quy tắc đặt tên resource
+
+| Quy tắc | Đúng | Sai |
+|---|---|---|
+| Danh từ số nhiều cho collection | `/projects`, `/tasks` | `/project`, `/getProjects` |
+| Không có động từ trong URL | `POST /projects` (tạo) | `POST /createProject` |
+| `:id` xác định 1 resource cụ thể | `/projects/:id` | `/projects?id=...` cho thao tác sửa/xoá |
+| Lồng resource khi có quan hệ cha-con bắt buộc | `/projects/:id/tasks` | `/tasks?projectId=...` khi tạo task mới |
+| Không lồng quá 2 cấp | `/projects/:id/tasks` | `/organizations/:id/projects/:id/tasks/:id/comments` |
+
+### Khi nào lồng (nested), khi nào để phẳng (flat)?
+
+Lồng resource hợp lý khi **con luôn cần cha để xác định phạm vi** — điển hình là tạo mới và liệt kê:
+
+```ts title="src/routes/tasks.ts — nested cho tạo/liệt kê"
+fastify.get("/projects/:projectId/tasks", async (request, reply) => {
+  const { projectId } = request.params as { projectId: string };
+  if (!fastify.store.projects.has(projectId)) {
+    return reply.code(404).send({ error: `Project ${projectId} không tồn tại` });
+  }
+  const tasks = Array.from(fastify.store.tasks.values()).filter((task) => task.projectId === projectId);
+  return tasks;
+});
+
+fastify.post("/projects/:projectId/tasks", async (request, reply) => {
+  const { projectId } = request.params as { projectId: string };
+  const body = request.body as { title?: string };
+  if (!fastify.store.projects.has(projectId)) return reply.code(404).send({ error: "Project không tồn tại" });
+  if (!body.title) return reply.code(400).send({ error: "title là bắt buộc" });
+
+  const task = {
+    id: `tsk_${Date.now().toString(36)}`,
+    projectId, // lấy từ URL, KHÔNG lấy từ body — tránh client tự ý gán task vào project khác
+    title: body.title,
+    description: "",
+    status: "todo" as const,
+    assigneeId: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  fastify.store.tasks.set(task.id, task);
+  return reply.code(201).header("Location", `/api/v1/tasks/${task.id}`).send(task);
+});
+```
+
+Khi thao tác trên **1 resource đã có id duy nhất**, route phẳng đơn giản hơn — không cần đồng bộ lại `projectId` mỗi lần sửa:
+
+```ts title="src/routes/tasks.ts — flat cho đọc/sửa 1 task"
+fastify.get("/tasks/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const task = fastify.store.tasks.get(id);
+  if (!task) return reply.code(404).send({ error: "Task không tồn tại" });
+  return task;
+});
+
+fastify.patch("/tasks/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const task = fastify.store.tasks.get(id);
+  if (!task) return reply.code(404).send({ error: "Task không tồn tại" });
+
+  const updates = request.body as Partial<{ status: "todo" | "in_progress" | "done"; assigneeId: string | null }>;
+  const updated = { ...task, ...updates, updatedAt: new Date().toISOString() };
+  fastify.store.tasks.set(id, updated);
+  return updated;
+});
+```
+
+### Content negotiation — vì sao B02 chưa cần lo nhiều
+
+`taskflow-api` chỉ trả `application/json` — client gửi header `Accept: application/json` (hoặc không gửi gì, JSON vẫn là mặc định). Fastify tự set `Content-Type: application/json; charset=utf-8` khi bạn trả về object/array JS thường (không cần gọi `reply.type()` thủ công). Content negotiation phức tạp hơn (trả XML/CSV theo `Accept` header) chỉ cần thiết khi có client thật sự yêu cầu định dạng khác — không phải mặc định cho mọi API.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Liệt kê task của đúng 1 project — nested resource", command: "curl -s http://localhost:3000/api/v1/projects/prj_8f2c1a/tasks | jq", output: "[\n  { \"id\": \"tsk_m1a2b3\", \"projectId\": \"prj_8f2c1a\", \"title\": \"Thiết kế trang chủ\", \"status\": \"todo\" }\n]" },
+    { comment: "Sửa 1 task bằng route phẳng — không cần biết lại projectId", command: "curl -i -X PATCH http://localhost:3000/api/v1/tasks/tsk_m1a2b3 \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"status\":\"in_progress\"}'", output: "HTTP/1.1 200 OK\nContent-Type: application/json; charset=utf-8\n\n{\"id\":\"tsk_m1a2b3\",\"projectId\":\"prj_8f2c1a\",\"title\":\"Thiết kế trang chủ\",\"status\":\"in_progress\",...}" },
+    { comment: "Tạo task cho project không tồn tại — nested resource tự chặn đúng ở đây", command: "curl -i -X POST http://localhost:3000/api/v1/projects/khong-ton-tai/tasks -d '{\"title\":\"x\"}'", output: "HTTP/1.1 404 Not Found\n\n{\"error\":\"Project không tồn tại\"}" },
+  ]}
+/>
+
+<Callout type="mistake" title="Lỗi hay gặp: lấy projectId từ body thay vì URL">
+  Route `POST /projects/:projectId/tasks` mà code lại đọc `request.body.projectId` thay vì `request.params.projectId` — client có thể gửi `projectId` khác trong body và tạo task "lạc" vào project mà URL không hề nhắc tới. URL đã xác định phạm vi (`projectId` trong `:projectId`), body chỉ nên chứa dữ liệu của resource mới (`title`, `description`...).
+</Callout>
+
+<Callout type="info">
+  Quy tắc này còn quan trọng hơn ở B06 (multi-tenant RBAC): `organizationId` sẽ luôn lấy từ token đã xác thực, không bao giờ tin vào giá trị client tự gửi trong body hay query — đúng tinh thần "đừng lấy phạm vi từ dữ liệu client có thể tự ý sửa".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "resource", meaning: "Một 'thứ' có thể thao tác qua HTTP, đại diện bởi một URL — project, task..." },
+    { term: "collection", meaning: "Tập hợp nhiều resource cùng loại, đặt tên số nhiều: /projects." },
+    { term: "nested resource", meaning: "Resource lồng dưới resource cha khi con luôn thuộc về đúng 1 cha đó." },
+    { term: "flat route", meaning: "Route thao tác trực tiếp bằng id duy nhất, không cần lồng lại resource cha." },
+    { term: "content negotiation", meaning: "Cơ chế client/server thoả thuận định dạng response qua header Accept." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao `POST /api/v1/projects/:projectId/tasks` nên lấy `projectId` từ URL (`request.params`) thay vì từ `request.body`?"
+  options={[
+    "Vì `request.params` nhanh hơn `request.body`",
+    "Vì body có thể chứa `projectId` khác do client tự gửi, phá vỡ đúng phạm vi mà URL đã xác định",
+    "Vì Fastify không cho phép đọc `projectId` từ body",
+    "Vì `request.body` chỉ dùng được với method GET",
+  ]}
+  answerIndex={1}
+  explanation="URL đã xác định rõ phạm vi (project nào). Nếu code lại tin vào projectId trong body, client có thể cố ý gửi giá trị khác và tạo dữ liệu sai chỗ — URL phải là nguồn sự thật duy nhất cho phạm vi của nested resource."
+/>

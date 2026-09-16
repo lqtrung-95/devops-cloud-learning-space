@@ -1,0 +1,90 @@
+import { HttpStatusCodeDecisionTreeDiagram } from "../diagrams/http-status-code-decision-tree-diagram";
+
+<Eli5 title="Status code giống như biên nhận ở bưu điện" emoji="📮">
+  Khi bạn gửi thư ở bưu điện, nhân viên không chỉ nói "xong rồi" — họ đưa một **biên nhận** ghi rõ chuyện gì đã xảy ra: "đã nhận, sẽ giao" (thành công), "thiếu tem" (lỗi của bạn), "địa chỉ không tồn tại" (không tìm thấy), hoặc "hòm thư đang khoá, không nhét thêm được" (xung đột).
+
+  HTTP status code chính là biên nhận đó. Client (trình duyệt, app mobile, script test) không cần đọc hết nội dung response để biết chuyện gì xảy ra — chỉ cần nhìn 3 chữ số đầu tiên.
+
+  Method (GET/POST/PATCH/DELETE) là **loại việc bạn nhờ bưu điện làm** — gửi thư mới khác với hỏi thăm thư cũ, khác với huỷ một lá thư.
+</Eli5>
+
+Trong `taskflow-api`, mọi CRUD của B02 đều xoay quanh 2 việc: chọn đúng **method** cho hành động, và trả đúng **status code** cho từng kết quả — kể cả các case lỗi. Sai một trong hai, client (hoặc chính bạn 3 tháng sau) sẽ phải đoán mò dựa vào nội dung body thay vì dựa vào chuẩn HTTP.
+
+<HttpStatusCodeDecisionTreeDiagram />
+
+<Technical>
+
+### HTTP method — đúng nghĩa, không phải thói quen
+
+| Method | Dùng khi | Idempotent? | Có body request? |
+|---|---|---|---|
+| `GET` | Đọc resource, không thay đổi gì | Có | Không |
+| `POST` | Tạo resource mới (hoặc hành động không idempotent) | Không | Có |
+| `PATCH` | Sửa một phần resource đã tồn tại | Không (thường) | Có |
+| `PUT` | Thay thế toàn bộ resource | Có | Có |
+| `DELETE` | Xoá resource | Có | Thường không |
+
+`taskflow-api` dùng `PATCH` cho việc sửa `project`/`task` (chỉ gửi field muốn đổi, ví dụ `{ "status": "done" }`) thay vì `PUT` — vì client hiếm khi có đủ toàn bộ resource để thay thế trọn vẹn.
+
+**Idempotent** nghĩa là gọi lại nhiều lần cho cùng kết quả cuối cùng như gọi 1 lần. `DELETE /projects/:id` gọi 2 lần vẫn kết thúc với "project không còn tồn tại" — idempotent. `POST /projects` gọi 2 lần tạo ra 2 project khác nhau — không idempotent.
+
+### Status code theo nhóm
+
+| Nhóm | Ý nghĩa | Hay dùng trong B02 |
+|---|---|---|
+| `2xx` | Thành công | `200` (đọc/sửa OK), `201` (tạo mới OK), `204` (xoá OK, không có body) |
+| `4xx` | Lỗi do client | `400` (thiếu/sai field), `404` (không tìm thấy resource), `409` (xung đột trạng thái) |
+| `5xx` | Lỗi do server | `500` (bug/crash — không phải lỗi bạn cố tình trả) |
+
+### 4 status code cần phân biệt rõ trong CRUD
+
+- **`201 Created`** — tạo thành công. Nên kèm header `Location` trỏ tới resource vừa tạo, ví dụ `Location: /api/v1/projects/prj_8f2c`.
+- **`204 No Content`** — thao tác thành công nhưng cố tình không trả body (điển hình: `DELETE`). Response không có `Content-Type`, không có body.
+- **`404 Not Found`** — resource được tham chiếu (`:id` trong URL) không tồn tại. Request đúng hình thức, chỉ là không có gì ở đó.
+- **`409 Conflict`** — resource CÓ tồn tại, nhưng thao tác hiện tại vi phạm một ràng buộc trạng thái. Ví dụ: xoá một `project` khi nó vẫn còn `task` bên trong.
+
+`400` khác `404` khác `409` ở một điểm mấu chốt: `400` là lỗi *hình thức* của request (thiếu field, sai kiểu dữ liệu) — server còn chưa kịp tìm resource. `404`/`409` là lỗi *ngữ nghĩa* sau khi đã tìm/xác định được resource.
+
+### Safe method — không chỉ là idempotent
+
+`GET` còn có một tính chất mạnh hơn idempotent: **safe** — nghĩa là không được phép gây ra tác dụng phụ nào (không ghi log nghiệp vụ, không tăng bộ đếm, không đổi trạng thái) chỉ vì client gọi `GET`. Lý do thực tế: trình duyệt, proxy, hay công cụ prefetch có thể tự động gọi lại `GET` nhiều lần mà không hỏi ý người dùng — nếu `GET /projects/:id` vô tình xoá luôn project, bạn sẽ có bug rất khó tái hiện. Trong `taskflow-api`, mọi route `GET` chỉ đọc từ `Map`, không bao giờ `.set()` hay `.delete()`.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo project thành công — kỳ vọng 201 + header Location", command: "curl -i -X POST http://localhost:3000/api/v1/projects \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"organizationId\":\"org_1\",\"name\":\"Website Revamp\"}'", output: "HTTP/1.1 201 Created\nLocation: /api/v1/projects/prj_8f2c1a\nContent-Type: application/json; charset=utf-8\n\n{\"id\":\"prj_8f2c1a\",\"organizationId\":\"org_1\",\"name\":\"Website Revamp\",\"createdAt\":\"2026-09-16T02:10:00.000Z\"}" },
+    { comment: "Thiếu field name — kỳ vọng 400", command: "curl -i -X POST http://localhost:3000/api/v1/projects \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"organizationId\":\"org_1\"}'", output: "HTTP/1.1 400 Bad Request\nContent-Type: application/json; charset=utf-8\n\n{\"error\":\"name là bắt buộc\"}" },
+    { comment: "Đọc project không tồn tại — kỳ vọng 404", command: "curl -i http://localhost:3000/api/v1/projects/khong-ton-tai", output: "HTTP/1.1 404 Not Found\nContent-Type: application/json; charset=utf-8\n\n{\"error\":\"Project không tồn tại\"}" },
+    { comment: "Project còn task bên trong — xoá phải bị chặn với 409, KHÔNG phải 404", command: "curl -i -X DELETE http://localhost:3000/api/v1/projects/prj_8f2c1a", output: "HTTP/1.1 409 Conflict\nContent-Type: application/json; charset=utf-8\n\n{\"error\":\"Project còn 2 task, xoá task trước khi xoá project\"}" },
+    { comment: "Xoá hết task rồi thử lại — lần này thành công", command: "curl -i -X DELETE http://localhost:3000/api/v1/projects/prj_8f2c1a", output: "HTTP/1.1 204 No Content" },
+  ]}
+/>
+
+<Callout type="mistake" title="Lỗi hay gặp: trả 200 cho mọi thứ">
+  Rất nhiều API trả `200 OK` kèm `{ "success": false, "message": "not found" }` cho mọi lỗi. Client buộc phải đọc và parse body để biết chuyện gì xảy ra — mất hết lợi ích của HTTP status code, và các công cụ chuẩn (browser cache, API gateway, load balancer health check) sẽ hiểu sai là request đã thành công.
+</Callout>
+
+<Callout type="tip">
+  Không chắc dùng status nào? Tự hỏi 3 câu theo đúng thứ tự: (1) Request có đúng hình thức không (đủ field, đúng kiểu)? Sai → `400`. (2) Resource được nhắc tới có tồn tại không? Không → `404`. (3) Trạng thái hiện tại có cho phép thao tác này không? Không → `409`. Còn lại → `2xx`.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "idempotent", meaning: "Gọi lại nhiều lần cho cùng kết quả cuối cùng như gọi 1 lần (GET, PUT, DELETE)." },
+    { term: "201 Created", meaning: "Tạo resource mới thành công, nên kèm header Location." },
+    { term: "204 No Content", meaning: "Thành công nhưng cố tình không có body trả về." },
+    { term: "404 Not Found", meaning: "Resource được tham chiếu trong URL không tồn tại." },
+    { term: "409 Conflict", meaning: "Resource tồn tại nhưng thao tác vi phạm ràng buộc trạng thái hiện tại." },
+    { term: "Location header", meaning: "Header trả về sau 201, trỏ tới resource vừa được tạo." },
+  ]}
+/>
+
+<QuickCheck
+  question="`PATCH /api/v1/tasks/:id` với `id` không tồn tại trong `Map`. Status code đúng là gì?"
+  options={["400 Bad Request", "404 Not Found", "409 Conflict", "204 No Content"]}
+  answerIndex={1}
+  explanation="Request đúng hình thức (PATCH hợp lệ, body hợp lệ) — vấn đề là resource với id đó không tồn tại. Đây là case kinh điển của 404, không phải 400."
+/>

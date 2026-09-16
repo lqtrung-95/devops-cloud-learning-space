@@ -1,0 +1,126 @@
+import { FastifyPluginEncapsulationDiagram } from "../diagrams/fastify-plugin-encapsulation-diagram";
+
+<Eli5 title="Mỗi plugin Fastify là một phòng ban riêng trong công ty" emoji="🏢">
+  Tưởng tượng `taskflow-api` là một công ty. Nếu nhét toàn bộ nhân viên vào một phòng lớn (một file `app.ts` khổng lồ chứa mọi route), ai làm gì cũng đụng nhau và rất khó tìm người phụ trách việc gì.
+
+  Fastify để bạn chia thành **phòng ban** — mỗi `fastify.register(plugin)` tạo một "phòng" riêng: phòng `projectRoutes` lo mọi thứ về project, phòng `taskRoutes` lo mọi thứ về task. Đồ dùng chung của công ty (tủ hồ sơ, wifi) thì đặt ở sảnh chính (context gốc) để phòng nào cũng dùng được. Nhưng ghi chú riêng của phòng project thì phòng task không tự nhiên đọc được — trừ khi bạn cố tình dán nó ở sảnh chính.
+
+  "Ghi chú dán ở sảnh chính" chính là ẩn dụ cho `fastify-plugin` (`fp`) trong phần Technical bên dưới.
+</Eli5>
+
+Việc chia route theo plugin không phải chỉ để code gọn — nó còn quyết định **decorator nào (hàm/dữ liệu gắn vào `fastify`) nhìn thấy được ở đâu**. Hiểu sai điều này là nguồn lỗi phổ biến nhất khi mới học Fastify: gọi một hàm decorator tưởng dùng chung được nhưng thực ra chỉ tồn tại trong 1 plugin.
+
+<FastifyPluginEncapsulationDiagram />
+
+<Technical>
+
+### `register()` tạo route và tạo "context" riêng
+
+```ts title="src/app.ts"
+import Fastify from "fastify";
+import fp from "fastify-plugin";
+import { storePlugin } from "./plugins/store.js";
+import { projectRoutes } from "./routes/projects.js";
+import { taskRoutes } from "./routes/tasks.js";
+
+export function buildApp() {
+  const app = Fastify({ logger: true });
+
+  // fp() = "đừng tạo context con riêng cho plugin này" — decorator gắn thẳng lên context gốc.
+  app.register(fp(storePlugin));
+
+  // 2 plugin thường bên dưới, mỗi cái có context (encapsulation) riêng.
+  app.register(projectRoutes, { prefix: "/api/v1/projects" });
+  app.register(taskRoutes, { prefix: "/api/v1" });
+
+  return app;
+}
+```
+
+```ts title="src/plugins/store.ts"
+import type { FastifyInstance } from "fastify";
+import type { Project, Task } from "../types.js";
+
+export async function storePlugin(fastify: FastifyInstance) {
+  fastify.decorate("store", {
+    projects: new Map<string, Project>(),
+    tasks: new Map<string, Task>(),
+  });
+}
+```
+
+```ts title="src/routes/projects.ts"
+import type { FastifyInstance } from "fastify";
+import { randomUUID } from "node:crypto";
+
+export async function projectRoutes(fastify: FastifyInstance) {
+  // Decorator này CHỈ tồn tại trong context của projectRoutes — taskRoutes không thấy được.
+  fastify.decorate("findProjectOrNull", (id: string) => fastify.store.projects.get(id) ?? null);
+
+  fastify.get("/", async () => Array.from(fastify.store.projects.values()));
+
+  fastify.post("/", async (request, reply) => {
+    const body = request.body as { organizationId?: string; name?: string };
+    if (!body.name) return reply.code(400).send({ error: "name là bắt buộc" });
+
+    const project = { id: `prj_${randomUUID().slice(0, 8)}`, organizationId: body.organizationId ?? "org_unknown", name: body.name, createdAt: new Date().toISOString() };
+    fastify.store.projects.set(project.id, project);
+    return reply.code(201).header("Location", `/api/v1/projects/${project.id}`).send(project);
+  });
+}
+```
+
+### Encapsulation — quy tắc 2 chiều
+
+- Decorator ở context **cha** → context **con** thấy được (kế thừa xuôi).
+- Decorator ở context **con** → context cha và các context **anh em khác** **không** thấy được.
+- `fastify-plugin` (`fp()`) đánh dấu "plugin này không tạo context riêng, chạy thẳng trong context cha" — dùng cho những thứ THỰC SỰ cần dùng chung xuyên suốt app (kết nối DB, cấu hình, ở B02 là `store` in-memory). Không lạm dụng `fp()` cho mọi plugin, vì như vậy sẽ mất luôn lợi ích cách ly của encapsulation.
+
+| Tình huống | Có cần `fp()`? |
+|---|---|
+| Decorate dữ liệu/kết nối dùng chung toàn app (DB pool, cache client, `store` in-memory) | Có |
+| Helper chỉ dùng trong route của chính plugin đó (`findProjectOrNull`) | Không |
+| Route handler bình thường | Không liên quan tới `fp()` |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài fastify-plugin (nếu chưa có) — fastify đã có từ B01", command: "pnpm add fastify-plugin" },
+    { comment: "Chạy dev server", command: "pnpm dev", output: "{\"level\":30,\"msg\":\"Server listening at http://0.0.0.0:3000\"}" },
+    { comment: "Danh sách route đã đăng ký — Fastify in ra dạng cây, rất hữu ích để soát prefix", command: "node -e \"import('./dist/app.js').then(m => console.log(m.buildApp().printRoutes()))\"", output: "└── /api/v1/\n    ├── projects (GET, POST)\n    │   └── /:id (GET, PATCH, DELETE)\n    └── projects/:projectId/tasks (GET, POST)" },
+  ]}
+/>
+
+<Callout type="mistake" title="Lỗi hay gặp: decorate quá sớm hoặc sai context">
+  `fastify.decorate("store", ...)` gọi bên trong `projectRoutes` chỉ tạo `store` cho riêng context đó. Nếu `taskRoutes` cũng cần `store`, bạn sẽ thấy lỗi `FastifyError: The decorator 'store' is not present in this scope` khi chạy app — dấu hiệu chắc chắn là decorator đang bị đặt sai tầng, cần chuyển lên plugin bọc `fp()` ở context gốc.
+</Callout>
+
+<Callout type="tip">
+  `fastify.register(plugin, { prefix: "/api/v1/projects" })` — `prefix` chỉ cộng dồn vào path của route bên trong plugin, không ảnh hưởng tới decorator hay context. Đổi `prefix` không bao giờ "sửa" được lỗi thiếu decorator.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "plugin", meaning: "Hàm async nhận `fastify` instance, dùng để đăng ký route/decorator/hook theo nhóm." },
+    { term: "register()", meaning: "Nạp một plugin vào app, tạo context con riêng cho nó (trừ khi bọc fp())." },
+    { term: "encapsulation", meaning: "Cơ chế cách ly: decorator ở context con không lộ ra context cha/anh em." },
+    { term: "decorate()", meaning: "Gắn thêm thuộc tính/hàm vào fastify instance, request hoặc reply." },
+    { term: "fastify-plugin (fp)", meaning: "Package đánh dấu một plugin là 'không encapsulate' — chạy thẳng trong context cha." },
+    { term: "prefix", meaning: "Tiền tố path cộng vào mọi route đăng ký bên trong 1 plugin." },
+  ]}
+/>
+
+<QuickCheck
+  question="`taskRoutes` cần đọc chung `Map` project/task với `projectRoutes`. Cách nào đúng?"
+  options={[
+    "Gọi `fastify.decorate('store', ...)` riêng bên trong mỗi plugin",
+    "Tạo một plugin `storePlugin` bọc bằng `fp()`, đăng ký ở context gốc trước khi đăng ký 2 plugin route",
+    "Import trực tiếp instance `fastify` từ file `projectRoutes` sang `taskRoutes`",
+    "Không cần làm gì, Fastify tự chia sẻ decorator giữa các plugin anh em",
+  ]}
+  answerIndex={1}
+  explanation="fp() làm decorator gắn lên context gốc thay vì context riêng của storePlugin, nên mọi plugin đăng ký sau đó (bao gồm cả anh em) đều kế thừa được — đúng cách dùng chung state giữa các route plugin."
+/>

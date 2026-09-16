@@ -1,0 +1,101 @@
+import { FastifyRequestLifecycleDiagram } from "../diagrams/fastify-request-lifecycle-diagram";
+
+<Eli5 title="Request đi qua dây chuyền trạm kiểm soát ở sân bay" emoji="🛂">
+  Trước khi lên máy bay, hành lý và hành khách đi qua nhiều trạm: soi chiếu an ninh, kiểm tra vé, kiểm tra hộ chiếu, rồi mới tới cửa lên máy bay. Mỗi trạm chỉ làm đúng một việc, và trạm sau chỉ chạy khi trạm trước cho qua.
+
+  **Hook** trong Fastify chính là các trạm đó. Request của client đi qua `onRequest` (vừa vào cổng), `preValidation` (kiểm tra giấy tờ trước khi soát vé), `preHandler` (trạm cuối trước khi vào máy bay), rồi mới tới `handler` (máy bay thật sự cất cánh — code route của bạn chạy), và `onSend` (kiểm tra hành lý lần cuối trước khi đóng cửa khoang).
+
+  Lợi ích: logic dùng chung (log, đo thời gian, sau này là auth) đặt ở đúng trạm, không phải copy-paste vào từng route.
+</Eli5>
+
+<FastifyRequestLifecycleDiagram />
+
+<Technical>
+
+### Vì sao không viết logic chung ngay trong handler?
+
+Nếu copy đoạn "log request + đo thời gian" vào đầu mỗi route handler, thêm 1 route mới là thêm 1 chỗ dễ quên. Hook giải quyết đúng vấn đề này: đăng ký một lần, chạy cho **mọi** route trong phạm vi nó được đăng ký (root app = mọi route, một plugin = chỉ route trong plugin đó).
+
+### Viết hook log request bằng `onRequest` + `onResponse`
+
+```ts title="src/plugins/request-logger.ts"
+import fp from "fastify-plugin";
+import type { FastifyInstance, FastifyRequest } from "fastify";
+
+// Module augmentation: khai báo thêm field cho FastifyRequest để TypeScript không báo lỗi.
+declare module "fastify" {
+  interface FastifyRequest {
+    startTime?: bigint;
+  }
+}
+
+async function requestLoggerPlugin(fastify: FastifyInstance) {
+  fastify.addHook("onRequest", async (request: FastifyRequest) => {
+    request.startTime = process.hrtime.bigint();
+  });
+
+  fastify.addHook("onResponse", async (request, reply) => {
+    const durationMs = request.startTime ? Number(process.hrtime.bigint() - request.startTime) / 1_000_000 : undefined;
+    request.log.info({ method: request.method, url: request.url, statusCode: reply.statusCode, durationMs }, "request completed");
+  });
+}
+
+// fp() vì hook này cần áp dụng cho MỌI route ở mọi plugin, không chỉ context của chính nó.
+export const requestLogger = fp(requestLoggerPlugin);
+```
+
+```ts title="src/app.ts (đăng ký ở root, trước các route plugin)"
+app.register(requestLogger);
+app.register(projectRoutes, { prefix: "/api/v1/projects" });
+app.register(taskRoutes, { prefix: "/api/v1" });
+```
+
+### 5 hook chính và việc điển hình đặt ở mỗi hook
+
+| Hook | Khi nào chạy | Việc điển hình |
+|---|---|---|
+| `onRequest` | Ngay khi request tới, chưa parse body | Gắn `requestId`, bắt đầu đếm thời gian |
+| `preValidation` | Trước khi Fastify validate schema | Chuẩn hoá payload trước khi validate (ví dụ trim string) |
+| `preHandler` | Sau validate, trước khi vào route handler | Kiểm tra quyền hạn — B06 sẽ thêm `requireRole` đúng ở đây |
+| *(handler)* | Route logic của bạn | Đọc/ghi `store`, trả response |
+| `onResponse` | Ngay sau khi response đã gửi xong | Log kết quả, đo latency — không chặn client chờ |
+
+`onSend` (trước `onResponse`, khi payload đã serialize nhưng chưa gửi ra network) cũng hợp lệ để log, nhưng `onResponse` an toàn hơn cho việc đo thời gian vì nó chắc chắn chạy SAU khi response đã rời đi — không góp phần vào latency mà client cảm nhận được.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Gọi một request bất kỳ sau khi đăng ký request-logger", command: "curl -s http://localhost:3000/api/v1/projects -o /dev/null" },
+    { comment: "Xem log — mỗi request có đủ method, url, statusCode, durationMs", command: "pnpm dev", output: "{\"level\":30,\"method\":\"GET\",\"url\":\"/api/v1/projects\",\"statusCode\":200,\"durationMs\":1.42,\"msg\":\"request completed\"}" },
+    { comment: "Kiểm tra hook áp dụng cho cả route lồng task, không chỉ project", command: "curl -s http://localhost:3000/api/v1/projects/prj_8f2c1a/tasks -o /dev/null", output: "{\"level\":30,\"method\":\"GET\",\"url\":\"/api/v1/projects/prj_8f2c1a/tasks\",\"statusCode\":200,\"durationMs\":0.87,\"msg\":\"request completed\"}" },
+  ]}
+/>
+
+<Callout type="warning" title="Đừng để hook throw lỗi im lặng">
+  Nếu hook `onRequest`/`preHandler` throw exception mà không được xử lý, Fastify sẽ trả lỗi cho TOÀN BỘ request đi qua hook đó — kể cả những route không liên quan tới logic bạn vừa thêm. Luôn bọc logic hook trong `try/catch` nếu nó có khả năng lỗi (ví dụ parse JSON thủ công), và test riêng hook đó trước khi đăng ký ở root.
+</Callout>
+
+<Callout type="tip">
+  Thứ tự `app.register()` quan trọng: đăng ký `requestLogger` TRƯỚC các route plugin để hook có hiệu lực với mọi route đăng ký sau đó. Đăng ký sau thì các route đã đăng ký trước sẽ không có hook.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "hook", meaning: "Hàm chạy tự động tại một điểm cố định trong vòng đời xử lý request." },
+    { term: "onRequest", meaning: "Hook chạy sớm nhất, request thô vừa tới, chưa có body đã parse." },
+    { term: "preValidation / preHandler", meaning: "Chạy trước/sau khi Fastify validate schema, trước khi vào handler." },
+    { term: "onSend / onResponse", meaning: "Chạy quanh lúc response được gửi — hợp lý để log, đo latency." },
+    { term: "addHook()", meaning: "API đăng ký một hook cho phạm vi (root hoặc plugin) hiện tại." },
+    { term: "module augmentation", meaning: "Cách TypeScript cho phép thêm field vào interface có sẵn (ví dụ FastifyRequest)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn muốn kiểm tra quyền hạn (authorization) trước khi route handler chạy, nhưng SAU khi Fastify đã validate xong body. Hook nào đúng?"
+  options={["onRequest", "preValidation", "preHandler", "onSend"]}
+  answerIndex={2}
+  explanation="preHandler chạy sau preValidation (đã kiểm tra schema) và ngay trước handler — đúng vị trí để kiểm tra quyền hạn dựa trên payload đã hợp lệ."
+/>
