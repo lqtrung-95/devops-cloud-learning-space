@@ -1,0 +1,123 @@
+import { PresenceHeartbeatStateMachineDiagram } from "../diagrams/presence-heartbeat-state-machine-diagram";
+
+<Eli5 title="Đèn báo 'đang ăn' ở quán ăn, không phải loa phát thanh" emoji="🟢">
+  Quán ăn có một cái đèn nhỏ trên mỗi bàn: còn sáng nghĩa là khách vẫn ngồi. Đèn tắt vài giây sau khi khách đứng dậy đi ra — không cần ai chạy ra kiểm tra bàn liên tục.
+
+  Nhưng nếu quán bật loa phát thanh "bàn 5 vẫn còn khách! bàn 5 vẫn còn khách!" mỗi 15 giây cho *toàn bộ khách hàng trong quán* nghe, thì dù thông tin đúng, nó vô nghĩa và gây ồn. Presence ở quy mô lớn đúng là bài toán đó: biết đúng trạng thái thì dễ, **không hét trạng thái đó ra cho tất cả mọi người mỗi nhịp tim** mới khó.
+</Eli5>
+
+<PresenceHeartbeatStateMachineDiagram />
+
+<Technical title="Heartbeat + TTL: cơ chế cơ bản">
+
+### Vòng đời một trạng thái online
+
+1. Client mở WebSocket, gửi heartbeat định kỳ (ví dụ mỗi 15 giây) — có thể tận dụng chính khung WebSocket ping/pong thay vì tự chế thêm message
+2. Mỗi heartbeat, server `SET presence:<userId> online EX 30` — TTL nên **lớn hơn chu kỳ heartbeat với biên độ an toàn** (ở đây 2×) để chịu được trễ mạng hoặc rớt gói lẻ tẻ
+3. Nếu không có heartbeat nào trong 30 giây, key tự hết hạn trong Redis — không ai phải "chủ động đánh dấu offline"
+
+```ts title="app/src/presence.ts"
+import Redis from "ioredis";
+
+const redis = new Redis(process.env.REDIS_URL ?? "redis://redis:6379");
+const HEARTBEAT_TTL_SECONDS = 30;
+
+export async function recordHeartbeat(userId: string): Promise<void> {
+  await redis.set(`presence:${userId}`, "online", "EX", HEARTBEAT_TTL_SECONDS);
+}
+
+export async function getPresence(userId: string): Promise<"online" | "offline"> {
+  const value = await redis.get(`presence:${userId}`);
+  return value === "online" ? "online" : "offline";
+}
+```
+
+### Phát hiện chuyển sang offline mà không cần polling liên tục
+
+```conf title="redis.conf (trích)"
+notify-keyspace-events Ex   # chỉ bật notification cho sự kiện "expired"
+```
+
+```ts title="app/src/presence-expiry-listener.ts"
+const expirySubscriber = new Redis(process.env.REDIS_URL ?? "redis://redis:6379");
+await expirySubscriber.psubscribe("__keyevent@0__:expired");
+
+expirySubscriber.on("pmessage", async (_pattern, _channel, key) => {
+  if (!key.startsWith("presence:")) return;
+  const userId = key.replace("presence:", "");
+  await announceOffline(userId); // publish 1 lần, không phải mỗi heartbeat
+});
+```
+
+</Technical>
+
+<Technical title="Coalescing: đừng hét mỗi nhịp tim">
+
+### Vấn đề fan-out
+
+Với `C` liên hệ trung bình mỗi user và heartbeat mỗi 15 giây, nếu publish "online" ở **mỗi** heartbeat thay vì chỉ khi trạng thái đổi, số sự kiện fan-out mỗi phiên online kéo dài `T` giây là `(T/15) × C` — tăng tuyến tính theo thời gian online, trong khi trạng thái thực tế gần như không đổi suốt phiên đó.
+
+### Cách coalesce
+
+- Chỉ publish `presence-changed` khi trạng thái **thực sự chuyển** (offline→online, online→away, away→offline) — không publish lại "vẫn online" mỗi heartbeat
+- Debounce khi mạng chập chờn: nếu user connect/disconnect nhiều lần trong vài giây (WiFi yếu, chuyển mạng), chờ trạng thái **ổn định** (ví dụ 5 giây không đổi) rồi mới publish, tránh spam "online, offline, online, offline" liên tục
+- Ở quy mô rất lớn (hàng trăm triệu user), cân nhắc **pull thay vì push**: chỉ tính presence theo yêu cầu (khi client đang hiển thị danh sách liên hệ trên màn hình) thay vì đẩy tới toàn bộ contact list mọi lúc — WhatsApp và các app tương tự thường giới hạn presence hiển thị chi tiết ("last seen") theo từng conversation đang mở, không fan-out toàn cục
+
+### Trade-off tổng kết cho cả case study
+
+| Quyết định | Chọn | Bỏ | Vì sao | Khi nào đổi ý |
+|---|---|---|---|---|
+| Route cross-instance | Fan-out qua Redis pub/sub | Registry lookup (userId → instanceId) | Đơn giản, không có "dữ liệu registry lệch" cần dọn dẹp | Khi số instance lớn (hàng trăm+) và băng thông nội bộ trở thành bottleneck đo được |
+| Thứ tự tin nhắn | Sequence scoped theo conversation | Sequence toàn cục / timestamp client | Đủ đúng cho nhu cầu thực tế, không có điểm ghi tập trung | Gần như không bao giờ cần đổi — global ordering hiếm khi là yêu cầu thật của chat |
+| Data model | Postgres sharded theo `conversation_id` | Wide-column (Cassandra/Scylla) ngay từ đầu | Đơn giản hơn, transaction quen thuộc, đủ tới hàng chục triệu user | Khi throughput ghi vượt khả năng một cụm Postgres đã tối ưu (SD06) |
+| Presence fan-out | Coalesced, chỉ publish khi đổi trạng thái | Publish mỗi heartbeat | Giảm số sự kiện fan-out theo đúng bậc độ lớn | Gần như không bao giờ nên publish mỗi heartbeat ở quy mô > vài nghìn user |
+
+</Technical>
+
+## Thực hành
+
+Đo độ trễ chuyển sang offline và xác nhận coalescing hoạt động.
+
+<Terminal
+  commands={[
+    { comment: "Bật keyspace notification cho sự kiện expired", command: "docker compose exec redis redis-cli CONFIG SET notify-keyspace-events Ex", output: "OK" },
+    { comment: "Client gửi heartbeat mỗi 15s rồi dừng đột ngột ở t=0", command: "node scripts/presence-client.js alice --heartbeat=15s --stop-after=1" },
+    { comment: "Poll trạng thái mỗi giây, ghi thời điểm chuyển sang offline", command: "watch -n1 \"curl -s localhost:8080/presence/alice\"", output: "{\"userId\":\"alice\",\"status\":\"online\"}\n... (30 giây sau) ...\n{\"userId\":\"alice\",\"status\":\"offline\"}" },
+    { comment: "Đếm số sự kiện presence-changed publish ra trong 1 phiên online 2 phút", command: "docker compose logs app | grep -c 'presence-changed published'", output: "1" },
+    { comment: "So sánh: tắt coalescing (biến môi trường DEBUG_NO_COALESCE=1) rồi chạy lại — số sự kiện phải tăng mạnh", command: "docker compose exec -e DEBUG_NO_COALESCE=1 app node -e \"console.log('kiểm tra logic không coalesce')\"" },
+  ]}
+/>
+
+<Callout type="mistake" title="TTL bằng đúng chu kỳ heartbeat">
+  TTL = chu kỳ heartbeat (ví dụ cả hai đều 15s) gây nhấp nháy online/offline giả liên tục: chỉ cần một heartbeat tới trễ vài trăm mili-giây do jitter mạng là key đã hết hạn. Luôn để TTL gấp khoảng 2× chu kỳ heartbeat.
+</Callout>
+
+<Callout type="warning">
+  Presence "chính xác tuyệt đối" không tồn tại trong hệ phân tán — luôn có độ trễ giữa lúc user thực sự rời đi và lúc hệ thống biết điều đó (bằng TTL). Đừng hứa hẹn "real-time 100%" trong design doc; hứa hẹn "phát hiện offline trong vòng ~TTL giây" thì đúng và đo được.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi được hỏi thiết kế presence, nhiều người chỉ dừng ở "heartbeat + TTL" rồi coi như xong. Câu trả lời mạnh hơn nói tiếp: fan-out tới bao nhiêu người, có coalesce không, và ở quy mô cực lớn có nên chuyển sang mô hình pull theo màn hình đang mở thay vì push toàn cục. Đây là điểm phân biệt câu trả lời "biết khái niệm" với câu trả lời "biết vận hành ở quy mô".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "heartbeat", meaning: "Tín hiệu định kỳ client gửi lên để xác nhận vẫn còn kết nối/hoạt động." },
+    { term: "TTL (time-to-live)", meaning: "Thời gian một key tồn tại trước khi tự hết hạn nếu không được làm mới." },
+    { term: "keyspace notification", meaning: "Cơ chế Redis phát sự kiện (như 'expired') khi một key thay đổi trạng thái." },
+    { term: "coalescing/debouncing", meaning: "Gộp nhiều sự kiện gần nhau hoặc chỉ phát khi trạng thái thực sự ổn định, tránh spam." },
+    { term: "push vs pull presence", meaning: "Đẩy trạng thái tới mọi liên hệ (push) so với chỉ tính khi có ai hỏi (pull) — pull rẻ hơn ở quy mô lớn." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn đang thiết kế presence cho app 300 triệu user, mỗi người trung bình 200 liên hệ, muốn tối ưu chi phí fan-out. Cách nào giảm tải nhiều nhất mà vẫn giữ trải nghiệm 'thấy bạn bè online' chấp nhận được?"
+  options={[
+    "Tăng tần suất heartbeat lên mỗi giây để cập nhật nhanh hơn",
+    "Bỏ hẳn TTL, chỉ dựa vào sự kiện disconnect tường minh",
+    "Coalesce (chỉ publish khi đổi trạng thái) kết hợp chuyển sang mô hình pull — chỉ tính/hiển thị presence cho những liên hệ đang thực sự xuất hiện trên màn hình client, thay vì đẩy toàn bộ 200 liên hệ mỗi lần đổi trạng thái",
+    "Chuyển toàn bộ presence sang lưu trong Postgres thay vì Redis",
+  ]}
+  answerIndex={2}
+  explanation="Coalescing loại bỏ phần lớn sự kiện lặp lại vô nghĩa (trạng thái không đổi), còn chuyển sang pull-theo-màn-hình tránh việc tính toán/fan-out cho hàng trăm liên hệ mà user không hề đang nhìn vào lúc đó. Tăng tần suất heartbeat làm vấn đề tệ hơn; bỏ TTL khiến hệ thống không tự phục hồi khi client crash không kịp gửi sự kiện disconnect."
+/>

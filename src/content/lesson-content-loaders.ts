@@ -38,4 +38,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "sd12-microservices-api-design": (lessonSlug) => import(`./modules/sd12-microservices-api-design/lessons/${lessonSlug}.mdx`),
   "sd13-slo-capacity-multi-region": (lessonSlug) => import(`./modules/sd13-slo-capacity-multi-region/lessons/${lessonSlug}.mdx`),
   "sd10-consensus-coordination": (lessonSlug) => import(`./modules/sd10-consensus-coordination/lessons/${lessonSlug}.mdx`),
+  "sd16-case-chat-presence": (lessonSlug) => import(`./modules/sd16-case-chat-presence/lessons/${lessonSlug}.mdx`),
 };

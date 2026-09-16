@@ -1,0 +1,112 @@
+import { ChatConversationShardingDiagram } from "../diagrams/chat-conversation-sharding-diagram";
+
+<Eli5 title="Xây một tổng đài bưu điện trước khi lắp đường dây" emoji="☎️">
+  Trước khi kéo dây điện thoại cho cả thành phố, tổng đài phải biết vài thứ: có bao nhiêu người dùng máy cùng lúc, mỗi người gọi mấy cuộc một ngày, và cuộc gọi lỡ đứt giữa chừng thì có cần nối lại đúng chỗ không.
+
+  Chat cũng vậy. Trước khi vẽ "WebSocket gateway" hay "Redis pub/sub", phải trả lời: 1-1 hay group, bao nhiêu người *đang mở app cùng lúc* (không phải tổng user), và tin nhắn có được phép mất hay không. Câu trả lời quyết định toàn bộ kiến trúc phía sau.
+</Eli5>
+
+Bạn đã học framework 4 bước ở SD01 (yêu cầu → ước lượng → high-level design → đào sâu). Case study này áp lại đúng framework đó cho một hệ thống chat kiểu WhatsApp — lớp bài phỏng vấn xuất hiện nhiều nhất trong nhóm "realtime system".
+
+<Technical title="Bước 1–2: Requirements & ước lượng">
+
+### Functional requirements
+
+- Nhắn tin 1-1 và group (giả định tối đa ~256 thành viên/group, giống WhatsApp)
+- Gửi/nhận realtime khi cả hai đang online; nếu offline thì nhận lại khi mở app hoặc qua push notification
+- Delivery receipt (đã gửi tới server) và read receipt (đã đọc) — tuỳ chọn, không phải yêu cầu cứng cho MVP
+- Đồng bộ trên nhiều thiết bị (điện thoại + laptop) của cùng một user
+
+### Non-functional requirements (có số)
+
+| Yêu cầu | Con số mục tiêu | Vì sao quan trọng |
+|---|---|---|
+| Latency gửi → nhận (2 người cùng online) | p99 dưới ~200ms trong cùng khu vực | Cảm giác "chat thật", không phải "nhắn tin trễ" |
+| Không mất tin nhắn | 0% mất khi client mạng chập chờn | Người dùng không tha thứ việc "tin nhắn biến mất" |
+| Đúng thứ tự | 100% đúng thứ tự *trong một conversation* | Đọc ngược thứ tự làm hội thoại vô nghĩa |
+| Availability | ~99,9%+ | Chat là tính năng lõi, downtime ảnh hưởng trực tiếp |
+| Consistency | Không cần strong consistency toàn cục — chỉ cần đúng thứ tự per-conversation | Đổi lại lấy được khả năng scale ngang (xem lesson 2–3) |
+
+**Out of scope** (nói rõ trong phỏng vấn để không lan man): mã hoá end-to-end, voice/video call, tìm kiếm full-text trong lịch sử chat.
+
+### Ước lượng quy mô (giả định rõ ràng, làm tròn theo Phụ lục B)
+
+Giả định kiểu WhatsApp: **1 tỷ user đăng ký**, **DAU 500 triệu** (WAU/DAU cao vì app dùng hàng ngày), mỗi user gửi trung bình **40 tin nhắn/ngày**.
+
+- Tổng tin nhắn/ngày ⇒ 500 triệu × 40 = **20 tỷ tin nhắn/ngày**
+- QPS ghi trung bình ⇒ 20 tỷ ÷ 10⁵ giây ≈ **200.000 QPS**; peak giờ cao điểm lấy 3× ⇒ cỡ **600.000 QPS** (giả định, *cần benchmark thật* trước khi tin số này)
+- Kích thước 1 tin nhắn (text, chưa media) ước ~200 byte (nội dung + metadata) ⇒ storage/ngày ≈ 20 tỷ × 200B ≈ 4 TB/ngày ⇒ **~7 PB cho 5 năm** (chưa tính media, vốn thường lưu ở object storage riêng — SD08 — không tính vào storage tin nhắn)
+- Kết nối WebSocket đồng thời (concurrent, không phải DAU): giả định **20% DAU online cùng lúc ở giờ cao điểm** ⇒ 500 triệu × 20% = **~100 triệu kết nối đồng thời** — đây là con số quyết định số lượng gateway instance (lesson 2)
+
+Đọc hay ghi nhiều hơn? Chat gần như **cân bằng đọc/ghi** ở luồng realtime (mỗi tin gửi ra gần như lập tức có người đọc), nhưng **đọc nhiều hơn hẳn** khi tính cả việc load lại lịch sử chat mỗi lần mở app — ảnh hưởng tới lựa chọn data model ở phần dưới.
+
+</Technical>
+
+<ChatConversationShardingDiagram />
+
+<Technical title="Bước 3–4: API & data model">
+
+### API sơ bộ
+
+```text
+WS   /ws?token=...                                  Nâng cấp kết nối realtime, nhận/gửi message qua socket
+POST /conversations                                 Tạo conversation 1-1 hoặc group
+POST /conversations/:id/messages                    Gửi tin (dùng khi client muốn qua REST thay vì socket, hoặc làm fallback)
+GET  /conversations/:id/messages?afterSeq=&limit=   Lấy tin theo trang, dùng cho load lịch sử và fetch-on-reconnect (lesson 3)
+POST /conversations/:id/read                         Đánh dấu đã đọc tới seq nào
+GET  /presence/:userId                               Trạng thái online/away/offline hiện tại (lesson 4)
+```
+
+`afterSeq` (không phải `page`/`offset`) là chi tiết quan trọng: nó cho phép client hỏi chính xác "tôi có mọi tin tới seq bao nhiêu rồi, cho tôi phần còn thiếu" — nền tảng cho fetch-on-reconnect.
+
+### Chọn data model
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Postgres, bảng `messages` có `conversation_id`, `seq`, `sender_id`, `body`, `created_at` | Quen thuộc, transaction, dễ debug, đủ cho `sd-playground` và quy mô vừa | Một node ghi có trần thông lượng; cần shard thủ công khi vượt vài trăm nghìn QPS ghi | MVP, hệ thống dưới hàng chục triệu user |
+| Wide-column store (Cassandra/ScyllaDB — chỉ ở mức khái niệm trong module này) với partition key `conversation_id`, clustering key `seq` | Ghi rất nhanh, scale ngang tự nhiên theo partition key, đúng khớp truy vấn "lấy N tin gần nhất của 1 conversation" | Không có transaction đa dòng, mô hình dữ liệu phải thiết kế quanh truy vấn (query-first), vận hành cluster phức tạp hơn | Quy mô tỷ tin nhắn/ngày kiểu Discord/WhatsApp |
+
+Dù chọn kiểu nào, **shard/partition key nên là `conversation_id`**, không phải `sender_id` hay `created_at` — xem diagram phía trên và deep dive đầy đủ ở lesson 3.
+
+</Technical>
+
+## Thực hành
+
+Ước lượng lại toàn bộ với giả định của *bạn* (không copy số phía trên) cho một app chat nội bộ công ty giả định 50.000 nhân viên, mỗi người gửi 15 tin/ngày.
+
+<Terminal
+  commands={[
+    { comment: "Không có lệnh chạy ở bước này — đây là bài tính nhẩm, ghi ra giấy hoặc file estimation.md", command: "echo 'DAU=50000; msgs_per_user=15' " , output: "DAU=50000; msgs_per_user=15"},
+    { comment: "Kiểm tra lại bằng máy tính: tổng tin/ngày, QPS trung bình, storage 1 năm", command: "python3 -c \"dau=50000; m=15; total=dau*m; qps=total/86400; print(f'total={total}, qps_avg={qps:.1f}')\"", output: "total=750000, qps_avg=8.7" },
+  ]}
+/>
+
+<Callout type="mistake" title="Nhầm DAU với concurrent connections">
+  Sai lầm phổ biến nhất khi ước lượng chat: dùng thẳng DAU làm số kết nối WebSocket đồng thời. DAU là số người *dùng app trong ngày* (có thể mở app 5 phút rồi tắt); concurrent connections là số người *đang mở kết nối tại một thời điểm* — luôn nhỏ hơn nhiều, nhưng lại là con số quyết định số gateway instance cần chạy.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Người phỏng vấn thường bấm giờ và chờ bạn tự nói: "1-1 hay group?", "bao nhiêu concurrent connection?", "tin nhắn được phép mất không?" trước khi bạn vẽ box đầu tiên. Nếu bạn vẽ kiến trúc ngay, họ sẽ hỏi ngược lại các câu này giữa chừng — mất điểm về *quy trình dẫn dắt*, dù kiến trúc cuối có đúng.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "DAU", meaning: "Daily Active Users — số user dùng app trong một ngày, không phải số kết nối đồng thời." },
+    { term: "concurrent connections", meaning: "Số kết nối WebSocket đang mở tại một thời điểm — quyết định số gateway instance." },
+    { term: "read/write ratio", meaning: "Tỷ lệ đọc so với ghi; quyết định nên tối ưu cho cache/replica (đọc nhiều) hay cho throughput ghi (ghi nhiều)." },
+    { term: "afterSeq", meaning: "Tham số phân trang theo sequence number, dùng để đồng bộ phần dữ liệu còn thiếu thay vì offset/page." },
+    { term: "wide-column store", meaning: "Kiểu database (Cassandra/ScyllaDB) tổ chức dữ liệu theo partition key + clustering key, tối ưu ghi nhanh và đọc theo thứ tự." },
+  ]}
+/>
+
+<QuickCheck
+  question="App chat có DAU 500 triệu, nhưng chỉ 20% DAU online cùng lúc ở giờ cao điểm. Số nào quyết định bạn cần bao nhiêu gateway instance chạy WebSocket?"
+  options={[
+    "500 triệu (DAU) vì đó là tổng số user có thể kết nối",
+    "100 triệu (concurrent connections ở giờ cao điểm) vì đó là số kết nối instance phải giữ cùng lúc",
+    "20 tỷ (tổng tin nhắn/ngày) vì đó là tải xử lý thực tế",
+    "Không cần con số nào, cứ scale tới khi hết lỗi",
+  ]}
+  answerIndex={1}
+  explanation="Gateway instance giữ *kết nối* chứ không giữ *tin nhắn đã gửi trong ngày*. Số kết nối đồng thời (100 triệu) mới là tải mà mỗi instance phải chịu — mỗi instance giữ được bao nhiêu connection (tuỳ RAM, file descriptor limit) chia ra số instance cần thiết."
+/>

@@ -1,0 +1,130 @@
+import { MessageOrderingReconnectResyncDiagram } from "../diagrams/message-ordering-reconnect-resync-diagram";
+
+<Eli5 title="Sổ tay riêng cho từng cuộc trò chuyện" emoji="📓">
+  Tưởng tượng mỗi cuộc trò chuyện có một cuốn sổ tay riêng, đánh số trang 1, 2, 3... Không ai quan tâm trang 5 của sổ "Alice-Bob" có phải viết trước hay sau trang 3 của sổ "Nhóm Standup" — mỗi cuốn sổ tự đánh số độc lập.
+
+  Khi Bob đóng sổ (mất mạng) rồi mở lại, cậu ấy chỉ cần hỏi: "sổ này tôi đọc tới trang mấy rồi, đưa tôi những trang tiếp theo" — không cần đọc lại từ đầu, không cần biết chuyện gì xảy ra ở sổ khác trong lúc mình vắng mặt.
+</Eli5>
+
+<MessageOrderingReconnectResyncDiagram />
+
+<Technical title="Thứ tự tin nhắn: scoped theo conversation, không phải toàn cục">
+
+### Vì sao không cần sequence toàn cục
+
+Một bộ đếm toàn cục (tăng dần cho *mọi* tin nhắn của *mọi* conversation) cần một điểm ghi duy nhất — chính là điểm nghẽn (bottleneck) khi throughput ghi lớn, và giải quyết sai vấn đề: người dùng không bao giờ so sánh "tin nhắn ở group A" với "tin nhắn ở group B" để hỏi cái nào trước.
+
+**Sequence number scoped theo `conversation_id`** vừa đủ, và có thể sinh độc lập cho từng conversation — không cần khoá toàn hệ thống.
+
+```sql title="messages (Postgres, MVP)"
+CREATE TABLE messages (
+  conversation_id BIGINT NOT NULL,
+  seq             BIGINT NOT NULL,
+  sender_id       BIGINT NOT NULL,
+  body            TEXT NOT NULL,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (conversation_id, seq)
+);
+
+CREATE TABLE conversation_counters (
+  conversation_id BIGINT PRIMARY KEY,
+  next_seq        BIGINT NOT NULL DEFAULT 1
+);
+```
+
+```ts title="app/src/next-seq.ts"
+// Transaction ngắn: khoá đúng 1 dòng counter, không khoá cả bảng messages
+export async function nextSeq(pool: Pool, conversationId: string): Promise<number> {
+  const { rows } = await pool.query(
+    `UPDATE conversation_counters SET next_seq = next_seq + 1
+     WHERE conversation_id = $1 RETURNING next_seq - 1 AS seq`,
+    [conversationId],
+  );
+  return rows[0].seq;
+}
+```
+
+Ở quy mô rất lớn, một conversation cực "hot" (group hàng nghìn người active) vẫn có thể làm dòng counter đó thành điểm nghẽn cục bộ — khi đó cân nhắc `INCR` trên Redis (nhanh hơn transaction Postgres) rồi ghi bất đồng bộ xuống DB, đánh đổi lấy một chút phức tạp khi Redis restart mất counter (cần khôi phục từ `MAX(seq)` trong DB).
+
+### Data model & shard key (nhắc lại lesson 1)
+
+Bảng `messages` shard/partition theo `conversation_id` (không phải `sender_id` hay theo thời gian) vì truy vấn phổ biến nhất — "N tin gần nhất của conversation X" — cần đọc liên tục trên cùng một shard. Đây là ứng dụng trực tiếp của consistent hashing / partition key ở SD06.
+
+</Technical>
+
+<Technical title="Offline & đa thiết bị">
+
+### Ba mảnh ghép cho delivery đáng tin cậy
+
+1. **Inbox bền vững**: mọi tin nhắn ghi vào Postgres *trước khi* cố gắng đẩy qua WebSocket (thứ tự ngược lại sẽ mất tin nếu server crash giữa lúc gửi). DB là nguồn sự thật — WebSocket chỉ là "đường tắt" để giao nhanh khi có thể.
+2. **Push notification fallback**: khi recipient không có kết nối WebSocket nào đang mở (kiểm tra registry/`Map`), gọi dịch vụ push (APNs/FCM — ngoài phạm vi module này) để "rung chuông" — bản thân push không chứa nội dung tin nhắn đầy đủ, chỉ báo "có tin mới, hãy mở app".
+3. **Fetch-on-reconnect**: khi client mở lại kết nối (app mở lại, mạng khôi phục), nó gọi `GET /conversations/:id/messages?afterSeq=<seq cuối đã có>` cho từng conversation cần đồng bộ — đảm bảo không phụ thuộc việc "server có nhớ đẩy lại" hay không.
+
+### Đa thiết bị: userId → nhiều connection
+
+```ts title="app/src/multi-device.ts"
+// Một user có thể có N kết nối cùng lúc (điện thoại + laptop + web)
+const connections = new Map<string, Set<WebSocket>>();
+
+function deliverToUser(userId: string, payload: unknown) {
+  const sockets = connections.get(userId);
+  sockets?.forEach((ws) => ws.readyState === ws.OPEN && ws.send(JSON.stringify(payload)));
+  // Không có socket nào mở ⇒ đây là lúc gọi push notification fallback
+}
+```
+
+Read receipt cũng phải đồng bộ chéo thiết bị: Bob đọc tin trên điện thoại thì laptop của Bob cũng cần biết "đã đọc tới seq X" — publish sự kiện `read-updated` cho chính `userId` của Bob (không chỉ cho người gửi), gửi tới mọi thiết bị khác của Bob.
+
+### Trade-off: chỗ đặt "đã gửi thành công"
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Ghi DB rồi mới publish/gửi WebSocket | Không mất tin dù server crash ngay sau đó | Thêm ~1 round-trip DB trước khi tin "rời khỏi" server | Mặc định — gần như luôn nên chọn cách này |
+| Gửi WebSocket trước, ghi DB bất đồng bộ (fire-and-forget) | Latency thấp hơn một chút | Server crash giữa chừng ⇒ mất tin đã "tưởng là gửi được"; vi phạm yêu cầu "0% mất tin nhắn" | Hiếm khi chấp nhận được cho chat — có thể tạm ổn cho tính năng "typing indicator" (mất thì không sao) |
+| Outbox pattern (SD07) trước khi publish ra WebSocket/push | An toàn nhất khi có nhiều side-effect (DB + push + analytics) | Thêm độ trễ và một tiến trình relay outbox | Hệ thống lớn cần đảm bảo mọi side-effect đều chạy dù thành phần nào đó tạm chết |
+
+</Technical>
+
+## Thực hành
+
+Chứng minh: Bob mất mạng, Alice gửi 2 tin, Bob reconnect và nhận đủ đúng thứ tự.
+
+<Terminal
+  commands={[
+    { comment: "Bob đang kết nối, kill kết nối phía client (giả lập mất mạng)", command: "node scripts/ws-client.js bob --then-disconnect-after=1s" },
+    { comment: "Alice gửi 2 tin trong lúc Bob offline", command: "node scripts/ws-send.js alice '{\"recipientId\":\"bob\",\"body\":\"còn đó không?\"}'" },
+    { command: "node scripts/ws-send.js alice '{\"recipientId\":\"bob\",\"body\":\"mai họp lúc 9h nhé\"}'" },
+    { comment: "Kiểm tra 2 tin đã nằm trong DB dù Bob chưa nhận", command: "docker compose exec postgres psql -U postgres -c \"SELECT seq, sender_id, body FROM messages WHERE conversation_id='c1' ORDER BY seq;\"", output: " seq | sender_id |          body           \n-----+-----------+--------------------------\n   1 | alice     | hi\n   2 | bob       | chào\n   3 | alice     | còn đó không?\n   4 | alice     | mai họp lúc 9h nhé" },
+    { comment: "Bob reconnect, client tự gọi afterSeq=2 để resync", command: "curl -s 'localhost:8080/conversations/c1/messages?afterSeq=2'", output: "[{\"seq\":3,...},{\"seq\":4,...}]" },
+  ]}
+/>
+
+<Callout type="mistake" title="Đánh dấu 'đã gửi' ngay khi push vào WebSocket">
+  Nếu server coi `ws.send()` thành công là "đã gửi xong" mà không cần ack từ client, tin nhắn có thể bị đánh dấu delivered dù gói tin chưa thực sự tới máy Bob (buffer TCP, client crash ngay sau khi nhận socket data nhưng trước khi xử lý). Delivery receipt đáng tin cậy cần một ack tường minh từ client, không suy ra từ trạng thái socket.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi thường gặp: "Làm sao đảm bảo không mất tin nhắn khi client offline?" Câu trả lời mạnh nêu đủ 3 tầng (DB bền vững → push fallback → fetch-on-reconnect bằng sequence number), và giải thích được vì sao *không thể* chỉ dựa vào một tầng duy nhất — ví dụ chỉ dùng push thì mất nội dung khi push service tự nó không đáng tin cậy 100%.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "sequence number theo conversation", meaning: "Bộ đếm tăng dần riêng cho từng conversation, đủ để đảm bảo thứ tự mà không cần điểm ghi toàn cục." },
+    { term: "durable inbox", meaning: "Nơi lưu tin nhắn bền vững (DB), tồn tại độc lập với việc kết nối WebSocket có đang mở hay không." },
+    { term: "fetch-on-reconnect", meaning: "Client hỏi lại phần dữ liệu còn thiếu dựa trên sequence cuối đã có, thay vì server phải 'nhớ' đẩy lại." },
+    { term: "push notification fallback", meaning: "Kênh báo tin khi không có kết nối realtime nào đang mở; chỉ báo hiệu, không thay thế đồng bộ dữ liệu thật." },
+    { term: "outbox pattern", meaning: "Ghi ý định side-effect vào cùng transaction với dữ liệu chính, rồi một tiến trình riêng relay đi sau (SD07)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Server thiết kế: nhận tin từ Alice → gửi ngay qua WebSocket cho Bob → sau đó mới ghi vào Postgres (bất đồng bộ, không chờ). Server crash đúng lúc giữa 2 bước. Hậu quả gì rõ nhất?"
+  options={[
+    "Không sao, WebSocket đã gửi thành công nên dữ liệu an toàn",
+    "Bob có thể đã nhận tin (nếu socket kịp gửi) nhưng tin nhắn không tồn tại trong DB — Bob thấy tin trên màn hình lúc đó, nhưng nó biến mất/không đồng bộ được sang thiết bị khác hoặc khi load lại lịch sử",
+    "Redis sẽ tự động khôi phục tin nhắn bị mất",
+    "Alice sẽ nhận được thông báo lỗi ngay lập tức",
+  ]}
+  answerIndex={1}
+  explanation="Đây là lý do thứ tự phải là: ghi bền vững (DB) TRƯỚC, rồi mới đẩy realtime. Ngược lại, DB không phải nguồn sự thật nữa — tin nhắn 'tồn tại' theo may rủi của việc socket có gửi kịp hay không, và hoàn toàn không đồng bộ được cho thiết bị thứ hai hay khi Bob load lại lịch sử."
+/>

@@ -1,0 +1,128 @@
+import { WebsocketGatewayPubsubRoutingDiagram } from "../diagrams/websocket-gateway-pubsub-routing-diagram";
+
+<Eli5 title="Tổng đài viên chỉ nhớ khách của riêng mình" emoji="📞">
+  Ở SD03 bạn đã học: app stateless thì instance nào trả lời cũng được, vì session nằm ở Redis dùng chung. WebSocket phá vỡ điều đó theo một cách khác — **kết nối chính là state**, và nó không thể "chuyển" sang instance khác giữa chừng như cookie session.
+
+  Tưởng tượng mỗi tổng đài viên (gateway instance) chỉ nhớ những đường dây đang cắm vào bàn của chính mình. Alice cắm vào bàn 1, Bob cắm vào bàn 2. Nếu tổng đài viên 1 muốn chuyển lời cho Bob, cô ấy **không thể tự với tay sang bàn 2** — phải hô lên (pub/sub) hoặc tra sổ xem Bob đang ngồi bàn nào (registry).
+</Eli5>
+
+Đây là điểm khác biệt cốt lõi giữa "load balance một API stateless" (SD03) và "load balance WebSocket": load balancer chỉ quyết định request/kết nối *mới* rơi vào instance nào; nó không giúp gì cho việc chuyển tiếp dữ liệu giữa các kết nối *đã tồn tại* trên các instance khác nhau.
+
+<WebsocketGatewayPubsubRoutingDiagram />
+
+<Technical title="Hai cách route tin nhắn cross-instance">
+
+### Cách 1: Fan-out qua Redis pub/sub (đơn giản, dùng trong lab)
+
+Mọi instance subscribe cùng một channel. Instance nhận tin từ client, publish lên channel, **mọi** instance khác nhận được và tự tra `Map` cục bộ — có người nhận thì gửi, không có thì bỏ qua.
+
+```ts title="app/src/ws-gateway.ts"
+import type { FastifyInstance } from "fastify";
+import Redis from "ioredis";
+
+const connections = new Map<string, Set<WebSocket>>(); // hỗ trợ đa thiết bị
+const publisher = new Redis(process.env.REDIS_URL ?? "redis://redis:6379");
+const subscriber = new Redis(process.env.REDIS_URL ?? "redis://redis:6379");
+
+export async function wsGatewayRoutes(app: FastifyInstance) {
+  await subscriber.subscribe("chat:relay");
+  subscriber.on("message", (_channel, raw) => {
+    const { recipientId, payload } = JSON.parse(raw);
+    const sockets = connections.get(recipientId);
+    sockets?.forEach((ws) => ws.send(JSON.stringify(payload))); // không có thì bỏ qua, instance khác lo
+  });
+
+  app.get("/ws", { websocket: true }, (socket, req) => {
+    const userId = (req.query as { userId: string }).userId;
+    if (!connections.has(userId)) connections.set(userId, new Set());
+    connections.get(userId)!.add(socket);
+
+    socket.on("message", async (raw) => {
+      const { conversationId, recipientId, body } = JSON.parse(raw.toString());
+      const seq = await nextSeq(conversationId); // xem lesson 3
+      await saveMessage({ conversationId, seq, senderId: userId, body });
+      await publisher.publish("chat:relay", JSON.stringify({ recipientId, payload: { conversationId, seq, senderId: userId, body } }));
+    });
+
+    socket.on("close", () => connections.get(userId)?.delete(socket));
+  });
+}
+```
+
+**Cần 2 kết nối Redis riêng** (`publisher`, `subscriber`): một connection đang ở chế độ `SUBSCRIBE` không thể chạy lệnh `PUBLISH`/`GET` khác trên cùng connection đó.
+
+### Cách 2: Registry lookup (userId → instanceId)
+
+Redis giữ một hash `presence:location:<userId> = <instanceId>`, cập nhật khi connect/disconnect. Khi cần gửi, tra hash rồi publish vào channel **riêng của đúng instance đó** (`chat:relay:<instanceId>`) thay vì channel chung.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Fan-out pub/sub (1 channel chung) | Đơn giản, không cần giữ thêm registry, không có "dữ liệu lệch" | Mọi instance nhận mọi message — tốn băng thông nội bộ tuyến tính theo số instance | Vài chục instance, hoặc giai đoạn đầu ưu tiên đơn giản |
+| Registry lookup (channel riêng/direct call mỗi instance) | Tiết kiệm băng thông, chỉ đúng instance nhận đúng tin | Registry phải chính xác — instance crash không kịp xoá entry ⇒ gửi vào "hư không"; cần TTL + heartbeat để tự dọn registry cũ | Hàng trăm+ instance, hoặc traffic nội bộ giữa instance đã là bottleneck |
+
+Đổi ý khi: nếu đo thấy băng thông nội bộ (Redis pub/sub traffic) chiếm tỷ lệ lớn so với băng thông client thật, chuyển sang registry. Nhiều hệ thống production (kể cả Discord ở quy mô lớn) dùng biến thể của registry lookup kết hợp consistent hashing để giảm fan-out.
+
+### Điều cần hedge
+
+`sd-playground` chỉ có 1 Redis instance — đủ để học cơ chế, **không phải cấu hình production**. Redis pub/sub *không đảm bảo delivery*: nếu subscriber đang bận hoặc mất kết nối đúng lúc publish, message bị mất — vì vậy DB (Postgres) vẫn phải là nguồn sự thật, pub/sub chỉ là "kênh báo tin nhanh", còn dữ liệu thật luôn đọc lại được qua `GET /conversations/:id/messages?afterSeq=` (lesson 3).
+
+</Technical>
+
+## Thực hành
+
+Dựng 2 replica trong `sd-playground` và xác nhận tin nhắn tới đúng người dù khác instance.
+
+```nginx title="nginx/default.conf (trích, WS-aware)"
+location /ws {
+  proxy_pass http://app_backend;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_read_timeout 3600s; # giữ kết nối lâu, không timeout như request thường
+}
+```
+
+<Terminal
+  commands={[
+    { comment: "Scale app lên 2 replica", command: "docker compose up -d --build --scale app=2" },
+    { comment: "Nginx chỉ resolve tên 'app' lúc nạp cấu hình", command: "docker compose exec nginx nginx -s reload" },
+    { comment: "Mở kết nối cho alice (script Node dùng thư viện ws)", command: "node scripts/ws-client.js alice", output: "connected as alice, servedBy=3f2a9c1d7b44" },
+    { comment: "Mở kết nối cho bob ở terminal khác", command: "node scripts/ws-client.js bob", output: "connected as bob, servedBy=a81e0b5c22f9" },
+    { comment: "Gửi tin từ alice cho bob qua stdin của script", command: "echo '{\"recipientId\":\"bob\",\"body\":\"hi\"}' | node scripts/ws-send.js alice" },
+    { comment: "Terminal của bob nhận tin dù khác servedBy", command: "# console của ws-client.js bob in ra:", output: "received: {\"conversationId\":\"c1\",\"seq\":7,\"senderId\":\"alice\",\"body\":\"hi\"}" },
+  ]}
+/>
+
+<Callout type="mistake" title="Quên tách publisher/subscriber Redis">
+  Dùng chung một `Redis` instance vừa để `SUBSCRIBE` vừa để `SET`/`GET` sẽ báo lỗi hoặc treo, vì một connection đã vào chế độ subscribe trong ioredis/node-redis không nhận lệnh thường nữa. Luôn tạo 2 connection riêng.
+</Callout>
+
+<Callout type="warning">
+  `docker compose kill` một container app giữa lúc test: các kết nối WebSocket trên instance đó chết ngay lập tức (TCP reset), không có "chuyển giao êm ái" như connection draining ở SD03. Client bắt buộc phải tự phát hiện mất kết nối và reconnect — xem lesson 3 để biết cách không mất tin nhắn khi việc này xảy ra.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi kinh điển: "Load balancer của bạn là round-robin, làm sao route tin nhắn tới đúng WebSocket đang mở ở instance khác?" Trả lời tốt nêu được cả 2 phương án (fan-out vs registry), nói rõ trade-off băng thông vs độ chính xác, và không quên: **Redis pub/sub không persistent** — DB vẫn phải là nguồn sự thật.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "WebSocket gateway", meaning: "Tầng server giữ các kết nối WebSocket lâu dài của client." },
+    { term: "connection registry", meaning: "Bảng tra cứu userId đang kết nối vào instance nào, dùng để route trực tiếp thay vì fan-out." },
+    { term: "fan-out (pub/sub)", meaning: "Gửi một message tới mọi subscriber, để mỗi bên tự quyết định có xử lý hay không." },
+    { term: "channel riêng theo instance", meaning: "Kỹ thuật giảm fan-out: mỗi instance có channel Redis của riêng nó, chỉ nhận message thật sự dành cho nó." },
+    { term: "at-most-once delivery của pub/sub", meaning: "Redis pub/sub không lưu lại message nếu subscriber offline lúc publish — phải kết hợp với lưu trữ bền vững." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hệ thống dùng registry lookup (userId → instanceId trong Redis) để route tin nhắn. Instance 2 bị crash đột ngột (không kịp chạy code dọn dẹp `on close`). Điều gì có khả năng xảy ra nếu không xử lý gì thêm?"
+  options={[
+    "Không sao, Redis tự phát hiện instance chết và xoá entry ngay lập tức",
+    "Registry vẫn ghi user đó thuộc instance 2 (đã chết) — tin nhắn gửi tới sẽ 'rơi vào hư không' cho tới khi entry được dọn (TTL hết hạn hoặc heartbeat cập nhật lại)",
+    "Toàn bộ hệ thống dừng hoạt động ngay lập tức",
+    "Tin nhắn tự động được gửi qua email thay thế",
+  ]}
+  answerIndex={1}
+  explanation="Đây là rủi ro cố hữu của registry: nó chỉ đúng khi được cập nhật đầy đủ. Cách giảm thiểu: đặt TTL ngắn cho entry (giống presence TTL ở lesson 4) và bắt các instance khác tự publish lại khi không nhận được ack, thay vì tin tuyệt đối vào registry."
+/>
