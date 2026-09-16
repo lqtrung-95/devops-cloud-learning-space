@@ -1,0 +1,112 @@
+import { GeodnsAnycastRoutingDiagram } from "../diagrams/geodns-anycast-routing-diagram";
+
+<Eli5 title="DNS ở quy mô lớn giống hệ thống bưu điện có nhiều chi nhánh" emoji="🏤">
+  Bình thường, danh bạ (DNS) chỉ ghi "cửa hàng này ở địa chỉ X". Nhưng một chuỗi cửa hàng lớn có **nhiều chi nhánh** ở nhiều thành phố — khách ở Hà Nội nên được chỉ tới chi nhánh Hà Nội, khách ở Sài Gòn tới chi nhánh Sài Gòn.
+
+  **GeoDNS** giống tổng đài thông minh: hỏi "bạn ở đâu?" rồi đọc **địa chỉ chi nhánh khác nhau** tuỳ nơi gọi tới.
+
+  **Anycast** thì khác hẳn: mọi chi nhánh dùng chung **một số điện thoại duy nhất**, và mạng bưu chính tự động nối cuộc gọi tới chi nhánh gần nhất — người gọi không cần biết mình đang được nối tới đâu.
+
+  **TTL** là "hạn dùng" của tờ giấy ghi địa chỉ trong sổ tay bạn: sổ ghi "dùng trong 1 ngày" thì dù chi nhánh đã đổi địa chỉ, bạn vẫn cầm tờ giấy cũ đi tới hết hạn mới hỏi lại.
+
+  Chỗ ví von bị hụt: đổi số điện thoại (anycast) không có "hạn dùng" như tờ giấy DNS — mạng lưới bưu chính (BGP) tự cập nhật đường đi gần như ngay lập tức khi một chi nhánh đóng cửa.
+</Eli5>
+
+Đây là lớp routing thấp nhất nhưng ảnh hưởng trực tiếp tới hai thứ học ở SD13: **latency** (đưa user tới nơi gần nhất) và **failover** (chuyển hướng khi một region chết). Hiểu đúng TTL và anycast giúp bạn trả lời chính xác câu hỏi "mất bao lâu để user hết bị ảnh hưởng khi một region sập?" — một câu các case study Phase 4 sẽ hỏi lại nhiều lần.
+
+<GeodnsAnycastRoutingDiagram />
+
+<Technical>
+
+### TTL: cân bằng giữa hiệu năng và khả năng đổi ý nhanh
+
+Mỗi DNS record có TTL (giây) — thời gian resolver được phép **cache** kết quả trước khi hỏi lại authoritative server.
+
+| TTL | Ưu | Nhược |
+|---|---|---|
+| Cao (86400 = 1 ngày) | Ít truy vấn DNS, resolver toàn cầu đỡ tải, phân giải nhanh (đã cache) | Đổi IP mất tới 1 ngày mới lan hết — chậm khi cần failover gấp |
+| Thấp (60 giây) | Đổi IP có hiệu lực trong ~1 phút | Nhiều truy vấn DNS hơn (tải hạ tầng DNS + chi phí một số nhà cung cấp) |
+
+**Lưu ý quan trọng:** TTL là *gợi ý*, không phải cam kết cứng. Một số resolver ISP hoặc client cache lâu hơn TTL công bố ("TTL flouting") — vì vậy kế hoạch migrate DNS luôn **giữ hạ tầng cũ chạy song song** một thời gian sau khi đổi record, không tắt ngay.
+
+```text
+Kế hoạch đổi DNS an toàn:
+T-24h   Hạ TTL của api.example.com từ 86400 xuống 60
+T-0     Đổi record sang IP/LB mới; cả 2 hạ tầng cùng chạy
+T+1h    Theo dõi traffic hạ tầng cũ giảm dần về 0
+T+24h   Tắt hạ tầng cũ (đề phòng resolver cache lâu hơn TTL)
+T+48h   Nâng TTL trở lại mức cao để giảm tải DNS
+```
+
+### GeoDNS: định tuyến ở tầng phân giải tên
+
+GeoDNS trả **IP khác nhau** tuỳ vị trí của resolver hỏi (hoặc chính xác hơn với **EDNS Client Subnet**, tuỳ subnet của client). Đây là cơ chế phổ biến để đưa user tới region gần nhất hoặc thực hiện latency-based routing (AWS Route 53, Cloudflare Load Balancing).
+
+Hạn chế: **tốc độ failover bị khoá bởi TTL**. Nếu region chính sập, DNS ngừng trả IP đó — nhưng resolver và client đã cache IP cũ vẫn tiếp tục gọi vào đó tới khi TTL hết. Muốn failover nhanh bằng GeoDNS, TTL phải thấp (đổi lại nhiều truy vấn DNS hơn).
+
+### Anycast: định tuyến ở tầng mạng (BGP)
+
+Với anycast, **nhiều điểm hiện diện (PoP)** ở nhiều nơi trên thế giới cùng quảng bá **một địa chỉ IP** ra Internet qua BGP. Router giữa đường chọn tuyến "gần nhất" theo chi phí BGP (thường tương quan với khoảng cách mạng, không hẳn khoảng cách địa lý). Khi một PoP gặp sự cố, nó **rút quảng bá route** — router lân cận tự động đổi sang tuyến kế tiếp trong vòng giây tới vài chục giây (thời gian BGP hội tụ), **không phụ thuộc TTL của DNS** vì IP không hề đổi.
+
+Đây là cách CDN lớn (Cloudflare, Fastly, các nhà cung cấp DNS anycast) vừa cho latency thấp (vào PoP gần) vừa failover nhanh khi một PoP chết.
+
+### GeoDNS vs anycast
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| GeoDNS / latency-based DNS | Dễ triển khai trên hạ tầng DNS thông thường, kiểm soát chi tiết theo vùng/policy nghiệp vụ | Failover chậm hơn (phụ thuộc TTL + cache client); một số resolver không tôn trọng TTL | Định tuyến origin server theo region với chính sách phức tạp (data residency, giá theo vùng) |
+| Anycast | Failover nhanh (giây tới vài chục giây), tự động, không cần đổi DNS | Cần hạ tầng mạng hỗ trợ BGP (thường phải qua nhà cung cấp CDN/cloud lớn), khó tự vận hành | Tầng edge/CDN, DNS resolver công cộng (1.1.1.1, 8.8.8.8), endpoint cần failover cực nhanh |
+| Kết hợp: anycast ở edge + GeoDNS/LB ở origin | Vào PoP gần nhanh, đồng thời kiểm soát được origin nào phục vụ | Nhiều tầng hơn để vận hành và debug | Kiến trúc CDN + multi-region origin (phổ biến ở hệ thống lớn) |
+
+Đổi ý khi: một sự cố thật cho thấy failover qua GeoDNS quá chậm so với SLA (RTO) đã cam kết ⇒ hoặc hạ TTL sâu hơn, hoặc chuyển hẳn sang anycast/health-check-based routing ở tầng LB toàn cầu.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem TTL hiện tại của một record công khai", command: "dig +noall +answer www.cloudflare.com", output: "www.cloudflare.com.  267  IN  A  104.16.132.229" },
+    { comment: "Hỏi lại sau vài giây qua CÙNG resolver — TTL giảm dần (bằng chứng đang lấy từ cache)", command: "dig +noall +answer www.cloudflare.com", output: "www.cloudflare.com.  254  IN  A  104.16.132.229" },
+    { comment: "Xem PoP anycast nào đang phục vụ bạn (Cloudflare trả về mã colo)", command: "curl -s https://www.cloudflare.com/cdn-cgi/trace | grep colo", output: "colo=SIN" },
+    { comment: "Traceroute để thấy các chặng mạng trước khi tới PoP", command: "traceroute -m 10 1.1.1.1", output: " 1  192.168.1.1  1.2 ms\n 2  10.10.0.1    5.1 ms\n 3  203.0.113.9  8.4 ms\n 4  1.1.1.1      9.7 ms" },
+    { comment: "So sánh: resolver anycast 1.1.1.1 luôn trả lời rất nhanh dù ở đâu", command: "dig @1.1.1.1 example.com +stats | grep 'Query time'", output: ";; Query time: 4 msec" },
+  ]}
+/>
+
+`colo=SIN` nghĩa là bạn đang được PoP Singapore của Cloudflare phục vụ — địa chỉ IP bạn gọi tới giống hệt người dùng ở nơi khác, nhưng BGP đã âm thầm đưa gói tin tới PoP gần bạn nhất.
+
+<Callout type="mistake">
+  **Đặt TTL rất thấp (vd 5 giây) vĩnh viễn "cho chắc".** Mỗi truy vấn DNS thêm một round trip tiềm năng và tăng tải lên hạ tầng DNS/authoritative server. Chỉ hạ TTL tạm thời quanh thời điểm migrate, rồi nâng lại.
+</Callout>
+
+<Callout type="mistake">
+  **Tưởng đổi DNS có hiệu lực ngay lập tức.** "Mình đã update record rồi mà vẫn vào server cũ" — thường do TTL cũ chưa hết hạn ở resolver của bạn, hoặc trình duyệt/OS cache DNS riêng (`ipconfig /flushdns`, `sudo dscacheutil -flushcache` trên macOS).
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi thiết kế multi-region, hãy nêu rõ **tầng nào chịu trách nhiệm route user tới region đúng**: DNS-based (GeoDNS, cần nói rõ TTL và độ trễ failover) hay anycast + health check ở tầng LB toàn cầu (nhanh hơn nhưng cần hạ tầng của nhà cung cấp lớn). Câu trả lời mạnh gắn con số cụ thể: "TTL 60s ⇒ tối đa ~60s + thời gian propagate để hầu hết traffic chuyển hướng, một số client cache lâu hơn nên vẫn giữ origin cũ chạy dự phòng".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "TTL (DNS)", meaning: "Thời gian resolver được phép cache một bản ghi DNS trước khi hỏi lại." },
+    { term: "GeoDNS", meaning: "DNS trả IP khác nhau tuỳ vị trí địa lý/subnet của người hỏi." },
+    { term: "Anycast", meaning: "Nhiều điểm hiện diện cùng quảng bá một IP; router chọn tuyến gần nhất qua BGP." },
+    { term: "BGP", meaning: "Giao thức định tuyến giữa các mạng lớn trên Internet, quyết định gói tin đi tuyến nào." },
+    { term: "PoP (Point of Presence)", meaning: "Một điểm hạ tầng vật lý/mạng nơi nhà cung cấp phục vụ user gần đó." },
+    { term: "BGP convergence", meaning: "Thời gian mạng cập nhật lại tuyến đường sau khi một route thay đổi hoặc rút đi." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn cần chuyển API sang load balancer mới trong vòng vài phút, dùng GeoDNS (không có anycast). Bước nào bắt buộc phải làm TRƯỚC khi đổi record?"
+  options={[
+    "Không cần chuẩn bị gì, đổi record là xong ngay",
+    "Hạ TTL của record xuống một giá trị thấp (vd 60s) từ trước và chờ TTL cũ hết hạn, rồi mới đổi record",
+    "Xoá record cũ ngay lập tức để tránh nhầm lẫn",
+    "Tăng TTL lên thật cao để giảm truy vấn DNS trong lúc chuyển đổi",
+  ]}
+  answerIndex={1}
+  explanation="TTL cũ vẫn còn hiệu lực trong resolver đã cache; hạ TTL trước và chờ nó lan ra + hết hạn thì lúc đổi record, phần lớn resolver mới hỏi lại nhanh. Xoá record cũ ngay hoặc tăng TTL đều làm chuyển đổi chậm hơn hoặc rủi ro hơn."
+/>

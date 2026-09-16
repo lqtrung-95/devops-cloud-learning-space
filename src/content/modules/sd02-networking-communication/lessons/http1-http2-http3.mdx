@@ -1,0 +1,112 @@
+import { HttpVersionsHolBlockingDiagram } from "../diagrams/http-versions-hol-blocking-diagram";
+
+<Eli5 title="HTTP/1.1, 2, 3 giống như số làn đường giao hàng vào một khu chợ" emoji="🛣️">
+  **HTTP/1.1**: mỗi xe hàng phải xếp hàng, xong xe này mới tới xe kia trên cùng một làn. Muốn nhanh, khu chợ mở thêm vài làn (trình duyệt mở ~6 kết nối song song) — nhưng làn nào cũng có giới hạn.
+
+  **HTTP/2**: gộp tất cả xe vào một làn rộng, cắt nhỏ hàng hoá và xen kẽ nhau (multiplexing) — không cần nhiều làn nữa. Nhưng nếu một xe bị hỏng giữa làn (mất gói), **mọi xe phía sau đều phải dừng** vì làn chỉ có một.
+
+  **HTTP/3**: chia hẳn nhiều làn riêng nhưng vẫn đi chung một "cửa ngõ" (một kết nối QUIC trên UDP) — xe này hỏng không cản xe làn khác.
+
+  Chỗ ví von bị hụt: làn đường thật không tự "biết nén hàng hoá" hay "tự tin cậy" như giao thức máy tính — HTTP/2 nén header (HPACK) và QUIC tự đảm bảo giao đúng thứ tự cho từng stream.
+</Eli5>
+
+Nâng cấp giao thức không đổi API hay code nghiệp vụ, nhưng ảnh hưởng trực tiếp tới latency và trải nghiệm trên mạng kém — biết version nào đang chạy giúp bạn giải thích đúng vì sao một API "chậm trên 4G" mà "nhanh trên wifi văn phòng".
+
+<HttpVersionsHolBlockingDiagram />
+
+<Technical>
+
+### So sánh nhanh
+
+| | HTTP/1.1 | HTTP/2 | HTTP/3 |
+|---|---|---|---|
+| Tầng vận chuyển | TCP | TCP | QUIC (trên UDP) |
+| Nhiều request/1 connection | Không (cần pipelining hiếm dùng) | Có — multiplexing | Có — multiplexing theo stream độc lập |
+| Head-of-line blocking | Ở tầng HTTP (xếp hàng theo connection) | Chuyển xuống tầng TCP khi mất gói | Không — mỗi QUIC stream độc lập |
+| Nén header | Không | HPACK | QPACK |
+| Bắt tay kết nối lại | Đầy đủ TCP + TLS | Đầy đủ TCP + TLS | Có thể 0-RTT (nối lại phiên cũ) |
+| Cách trình duyệt bù trước đây | Mở ~6 connection/host, domain sharding | Không cần sharding nữa | Không cần sharding |
+
+### Vì sao multiplexing của HTTP/2 vẫn có thể bị kẹt?
+
+HTTP/2 giải quyết HOL blocking **ở tầng ứng dụng** (nhiều request không còn phải xếp hàng theo connection). Nhưng TCP đảm bảo giao byte **đúng thứ tự tuyệt đối** trên một connection: nếu một gói của stream A bị mất, TCP giữ lại *mọi* byte đến sau — kể cả byte của stream B, C không liên quan — cho tới khi A được gửi lại và xác nhận. Đây gọi là **HOL blocking ở tầng TCP**, và nó ảnh hưởng nặng nhất trên mạng có tỉ lệ mất gói cao (wifi đông người, 4G yếu).
+
+### QUIC giải quyết bằng cách nào
+
+QUIC tự cài đặt tin cậy và thứ tự **theo từng stream** thay vì theo cả connection, và chạy trên UDP để tránh phải đợi tầng TCP của hệ điều hành xử lý theo kiểu cũ. Vì tự quản lý cả bảo mật, QUIC gộp luôn TLS 1.3 vào bắt tay — kết nối lần đầu cần 1 RTT, và **nối lại phiên cũ có thể 0-RTT** (gửi dữ liệu ngay trong gói đầu, đánh đổi lấy một số rủi ro replay cho request idempotent).
+
+### Ai nên quan tâm HTTP/2 vs HTTP/3?
+
+Phần lớn thời gian bạn không tự cài giao thức — Nginx, load balancer, CDN, hoặc HTTP client library lo việc đó. Điều cần biết là **bật đúng cấu hình** và đọc hiểu khi debug:
+
+```nginx title="nginx/default.conf — bật HTTP/2 phía sau TLS"
+server {
+  listen 443 ssl;
+  http2 on;                    # Nginx ≥ 1.25: bật HTTP/2 bằng directive riêng
+  ssl_certificate     /etc/nginx/certs/fullchain.pem;
+  ssl_certificate_key /etc/nginx/certs/privkey.pem;
+  location / {
+    proxy_pass http://app_upstream;
+  }
+}
+```
+
+HTTP/2 gần như luôn chạy trên HTTPS trong thực tế (trình duyệt chỉ hỗ trợ `h2` qua TLS); HTTP/3 cần thêm hỗ trợ QUIC ở cả server và mọi middlebox trên đường đi.
+
+### Chọn giao thức nào cho service nội bộ?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Giữ HTTP/1.1 | Đơn giản, mọi tool đều hỗ trợ, dễ debug bằng `curl -v` | Nhiều connection song song, không multiplexing | Traffic thấp, tool nội bộ, debug nhanh |
+| Nâng lên HTTP/2 | Multiplexing, nén header, ít connection hơn | Vẫn có HOL blocking tầng TCP trên mạng mất gói | Hầu hết API công khai và nội bộ hiện đại; gRPC bắt buộc HTTP/2 |
+| HTTP/3 / QUIC | Không HOL blocking tầng transport, bắt tay nhanh hơn khi nối lại | Middlebox cũ có thể chặn UDP; cần hỗ trợ ở cả 2 đầu | Traffic mobile nhiều, mạng chập chờn, CDN lớn (nhiều CDN đã bật mặc định) |
+
+Đổi ý khi: metrics cho thấy phần lớn user ở mạng di động có tỉ lệ mất gói cao và HTTP/2 đang bị nghẽn ở tầng TCP.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Ép HTTP/1.1 và xem version được xác nhận", command: "curl -s -o /dev/null --http1.1 -w 'protocol=%{http_version}\\n' https://www.google.com", output: "protocol=1.1" },
+    { comment: "Để curl tự thương lượng (thường ra h2 với site hỗ trợ)", command: "curl -s -o /dev/null --http2 -w 'protocol=%{http_version}\\n' https://www.google.com", output: "protocol=2" },
+    { comment: "Kiểm tra site có quảng cáo hỗ trợ HTTP/3 qua header Alt-Svc không", command: "curl -sI https://www.cloudflare.com | grep -i alt-svc", output: "alt-svc: h3=\":443\"; ma=86400" },
+    { comment: "So sánh số Connection ID trong DevTools: mở Network tab, bật cột Protocol", command: "echo 'DevTools > Network > cột Protocol/Connection ID: h2 dùng chung 1 ID cho nhiều request; http/1.1 có nhiều ID song song'" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Nghĩ HTTP/2 "luôn nhanh hơn HTTP/1.1".** Đúng trên mạng ổn định với nhiều asset nhỏ. Trên mạng mất gói nhiều, HOL blocking tầng TCP của HTTP/2 đôi khi khiến nó *chậm hơn* HTTP/1.1 với nhiều connection song song — đây chính là động lực ra đời HTTP/3.
+</Callout>
+
+<Callout type="warning">
+  gRPC yêu cầu HTTP/2 (dùng multiplexing và trailer để truyền status code). Nếu proxy/load balancer ở giữa không hỗ trợ HTTP/2 tới backend (`grpc_pass` cần Nginx bản đủ mới), call gRPC sẽ lỗi khó hiểu.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi được hỏi "làm sao giảm số round trip khi tải trang", câu trả lời mạnh nhắc HTTP/2 multiplexing thay vì domain sharding kiểu cũ, đồng thời **chỉ ra giới hạn**: HOL blocking chuyển xuống TCP, và HTTP/3 giải quyết bằng QUIC. Tránh nói "HTTP/3 nhanh hơn vì mới hơn" — luôn giải thích bằng cơ chế cụ thể.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Multiplexing", meaning: "Nhiều request/response xen kẽ trên cùng một kết nối." },
+    { term: "Head-of-line (HOL) blocking", meaning: "Một phần tử bị kẹt đầu hàng làm mọi phần tử phía sau phải chờ." },
+    { term: "HPACK / QPACK", meaning: "Thuật toán nén header của HTTP/2 và HTTP/3." },
+    { term: "QUIC", meaning: "Giao thức vận chuyển trên UDP, nền tảng của HTTP/3, tự lo tin cậy theo từng stream." },
+    { term: "0-RTT", meaning: "Gửi dữ liệu ngay trong bước bắt tay đầu tiên khi nối lại phiên cũ." },
+    { term: "Alt-Svc header", meaning: "Header HTTP báo cho client biết server còn hỗ trợ giao thức nào khác (vd HTTP/3)." },
+  ]}
+/>
+
+<QuickCheck
+  question="App mobile dùng HTTP/2, chạy tốt trên wifi nhưng lag nặng trên 4G ở vùng sóng yếu — DevTools cho thấy nhiều request cùng bị treo mỗi khi có một request timeout. Giải thích đúng nhất?"
+  options={[
+    "HTTP/2 không hỗ trợ mobile",
+    "Server bị quá tải CPU",
+    "Mất gói trên 4G gây HOL blocking ở tầng TCP: mọi stream trên cùng connection HTTP/2 phải chờ gói bị mất được gửi lại",
+    "Do JSON payload quá lớn",
+  ]}
+  answerIndex={2}
+  explanation="Đây đúng là kịch bản HTTP/2 chạy trên TCP: một làn duy nhất, một xe hỏng là cả làn đứng. Đây là lý do nhiều app mobile và CDN chuyển sang HTTP/3 (QUIC) để mỗi stream có làn riêng."
+/>

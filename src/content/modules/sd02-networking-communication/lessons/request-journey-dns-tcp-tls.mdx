@@ -1,0 +1,109 @@
+import { RequestJourneyWaterfallDiagram } from "../diagrams/request-journey-waterfall-diagram";
+
+<Eli5 title="Một request giống như gọi điện đặt hàng cho một cửa hàng" emoji="☎️">
+  Trước khi nói được câu "cho tôi 2 hộp bánh", bạn phải: **tra danh bạ** xem số của cửa hàng (DNS), **quay số và chờ bắt máy** (TCP), rồi hai bên **xác minh danh tính và thống nhất mật mã** để không ai nghe lén (TLS). Chỉ sau đó mới **đặt hàng** (HTTP request) và nghe trả lời.
+
+  Nếu mỗi câu hỏi bạn lại cúp máy rồi gọi lại từ đầu, phần lớn thời gian sẽ là… chờ bắt máy. **Keep-alive** là giữ máy giữa các câu. **Connection pool** giống tổng đài công ty giữ sẵn vài đường dây luôn nối với nhà cung cấp — ai cần thì dùng ngay.
+
+  Chỗ ví von bị hụt: gọi điện thật bắt máy nhanh dù ở xa, còn trên mạng mỗi lần "chờ bắt máy" tốn đúng một vòng đi-về của tín hiệu (RTT) — càng xa càng lâu.
+</Eli5>
+
+Ở quy mô lớn, latency hiếm khi nằm ở code mà nằm ở **số lần bắt tay và round trip**. Service gọi service khác ở region xa mà không tái dùng kết nối có thể tốn hàng trăm ms chỉ để "chào hỏi". Database cũng vậy: mở kết nối Postgres mới cho mỗi request vừa chậm vừa có thể làm cạn `max_connections`. Hiểu hành trình request giúp bạn đọc được waterfall trong DevTools và biết nên sửa ở tầng nào.
+
+<RequestJourneyWaterfallDiagram />
+
+<Technical>
+
+### Bốn pha của một request HTTPS mới
+
+| Pha | Chuyện gì xảy ra | Chi phí điển hình |
+|---|---|---|
+| DNS | Resolver tra tên → IP, qua cache của OS, resolver, rồi root/TLD/authoritative nếu chưa có | 0 (cache hit) tới vài chục ms |
+| TCP | 3-way handshake `SYN` → `SYN-ACK` → `ACK` | 1 RTT |
+| TLS | TLS 1.3: trao khoá + xác thực certificate | 1 RTT (TLS 1.2: 2 RTT; nối lại phiên có thể 0-RTT) |
+| HTTP | Gửi request, server xử lý, byte đầu tiên trả về (TTFB) | 1 RTT + thời gian xử lý |
+
+**Ước lượng:** client ở Việt Nam, server ở châu Âu, RTT ~160ms, app xử lý 20ms, DNS 30ms ⇒ kết nối mới cỡ `30 + 160 + 160 + (160 + 20) ≈ 530ms` tới byte đầu tiên. Tái dùng kết nối ⇒ `160 + 20 = 180ms`. Cùng code, nhanh gấp ~3 lần — chỉ nhờ không bắt tay lại.
+
+### Keep-alive và connection pooling
+
+- **HTTP keep-alive**: HTTP/1.1 mặc định giữ kết nối (persistent connection) để gửi nhiều request nối tiếp. Server/proxy có *idle timeout* — hết thời gian không dùng thì đóng.
+- **Connection pool**: client giữ sẵn N kết nối mở và cho mượn. Áp dụng cho HTTP client, database driver, Redis client.
+- **Hai phía phải khớp**: nếu client giữ kết nối lâu hơn idle timeout của server/LB, request đầu tiên sau lúc nghỉ có thể gặp lỗi `ECONNRESET` — đặt timeout phía client ngắn hơn phía server.
+
+```ts title="app/src/clients.ts"
+import http from "node:http";
+import pg from "pg";
+
+// Tái dùng socket cho các call HTTP ra ngoài, tối đa 50 socket mỗi host
+export const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
+
+// Pool Postgres: mở tối đa 10 kết nối cho MỖI instance app
+export const db = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 2_000, // chờ mượn kết nối quá 2s thì báo lỗi, không treo mãi
+});
+```
+
+### Ước lượng pool size — nơi hay vỡ khi scale
+
+Giả định: 30 instance app × pool 10 = **300 kết nối** tới Postgres, trong khi `max_connections` mặc định của Postgres là 100 và mỗi kết nối Postgres là một process tốn RAM. Scale app thêm ⇒ database từ chối kết nối. Cách xử lý: giảm pool mỗi instance, hoặc đặt **PgBouncer** (connection pooler) ở giữa để hàng trăm kết nối client dùng chung vài chục kết nối thật (SD06).
+
+### Mở kết nối mỗi lần hay tái dùng?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Kết nối mới mỗi request | Đơn giản, không có trạng thái treo, cân bằng tải đều | Tốn 1–3 RTT bắt tay, tốn CPU cho TLS, cạn port/connection khi tải cao | Gọi rất thưa, script, serverless cold path |
+| Keep-alive / pool trong client | Bỏ bắt tay, latency thấp, ít CPU | Kết nối lâu có thể "dính" vào một backend (LB L4 không cân bằng lại); phải cấu hình timeout khớp | Service-to-service, DB, Redis — gần như mọi luồng nóng |
+| Pooler bên ngoài (PgBouncer, proxy sidecar) | Nhiều client dùng chung ít kết nối thật; bảo vệ DB | Thêm một thành phần; transaction pooling hạn chế một số tính năng session | Nhiều instance app/serverless cùng đánh vào một database |
+
+Đổi ý khi: kết nối dài làm tải lệch giữa các backend sau LB L4 — khi đó giới hạn tuổi thọ kết nối (max lifetime) để client thỉnh thoảng nối lại.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Đo từng pha (các mốc là cộng dồn từ lúc bắt đầu)", command: "curl -s -o /dev/null -w 'dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\\n' https://example.com", output: "dns=0.012 tcp=0.051 tls=0.112 ttfb=0.187 total=0.188" },
+    { comment: "Chạy lại ngay: DNS đã được cache nên pha dns gần như bằng 0", command: "curl -s -o /dev/null -w 'dns=%{time_namelookup} tcp=%{time_connect}\\n' https://example.com", output: "dns=0.001 tcp=0.040" },
+    { comment: "2 URL trong một lệnh curl: lần hai tái dùng kết nối tới Nginx của playground", command: "curl -s -o /dev/null -o /dev/null -w '%{num_connects}\\n' localhost:8080/health localhost:8080/health", output: "1\n0" },
+    { comment: "Pool pg giữ sẵn kết nối tới Postgres sau khi chạy smoke test", command: "docker compose exec postgres psql -U playground -tc \"SELECT count(*) FROM pg_stat_activity WHERE datname = 'playground' AND backend_type = 'client backend';\"", output: "     4" },
+    { command: "docker compose exec postgres psql -U playground -tc 'SHOW max_connections;'", output: " 100" },
+  ]}
+/>
+
+Đọc dòng đầu: `tcp − dns ≈ 39ms` là 1 RTT, `tls − tcp ≈ 61ms` là 1 RTT + chi phí mã hoá, `ttfb − tls ≈ 75ms` là RTT + server xử lý. Số của bạn sẽ khác theo vị trí — hãy tự trừ để thấy RTT của mình.
+
+<Callout type="mistake">
+  **Tạo client/pool mới bên trong mỗi request handler.** `new pg.Pool()` hay `new Redis()` đặt trong handler nghĩa là mỗi request mở kết nối mới (và thường quên đóng). Tạo **một lần** khi app khởi động, dùng chung cho mọi request.
+</Callout>
+
+<Callout type="warning">
+  Pool size lớn hơn không có nghĩa nhanh hơn. Database chỉ xử lý song song được cỡ số CPU core cho các query nặng; quá nhiều kết nối đồng thời làm tăng tranh chấp lock và context switch. Hãy load test để chọn con số, và nhớ nhân với số instance.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu kinh điển "Chuyện gì xảy ra khi gõ URL vào trình duyệt?" là để kiểm tra chiều sâu: câu trả lời mạnh đi qua DNS (cache nhiều tầng), TCP handshake, TLS, HTTP, rồi **nêu số RTT mỗi pha** và cách giảm (keep-alive, HTTP/2 dùng chung kết nối, TLS resumption, CDN đưa điểm bắt tay lại gần user). Trong bài thiết kế, nhắc connection pooling và giới hạn `max_connections` khi scale app là tín hiệu đã từng vận hành thật.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "RTT (round-trip time)", meaning: "Thời gian gói tin đi tới server và quay về." },
+    { term: "TCP 3-way handshake", meaning: "SYN, SYN-ACK, ACK để mở kết nối TCP; tốn 1 RTT." },
+    { term: "TLS handshake", meaning: "Trao khoá và xác thực certificate trước khi gửi dữ liệu mã hoá; TLS 1.3 tốn 1 RTT." },
+    { term: "TTFB", meaning: "Time to first byte — thời gian tới khi nhận byte đầu tiên của response." },
+    { term: "Keep-alive", meaning: "Giữ kết nối mở để gửi nhiều request, không bắt tay lại." },
+    { term: "Connection pool", meaning: "Tập kết nối mở sẵn được cho mượn và trả lại giữa các request." },
+    { term: "PgBouncer", meaning: "Connection pooler cho Postgres, gom nhiều kết nối client vào ít kết nối thật." },
+  ]}
+/>
+
+<QuickCheck
+  question="RTT giữa app và API bên thứ ba là 100ms, API xử lý 30ms, dùng TLS 1.3, DNS đã cache. Nếu mỗi call mở kết nối mới thì mất cỡ bao lâu, và tái dùng kết nối thì còn bao nhiêu?"
+  options={["130ms và 130ms", "230ms và 130ms", "330ms và 130ms", "430ms và 230ms"]}
+  answerIndex={2}
+  explanation="Kết nối mới: TCP 100 + TLS 100 + request 100 + xử lý 30 = 330ms. Giữ máy (keep-alive) thì chỉ còn câu hỏi và câu trả lời: 100 + 30 = 130ms."
+/>

@@ -1,0 +1,130 @@
+import { ApiStyleComparisonDiagram } from "../diagrams/api-style-comparison-diagram";
+
+<Eli5 title="REST, GraphQL, gRPC giống ba cách gọi món ở quán ăn" emoji="🍽️">
+  **REST** giống thực đơn cố định: gọi "phở bò" thì được nguyên tô phở bò, không bớt rau được. Ai đọc thực đơn cũng hiểu ngay — kể cả khách lạ (client bên ngoài).
+
+  **GraphQL** giống buffet tự chọn: bạn nói chính xác muốn gì ("phở, bỏ hành, thêm trứng"), bếp gom đủ trong một lượt bưng ra — dù nguyên liệu tới từ nhiều quầy khác nhau (nhiều service).
+
+  **gRPC** giống đường dây điện thoại nội bộ giữa bếp và kho: có kịch bản gọi sẵn (`.proto`), nói ngắn gọn bằng mã hiệu thay vì cả câu, chỉ hai bên trong nhà hiểu.
+
+  Chỗ ví von bị hụt: khách ở quán không tự "sinh code" từ thực đơn, nhưng gRPC và GraphQL đều generate được client/type tự động từ file mô tả (`.proto`, schema) — tiết kiệm cả núi code thủ công.
+</Eli5>
+
+Chọn sai kiểu API không phải lỗi chí mạng ngay lập tức, nhưng để lại nợ kỹ thuật: REST cho giao tiếp nội bộ tốc độ cao thì lãng phí băng thông và CPU serialize; gRPC cho API công khai thì đối tác không gọi được bằng `curl`; GraphQL cho một microservice nội bộ đơn giản thì thừa độ phức tạp. Đây là quyết định ảnh hưởng tới hàng chục team trong nhiều năm — đáng để có bảng trade-off rõ ràng.
+
+<ApiStyleComparisonDiagram />
+
+<Technical>
+
+### REST: tài nguyên + HTTP verb
+
+```http title="REST — CRUD trên resource orders"
+GET    /orders/42          # đọc một order
+GET    /orders?userId=7    # lọc theo user
+POST   /orders             # tạo order mới
+PATCH  /orders/42          # cập nhật một phần
+DELETE /orders/42          # xoá
+```
+
+Ưu điểm lớn nhất là **tận dụng hạ tầng HTTP có sẵn**: cache theo URL (CDN, browser cache), status code chuẩn, mọi ngôn ngữ/tool đều gọi được. Nhược điểm: **over-fetching** (trả cả object dù client chỉ cần 2 field) và **under-fetching** (client phải gọi thêm request để lấy dữ liệu liên quan).
+
+### gRPC: contract-first, nhị phân, streaming
+
+```protobuf title="proto/order.proto"
+syntax = "proto3";
+service OrderService {
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  rpc StreamOrderUpdates(GetOrderRequest) returns (stream OrderEvent); // server streaming
+}
+message GetOrderRequest { int64 id = 1; }
+message Order { int64 id = 1; string status = 2; repeated OrderItem items = 3; }
+```
+
+File `.proto` là **hợp đồng duy nhất**: chạy `protoc` sinh ra client/server stub cho Go, Java, TypeScript… nên hai team không thể "hiểu khác nhau" về field nào bắt buộc. Protobuf mã hoá nhị phân, thường nhỏ hơn JSON tương đương vài lần vì không lặp lại tên field dạng text. gRPC hỗ trợ 4 kiểu: unary, server streaming, client streaming, bidirectional streaming — hợp cho các luồng như "theo dõi trạng thái đơn hàng liên tục".
+
+Đánh đổi: **browser không gọi thẳng gRPC được** (cần gRPC-Web qua một proxy dịch sang HTTP/1.1), và debug khó hơn REST vì payload là binary — cần `grpcurl` thay vì `curl`.
+
+### GraphQL: client mô tả hình dạng dữ liệu cần
+
+```graphql title="query lấy đúng field cần cho màn hình"
+query OrderDetail($id: ID!) {
+  order(id: $id) {
+    status
+    items { name price }
+    user { name }
+  }
+}
+```
+
+Một request lấy dữ liệu từ nhiều "nguồn" (resolver có thể gọi nhiều service khác nhau phía sau), giảm round trip cho client — rất hợp cho mobile nhiều màn hình. Cái giá: **N+1 query** nếu không cẩn thận (resolver `user` bị gọi riêng cho từng order), cache HTTP thông thường khó áp dụng (thường POST một endpoint duy nhất), và cần giới hạn độ phức tạp/độ sâu query để tránh một client gửi query khổng lồ làm sập backend.
+
+```ts title="Giải N+1 bằng DataLoader (gom nhiều lệnh gọi user thành 1 batch)"
+import DataLoader from "dataloader";
+
+const userLoader = new DataLoader<number, User>(async (ids) => {
+  const users = await db.query("SELECT * FROM users WHERE id = ANY($1)", [ids]);
+  const byId = new Map(users.rows.map((u) => [u.id, u]));
+  return ids.map((id) => byId.get(id)!); // giữ đúng thứ tự ids đầu vào
+});
+```
+
+`DataLoader` gom mọi lệnh gọi `.load(id)` trong cùng một tick sự kiện thành **một** query `WHERE id = ANY(...)` — biến 50 round trip thành 1.
+
+### Chọn kiểu nào
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| REST | Dễ hiểu, cache HTTP tốt, tooling phổ biến (curl, Postman, OpenAPI) | Over/under-fetching, nhiều round trip cho dữ liệu liên quan | API công khai, webhook, CRUD đơn giản |
+| gRPC | Nhanh, payload nhỏ, contract chặt, streaming mạnh | Browser cần proxy, khó debug thủ công, học đường cong ban đầu | Giao tiếp service-to-service nội bộ, hệ thống nhiều ngôn ngữ |
+| GraphQL | 1 round trip cho dữ liệu đa nguồn, client linh hoạt | N+1 nếu không dùng DataLoader, cache khó hơn, cần giới hạn độ phức tạp query | Client đa dạng (mobile, web) cần nhiều hình dạng dữ liệu khác nhau |
+
+Nhiều hệ thống lớn dùng **cả ba ở các tầng khác nhau**: gRPC giữa microservice nội bộ, GraphQL hoặc BFF ở tầng client-facing, REST cho webhook/API đối tác bên ngoài. Đổi ý khi: một API REST nội bộ đang tốn quá nhiều round trip cho một màn hình ⇒ cân nhắc BFF/GraphQL; hoặc một GraphQL endpoint công khai đang khó cache/bị lạm dụng ⇒ thêm REST cho các truy vấn phổ biến.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "REST: gọi thẳng, dễ đọc, cache được theo URL", command: "curl -s localhost:8080/api/quotes/VNM", output: "{\"symbol\":\"VNM\",\"price\":68500,\"currency\":\"VND\"}" },
+    { comment: "So sánh kích thước JSON vs protobuf cho cùng dữ liệu (ước lượng bằng node)", command: "node -e \"const j=JSON.stringify({symbol:'VNM',price:68500,currency:'VND'}); console.log('json', j.length, 'bytes')\"", output: "json 47 bytes" },
+    { comment: "grpcurl liệt kê service từ reflection (cần bật server reflection)", command: "grpcurl -plaintext localhost:50051 list", output: "grpc.reflection.v1alpha.ServerReflection\nquote.QuoteService" },
+    { comment: "Gọi gRPC unary bằng grpcurl, so p95 với k6 (xem lab module-meta)", command: "grpcurl -plaintext -d '{\"symbol\":\"VNM\"}' localhost:50051 quote.QuoteService/GetQuote", output: "{\n  \"symbol\": \"VNM\",\n  \"price\": 68500\n}" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Query GraphQL không giới hạn độ sâu.** Một query lồng `order { user { orders { user { orders { ... } } } } }` có thể khiến resolver chạy hàng nghìn lần. Luôn giới hạn `maxDepth` và độ phức tạp (cost analysis) ở tầng server.
+</Callout>
+
+<Callout type="mistake">
+  **Dùng gRPC cho API mà đối tác bên ngoài cần tự gọi bằng Postman/curl.** Ép đối tác cài `protoc` và generate client chỉ để test một endpoint là rào cản không cần thiết — REST hoặc GraphQL phù hợp hơn cho ranh giới tổ chức.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi thiết kế API cho một hệ thống, nêu rõ **ai gọi ai**: client bên ngoài (ưu tiên REST/GraphQL, tương thích rộng) hay service nội bộ (gRPC cho hiệu năng và contract chặt). Câu trả lời mạnh còn nhắc versioning (REST: `/v2/...` hoặc header; GraphQL: thêm field thay vì đổi field cũ; gRPC: field mới trong message, giữ số thứ tự cũ) và cách tránh N+1.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Over-fetching / under-fetching", meaning: "Nhận thừa dữ liệu không dùng / phải gọi thêm request để đủ dữ liệu." },
+    { term: "Protobuf", meaning: "Định dạng nhị phân có schema, dùng bởi gRPC, nhỏ hơn JSON tương đương." },
+    { term: "Contract-first", meaning: "Định nghĩa API (proto, schema) trước, sinh code từ đó — hai phía luôn khớp." },
+    { term: "N+1 query", meaning: "Gọi 1 query lấy danh sách rồi N query riêng cho từng phần tử, thay vì gộp lại." },
+    { term: "DataLoader", meaning: "Cơ chế gom nhiều lệnh gọi rời rạc trong cùng tick thành một batch." },
+    { term: "BFF (Backend For Frontend)", meaning: "Tầng trung gian tổng hợp dữ liệu từ nhiều service cho một loại client cụ thể." },
+    { term: "Server streaming (gRPC)", meaning: "Một request, server trả về nhiều message liên tục theo thời gian." },
+  ]}
+/>
+
+<QuickCheck
+  question="Dashboard nội bộ gọi GraphQL, mỗi lần tải trang mất 3 giây và log cho thấy 200 query SQL riêng lẻ cho 40 dòng dữ liệu. Nguyên nhân và cách sửa hợp lý nhất?"
+  options={[
+    "Do GraphQL chậm hơn REST bản chất; nên đổi hẳn sang REST",
+    "Do thiếu index; thêm index cho mọi bảng",
+    "N+1 query: mỗi dòng gọi riêng resolver liên quan (vd user, product); gom bằng DataLoader để còn vài query gộp",
+    "Do dùng HTTP/1.1; nâng lên HTTP/2",
+  ]}
+  answerIndex={2}
+  explanation="200 query cho 40 dòng là dấu hiệu kinh điển của N+1: mỗi dòng lại tự gọi resolver riêng. DataLoader gom các lệnh gọi trong cùng tick thành một câu WHERE id = ANY(...), không liên quan tới bản chất GraphQL hay giao thức HTTP."
+/>

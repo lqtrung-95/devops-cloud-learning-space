@@ -1,0 +1,132 @@
+import { RealtimeDeliveryModesDiagram } from "../diagrams/realtime-delivery-modes-diagram";
+
+<Eli5 title="Bốn cách biết thư đã tới: hỏi liên tục, chờ ở cửa, nghe loa phường, hay bộ đàm" emoji="📬">
+  **Polling**: cứ 5 phút bạn chạy ra hộp thư hỏi "có thư chưa?" — dù 99% lần là chưa. Đơn giản nhưng tốn công cả hai bên.
+
+  **Long polling**: bạn đứng chờ ngay ở cửa bưu điện, nhân viên chỉ trả lời khi có thư (hoặc sau một lúc lâu không có thì bảo "chưa có, quay lại hỏi tiếp"). Ít lần "hỏi suông" hơn hẳn.
+
+  **SSE (Server-Sent Events)**: giống loa phát thanh phường — phường có tin gì mới thì phát ngay qua loa đang mở sẵn, bạn chỉ cần nghe. Nhưng loa chỉ phát một chiều, bạn không nói lại qua loa được.
+
+  **WebSocket**: giống bộ đàm — bấm nút là nói được ngay, bên kia cũng vậy, cả hai chiều liên tục trên cùng một kênh đã mở.
+
+  Chỗ ví von bị hụt: "chờ ở cửa bưu điện" (long polling) trong máy tính là một HTTP request bị giữ lại chưa trả response — tốn một "chỗ đứng" (connection/thread) ở server suốt thời gian chờ.
+</Eli5>
+
+Chọn nhầm cơ chế realtime là lỗi tốn kém: dùng WebSocket cho một thông báo mỗi giờ thì lãng phí hạ tầng giữ hàng triệu kết nối mở; dùng polling 1 giây cho chat thì server ngộp trong request rỗng còn user vẫn thấy tin nhắn tới "trễ". Bài học SD16 (chat & presence) sẽ đào sâu WebSocket ở quy mô lớn — bài này xây nền tảng để so sánh đúng.
+
+<RealtimeDeliveryModesDiagram />
+
+<Technical>
+
+### Bốn cơ chế, bốn cái giá khác nhau
+
+| | Short polling | Long polling | SSE | WebSocket |
+|---|---|---|---|---|
+| Chiều dữ liệu | Server → client (qua hỏi lặp) | Server → client | Server → client | Hai chiều |
+| Giao thức | HTTP thường | HTTP thường | HTTP (`text/event-stream`) | HTTP Upgrade → TCP thô |
+| Độ trễ | = interval hỏi | ~0 (trong lúc đang chờ) | ~0 | ~0 |
+| Số request/kết nối | Nhiều, phần lớn rỗng | Nhiều, ít rỗng hơn | 1 kết nối dài | 1 kết nối dài |
+| Tự động reconnect | Có sẵn (mỗi lần là request mới) | Client tự viết lại | Trình duyệt tự làm (`EventSource`) | Phải tự viết |
+| Qua proxy/firewall cũ | Dễ | Dễ | Dễ (vẫn là HTTP) | Có thể bị chặn/timeout nếu proxy không hiểu Upgrade |
+
+### SSE: một chiều nhưng rẻ và bền
+
+```ts title="app/src/sse.ts"
+app.get("/stream/price", (req, reply) => {
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  const send = (price: number) => reply.raw.write(`data: ${JSON.stringify({ price, at: Date.now() })}\n\n`);
+  const timer = setInterval(() => send(getLatestPrice()), 2000);
+  req.raw.on("close", () => clearInterval(timer)); // dọn dẹp khi client rời đi
+});
+```
+
+Trình duyệt dùng `new EventSource("/stream/price")` — tự động **reconnect** khi mất kết nối và gửi lại header `Last-Event-ID` để server biết tiếp tục từ đâu (nếu server implement `id:` trong mỗi event). SSE chạy trên HTTP bình thường nên qua được hầu hết proxy, nhưng **cần tắt buffering** ở reverse proxy — Nginx mặc định đệm response, làm event bị giữ lại thay vì gửi ngay.
+
+```nginx title="nginx/default.conf — bắt buộc cho SSE"
+location /stream/ {
+  proxy_pass http://app_upstream;
+  proxy_buffering off;      # không đệm, đẩy event ngay khi có
+  proxy_read_timeout 1h;    # kết nối SSE sống lâu, timeout mặc định sẽ cắt ngang
+  proxy_set_header Connection "";
+}
+```
+
+### WebSocket: hai chiều, cần lo nhiều hơn
+
+```ts title="app/src/ws.ts"
+import { WebSocketServer } from "ws";
+
+const wss = new WebSocketServer({ noServer: true });
+wss.on("connection", (socket) => {
+  const timer = setInterval(() => socket.send(JSON.stringify({ price: getLatestPrice() })), 2000);
+  socket.on("message", (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === "subscribe") console.log("client theo dõi", msg.symbol);
+  });
+  socket.on("close", () => clearInterval(timer));
+});
+```
+
+WebSocket **không tự đảm bảo gì** ngoài "giao đúng thứ tự byte trên kết nối này" — ứng dụng phải tự lo: heartbeat (ping/pong) để phát hiện kết nối chết, reconnect với backoff khi rớt mạng, và đồng bộ lại trạng thái sau khi nối lại (vì các sự kiện trong lúc mất kết nối đã trôi qua). Ở nhiều instance sau load balancer, cần sticky routing hoặc pub/sub trung gian (Redis, SD16) để tin nhắn tới đúng instance đang giữ kết nối của user.
+
+### Chi phí tài nguyên khi giữ nhiều kết nối mở
+
+Mỗi kết nối SSE/WebSocket giữ ít nhất một socket và buffer ở server. Giả định: 100.000 kết nối đồng thời × ~20KB overhead/kết nối (buffer + cấu trúc quản lý) ⇒ cỡ 2GB RAM chỉ để *giữ* kết nối, chưa tính xử lý. Đây là lý do event loop (Node.js) hoặc mô hình bất đồng bộ khác thường được chọn cho tầng gateway realtime, thay vì one-thread-per-connection.
+
+### Chọn cơ chế nào
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Short polling | Cực đơn giản, không trạng thái, cache/CDN thân thiện | Trễ = interval, tốn request rỗng khi tỉ lệ có-tin-mới thấp | Dữ liệu đổi chậm, chấp nhận trễ vài giây–vài phút |
+| Long polling | Trễ thấp mà vẫn là HTTP thường, qua được hạ tầng cũ | Server phải giữ nhiều request treo; phức tạp hơn short polling | Cần trễ thấp nhưng không muốn/không thể dùng WebSocket |
+| SSE | Trễ thấp, tự reconnect, đơn giản hơn WebSocket | Một chiều; giới hạn số kết nối HTTP/1.1 mỗi host (đỡ hơn nhiều với HTTP/2) | Feed thông báo, dashboard cập nhật, log tail |
+| WebSocket | Hai chiều thật, trễ thấp cho cả gửi lẫn nhận | Phức tạp nhất: heartbeat, reconnect, sticky/pub-sub khi nhiều instance | Chat, game realtime, collaborative editing, trading |
+
+Đổi ý khi: tính năng "chỉ đẩy thông báo" (SSE đủ dùng) phát triển thêm "trả lời trực tiếp trong thông báo" (cần kênh ngược) ⇒ cân nhắc chuyển sang WebSocket.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem SSE thô qua curl — sẽ in liên tục, không tự thoát", command: "curl -N localhost:8080/stream/price", output: "data: {\"price\":68500,\"at\":1757980800000}\n\ndata: {\"price\":68620,\"at\":1757980802000}\n\n" },
+    { comment: "Đếm request polling trong 2 phút qua log Nginx", command: "docker compose logs nginx --since=2m | grep -c 'GET /api/price'", output: "24" },
+    { comment: "Test WebSocket nhanh bằng websocat (cài: brew install websocat)", command: "websocat ws://localhost:3000/ws/price", output: "{\"price\":68500}\n{\"price\":68410}" },
+    { comment: "Kiểm tra Nginx đã tắt buffering cho SSE chưa", command: "docker compose exec nginx nginx -T 2>/dev/null | grep -A2 'location /stream'", output: "location /stream/ {\n    proxy_buffering off;" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Quên `proxy_buffering off` cho SSE.** Nginx mặc định đệm response tới khi đủ một buffer hoặc connection đóng — event bị giữ lại hàng chục giây thay vì gửi ngay, làm SSE trông "không hoạt động".
+</Callout>
+
+<Callout type="mistake">
+  **Không có heartbeat cho WebSocket.** Nhiều NAT/firewall/load balancer âm thầm đóng kết nối TCP idle sau vài phút. Không có ping/pong định kỳ, client tưởng vẫn kết nối trong khi server đã đóng từ lâu — tin nhắn "biến mất" không rõ lý do.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi kinh điển: "Vì sao chat cần WebSocket còn feed thông báo dùng SSE là đủ?" Câu trả lời mạnh chỉ ra **hướng dữ liệu** (chat cần gửi từ cả hai phía trên cùng kênh; feed chỉ cần server đẩy) và **tần suất/độ trễ yêu cầu**, đồng thời nhắc chi phí vận hành: giữ hàng triệu WebSocket cần kiến trúc gateway riêng, trong khi SSE tận dụng được hạ tầng HTTP có sẵn.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Short polling", meaning: "Client hỏi lại định kỳ theo interval cố định." },
+    { term: "Long polling", meaning: "Server giữ request tới khi có dữ liệu hoặc timeout mới trả về." },
+    { term: "Server-Sent Events (SSE)", meaning: "Kênh một chiều server→client qua một HTTP response không đóng, dùng EventSource." },
+    { term: "WebSocket", meaning: "Kênh hai chiều liên tục qua một kết nối TCP sau khi nâng cấp từ HTTP." },
+    { term: "Heartbeat (ping/pong)", meaning: "Gói tin định kỳ để xác nhận kết nối còn sống và tránh bị hạ tầng mạng đóng do idle." },
+    { term: "Sticky routing", meaning: "Load balancer luôn đưa cùng một client về đúng instance đang giữ kết nối của họ." },
+  ]}
+/>
+
+<QuickCheck
+  question="Tính năng 'số lượng người đang xem' hiển thị trên trang sản phẩm, cập nhật vài giây một lần, chỉ cần server đẩy xuống, không cần client gửi gì qua kênh đó. Lựa chọn đơn giản mà đủ?"
+  options={["WebSocket hai chiều", "Server-Sent Events (SSE)", "Long polling", "Polling mỗi 100ms"]}
+  answerIndex={1}
+  explanation="Giống loa phường: chỉ cần phát, không cần người nghe nói lại qua loa. SSE chạy trên HTTP bình thường, tự reconnect, không cần độ phức tạp hai chiều của WebSocket."
+/>
