@@ -1,0 +1,147 @@
+import { EventDrivenVsRequestResponseDiagram } from "../diagrams/event-driven-vs-request-response-diagram";
+
+<Eli5 title="Gọi điện thoại đợi trả lời, hay bỏ thư vào hộp rồi đi tiếp việc khác" emoji="☎️📮">
+  Gọi điện thoại (**request/response**) nghĩa là bạn đứng đó chờ đầu dây bên kia bắt máy và trả lời xong mới cúp máy làm việc khác — nếu người kia bận hoặc tắt máy, bạn kẹt lại chờ hoặc phải gọi lại ngay.
+
+  Bỏ thư vào hộp thư rồi đi tiếp (**event-driven**) nghĩa là bạn không cần biết người nhận có đang ở nhà hay không — bạn bỏ thư xong là xong việc của mình. Người đưa thư (relay) lo phần còn lại, kể cả việc quay lại nhiều lần nếu lần đầu không gặp người nhận.
+
+  Cả hai cách đều "gửi thông báo được" — khác nhau ở việc AI phải chờ AI, và điều gì xảy ra khi bên nhận tạm thời không sẵn sàng.
+</Eli5>
+
+B13 dùng request/response: `api` gọi gRPC `SendNotification` và đợi kết quả ngay trong request. Bài này chuyển sang event-driven cho đúng use case gửi notification: `api` chỉ ghi `outbox` (đã học ở bài trước), một **relay** chạy độc lập trong service `worker` (đã có từ B09) đọc `outbox` và gọi gRPC thay cho `api`.
+
+<EventDrivenVsRequestResponseDiagram />
+
+<Technical>
+
+### So sánh cho đúng use case này (không phải tuyên bố chung chung "event-driven luôn tốt hơn")
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Request/response (gRPC trực tiếp, B13) | Kết quả tức thời, dễ trace lỗi (biết ngay thành công hay không) | Request chính bị chặn/lỗi theo nếu service phụ trợ down hoặc chậm | Gọi cần kết quả NGAY để quyết định bước tiếp theo (ví dụ kiểm tra quyền, tính phí) |
+| Event-driven (outbox + relay poll) | Request chính không phụ thuộc sự sẵn sàng của service phụ trợ; tự động retry khi service down | Độ trễ vài giây (chu kỳ poll); khó biết "gửi xong chưa" ngay lập tức từ phía client | Việc phụ trợ, không cần kết quả ngay, cần chịu lỗi khi downstream tạm chết (đúng trường hợp gửi notification) |
+
+Gửi notification là ví dụ kinh điển cho cột bên phải: user tạo comment không cần biết notification đã tới tay ai chưa, và tuyệt đối không nên bị chặn chỉ vì `notification-service` đang restart.
+
+### Relay: đọc `outbox`, gọi gRPC, đánh dấu khi thành công
+
+```ts title="src/queues/outbox-relay.ts"
+import { asc, eq, isNull } from "drizzle-orm";
+import { db } from "../db/client.js";
+import { outbox } from "../db/schema.js";
+import { notificationClient } from "../grpc/notification-client.js"; // client gRPC đã dựng ở B13
+
+const BATCH_SIZE = 20;
+const POLL_INTERVAL_MS = 2000;
+
+/** Chạy một lượt poll: gửi tất cả outbox row chưa publish, tối đa BATCH_SIZE dòng. */
+export async function relayOnce(): Promise<{ attempted: number; succeeded: number }> {
+  const pending = await db
+    .select()
+    .from(outbox)
+    .where(isNull(outbox.publishedAt))
+    .orderBy(asc(outbox.id))
+    .limit(BATCH_SIZE);
+
+  let succeeded = 0;
+  for (const row of pending) {
+    try {
+      await notificationClient.sendNotification({
+        eventType: row.eventType,
+        aggregateId: row.aggregateId,
+        payload: JSON.stringify(row.payload),
+      });
+      // Chỉ đánh dấu SAU KHI gọi thành công — xem lesson 3 vì sao thứ tự này quan trọng.
+      await db.update(outbox).set({ publishedAt: new Date() }).where(eq(outbox.id, row.id));
+      succeeded += 1;
+    } catch (error) {
+      // notification-service có thể đang down — KHÔNG throw, để lần poll sau thử lại đúng dòng này
+      console.warn(`[outbox-relay] gửi thất bại cho outbox #${row.id}, sẽ thử lại`, (error as Error).message);
+    }
+  }
+  return { attempted: pending.length, succeeded };
+}
+
+export async function startOutboxRelay(): Promise<void> {
+  for (;;) {
+    await relayOnce().catch((error) => console.error("[outbox-relay] lỗi không lường trước", error));
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+}
+```
+
+`src/worker.ts` (đã có `Worker` BullMQ từ B09) chỉ cần gọi thêm `startOutboxRelay()` khi khởi động — cùng process, cùng container `worker`, **không cần thêm service mới vào `docker-compose.yml`**:
+
+```ts title="src/worker.ts"
+import { startOutboxRelay } from "./queues/outbox-relay.js";
+// ... phần khởi tạo Worker BullMQ đã có từ B09 ...
+
+startOutboxRelay().catch((error) => {
+  console.error("[worker] outbox relay dừng vì lỗi không lường trước", error);
+});
+```
+
+Để chạy relay độc lập lúc debug hoặc chaos test (bài sau), thêm script riêng:
+
+```json title="package.json"
+{
+  "scripts": {
+    "worker:relay": "tsx src/queues/run-outbox-relay.ts"
+  }
+}
+```
+
+### Polling vs CDC — đánh đổi cần biết, không cần triển khai
+
+Relay ở đây dùng **polling**: hỏi Postgres "có gì mới không" mỗi 2 giây. Cách tinh vi hơn là **CDC (Change Data Capture)** — ví dụ Debezium đọc trực tiếp write-ahead log (WAL) của Postgres, phát hiện `INSERT` vào `outbox` gần như ngay lập tức, không cần hỏi lặp lại.
+
+| Cách | Độ trễ | Tải lên Postgres | Độ phức tạp vận hành |
+|---|---|---|---|
+| Polling (`SELECT ... WHERE published_at IS NULL`) | Tối đa bằng chu kỳ poll (2s ở đây) | `SELECT` lặp lại kể cả khi không có gì mới | Thấp — chỉ là code trong `worker` |
+| CDC (Debezium đọc WAL) | Gần như tức thời | Không cần poll, đọc log thay đổi | Cao hơn — cần chạy Debezium/Kafka Connect riêng |
+
+Module này chọn polling vì đơn giản và đủ cho tải của `taskflow-api`. CDC là hướng nâng cấp hợp lý khi số lượng event hoặc yêu cầu độ trễ tăng lên — không cần làm ngay, nhưng nên biết nó tồn tại.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chạy relay độc lập để quan sát log rõ ràng", command: "pnpm worker:relay", output: "[outbox-relay] bắt đầu poll mỗi 2000ms\n[outbox-relay] không có dòng nào cần gửi" },
+    { comment: "Tạo comment ở terminal khác", command: "curl -s -X POST localhost:3000/api/v1/tasks/$TASK_ID/comments -d '{\"body\":\"test relay\"}' -H 'Content-Type: application/json' -H 'Authorization: Bearer $TOKEN'" },
+    { comment: "Quan sát relay tự bắt được dòng mới và gửi thành công", command: "# (quan sát terminal đang chạy pnpm worker:relay)", output: "[outbox-relay] gửi outbox #12 (comment.created) — thành công" },
+    { comment: "Tắt notification-service rồi tạo thêm 1 comment", command: "docker compose stop notification-service && curl -s -X POST localhost:3000/api/v1/tasks/$TASK_ID/comments -d '{\"body\":\"test khi service down\"}' -H 'Content-Type: application/json' -H 'Authorization: Bearer $TOKEN'", output: '{"id":"d2f0...","body":"test khi service down","createdAt":"2026-09-17T03:20:11.000Z"}' },
+    { comment: "Relay vẫn chạy, log cảnh báo lặp lại — process không crash", command: "# (quan sát terminal pnpm worker:relay)", output: "[outbox-relay] gửi thất bại cho outbox #13, sẽ thử lại 14 UNAVAILABLE: No connection established" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Để `relayOnce()` `throw` ra ngoài khi một dòng gọi gRPC lỗi (thay vì `try/catch` từng dòng) — nếu vậy, MỘT dòng lỗi sẽ làm cả vòng lặp dừng lại, kéo theo mọi dòng khác trong batch cũng không được thử, dù chúng có thể gửi thành công.
+</Callout>
+
+<Callout type="warning" title="Rủi ro duplicate còn sót lại — thành thật, không tô hồng">
+  Nếu process `worker` bị kill đúng lúc `sendNotification` vừa trả về thành công nhưng CHƯA kịp chạy `UPDATE outbox SET published_at`, lần poll sau sẽ gọi lại đúng event đó lần nữa. Hệ thống này là **at-least-once**, không phải exactly-once tuyệt đối. Giảm thiểu triệt để đòi hỏi `SendNotification` phía `notification-service` idempotent (dedup theo `aggregate_id` + `event_type`) — nằm ngoài phạm vi lab này, nhưng cần biết rõ đây là rủi ro còn tồn tại, không phải đã được giải quyết hoàn toàn.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "event-driven", meaning: "Bên gửi phát ra event rồi không chờ kết quả xử lý ngay; bên nhận xử lý độc lập, có thể sau một khoảng trễ." },
+    { term: "request/response", meaning: "Bên gọi đợi bên nhận xử lý xong và trả kết quả trước khi tiếp tục." },
+    { term: "polling", meaning: "Hỏi lặp lại định kỳ 'có gì mới không' thay vì được báo ngay khi có thay đổi." },
+    { term: "CDC (Change Data Capture)", meaning: "Kỹ thuật đọc trực tiếp log thay đổi của database (ví dụ WAL của Postgres) để phát hiện thay đổi gần như tức thời, không cần poll." },
+    { term: "at-least-once", meaning: "Đảm bảo một event sẽ được xử lý ít nhất một lần — có thể nhiều hơn một lần trong một số tình huống crash hiếm gặp." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao gửi notification (trong use case tạo comment) phù hợp với event-driven (outbox + relay) hơn là request/response (gọi gRPC trực tiếp trong request)?"
+  options={[
+    "Vì event-driven luôn nhanh hơn request/response trong mọi trường hợp",
+    "Vì việc tạo comment không cần biết ngay kết quả gửi notification, và không nên bị chặn/lỗi chỉ vì notification-service đang tạm thời không sẵn sàng — đây đúng là trường hợp nên tách rời (loose coupling), đổi lấy độ trễ vài giây",
+    "Vì gRPC không hỗ trợ gọi trực tiếp trong route handler của Fastify",
+    "Vì request/response không thể dùng cho service viết bằng Node.js",
+  ]}
+  answerIndex={1}
+  explanation="Đây là lựa chọn dựa trên đặc điểm của use case, không phải một quy tắc tuyệt đối: việc phụ trợ, không cần kết quả ngay, cần chịu lỗi khi downstream chết — chính là điều kiện lý tưởng cho event-driven."
+/>

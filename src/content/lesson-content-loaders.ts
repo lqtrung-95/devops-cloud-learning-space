@@ -54,4 +54,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "b09-background-jobs-scheduling": (lessonSlug) => import(`./modules/b09-background-jobs-scheduling/lessons/${lessonSlug}.mdx`),
   "b07-testing-backend": (lessonSlug) => import(`./modules/b07-testing-backend/lessons/${lessonSlug}.mdx`),
   "b10-caching-for-backend": (lessonSlug) => import(`./modules/b10-caching-for-backend/lessons/${lessonSlug}.mdx`),
+  "b14-microservice-split-event-driven": (lessonSlug) => import(`./modules/b14-microservice-split-event-driven/lessons/${lessonSlug}.mdx`),
 };

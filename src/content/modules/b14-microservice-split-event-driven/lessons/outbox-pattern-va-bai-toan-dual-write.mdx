@@ -1,0 +1,124 @@
+import { DualWriteProblemVsOutboxDiagram } from "../diagrams/dual-write-problem-vs-outbox-diagram";
+
+<Eli5 title="Gửi thư qua hộp thư chung, không gọi điện trực tiếp" emoji="📮">
+  Tưởng tượng bạn vừa hoàn tất một đơn hàng ở quầy (ghi vào sổ cái — việc chính, không thể sai). Ngay sau đó bạn tự cầm điện thoại gọi cho bưu tá để báo "có hàng cần giao". Nếu đúng lúc đó bạn ngất xỉu (crash) giữa việc ghi sổ và việc gọi điện, đơn hàng đã được ghi nhận nhưng bưu tá không hề biết — hàng không bao giờ được giao.
+
+  Cách an toàn hơn: ngay khi ghi sổ, bạn CŨNG bỏ luôn một tờ phiếu vào hộp thư chung (cùng một hành động, không tách rời). Một người đưa thư (relay) đi kiểm hộp thư định kỳ, thấy phiếu mới thì đi giao; giao trượt (bưu tá tạm nghỉ) thì tờ phiếu vẫn nằm đó, người đưa thư quay lại giao tiếp ở vòng sau. Ghi sổ và bỏ phiếu vào hộp thư là MỘT hành động không thể tách đôi; việc giao đi là một hành động khác, được phép thử lại bao nhiêu lần cũng được.
+</Eli5>
+
+Ở B13, `api` gọi gRPC `SendNotification` trực tiếp ngay trong request xử lý nghiệp vụ. Cách đó hoạt động tốt khi mọi thứ khoẻ mạnh, nhưng có một khe hở: **ghi Postgres** và **gọi service khác qua mạng** là hai hệ thống hoàn toàn khác nhau, không có transaction phân tán nào bao trọn cả hai một cách rẻ tiền. Đây gọi là **dual-write problem**. Module này đóng khe hở đó bằng **outbox pattern**.
+
+**Quyết định thiết kế của module (nêu rõ vì đây là lựa chọn, không phải sự thật hiển nhiên):** bảng `outbox` được thêm vào Postgres CHÍNH của `taskflow-api` — không phải một bảng riêng ở `notification-service`. Lý do: bước cần đảm bảo atomic là *business write* (insert `comments`) đi cùng *ghi ý định gửi event*, và cả hai đều là hành vi của `taskflow-api`. Việc bảng nằm ở đâu không quan trọng bằng việc nó nằm CÙNG một transaction với business write đó.
+
+<DualWriteProblemVsOutboxDiagram />
+
+<Technical>
+
+### Bảng `outbox` (đúng cột theo mục 3 curriculum)
+
+```ts title="src/db/schema.ts"
+import { bigserial, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+
+export const outbox = pgTable("outbox", {
+  id: bigserial("id", { mode: "number" }).primaryKey(),
+  aggregateType: text("aggregate_type").notNull(),
+  aggregateId: uuid("aggregate_id").notNull(),
+  eventType: text("event_type").notNull(),
+  payload: jsonb("payload").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  publishedAt: timestamp("published_at", { withTimezone: true }), // NULL = chưa gửi
+});
+```
+
+`aggregate_type`/`aggregate_id` cho biết event này thuộc về thực thể nào (ví dụ `"comment"` + id của comment đó) — hữu ích khi debug hoặc khi sau này cần replay lại đúng một nhóm event.
+
+### Ghi trong CÙNG một transaction
+
+```ts title="src/routes/comments.ts"
+fastify.post("/api/v1/tasks/:taskId/comments", async (request, reply) => {
+  const { taskId } = request.params as { taskId: string };
+  const { body } = request.body as { body: string };
+
+  const comment = await db.transaction(async (tx) => {
+    const [created] = await tx
+      .insert(comments)
+      .values({ taskId, authorId: request.user.id, body })
+      .returning();
+
+    // Cùng transaction — commit hoặc rollback cùng lúc với insert ở trên
+    await tx.insert(outbox).values({
+      aggregateType: "comment",
+      aggregateId: created.id,
+      eventType: "comment.created",
+      payload: { taskId, commentId: created.id, authorId: request.user.id, body },
+    });
+
+    return created;
+  });
+
+  reply.code(201);
+  return comment;
+});
+```
+
+Không có `notificationClient.sendNotification(...)` nào ở đây cả — đó là việc CHỦ ĐÍCH để lại cho relay ở bài sau. Điều `db.transaction` đảm bảo: nếu `INSERT comments` thất bại, `INSERT outbox` cũng không xảy ra (và ngược lại) — giống hệt cơ chế transaction đã học ở B04, chỉ áp dụng cho hai bảng thay vì một.
+
+### Outbox pattern đảm bảo atomic ở ĐÂU, và KHÔNG đảm bảo ở đâu
+
+| Bước | Có atomic không? | Vì sao |
+|---|---|---|
+| `INSERT comments` + `INSERT outbox` | Có — cùng `db.transaction` Postgres | Cùng một database, transaction thông thường xử lý được |
+| Relay đọc `outbox` + gọi gRPC `SendNotification` | Không — hai bước riêng, cách nhau bằng thời gian | Gọi mạng có thể timeout/lỗi bất cứ lúc nào; không thể "rollback" một request đã gửi đi tới service khác |
+
+Chính vì bước thứ hai không thể atomic, nó phải được thiết kế để **retry an toàn** (idempotent-checkable): relay chỉ đánh dấu `published_at` sau khi gọi thành công, nên gọi lại nhiều lần cho tới khi thành công là hành vi đúng, không phải bug.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Sinh migration cho bảng outbox", command: "pnpm drizzle-kit generate", output: "✓ 1 migration created: drizzle/0009_add_outbox.sql" },
+    { comment: "Áp migration", command: "pnpm drizzle-kit migrate", output: "✓ Migrations applied" },
+    {
+      comment: "Tạo một comment qua API",
+      command: "curl -s -X POST localhost:3000/api/v1/tasks/$TASK_ID/comments -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"body\":\"đã xong phần review\"}'",
+      output: '{"id":"c9b1...","taskId":"...","body":"đã xong phần review","createdAt":"2026-09-17T03:12:00.000Z"}',
+    },
+    {
+      comment: "Kiểm tra outbox — published_at phải là NULL, chưa ai gửi",
+      command: "docker compose exec postgres psql -U taskflow -c \"select id, event_type, published_at from outbox order by id desc limit 1;\"",
+      output: " id | event_type      | published_at\n----+-----------------+--------------\n  7 | comment.created | \n",
+    },
+  ]}
+/>
+
+<Callout type="warning" title="Đừng gọi gRPC bên trong db.transaction">
+  Một cám dỗ thường gặp: cứ gọi luôn `notificationClient.sendNotification(...)` bên trong `db.transaction` cho "chắc ăn". Đừng làm vậy — network call bên trong transaction giữ connection Postgres mở suốt thời gian chờ gRPC trả lời (có thể vài giây nếu service đang chậm), làm cạn connection pool nhanh hơn nhiều so với chỉ giữ connection cho vài lệnh `INSERT`.
+</Callout>
+
+<Callout type="mistake">
+  Quên `.returning()` sau `tx.insert(comments)` rồi lấy `taskId`/`authorId` từ `request.body` thay vì từ dòng vừa insert — nếu comment insert thành công nhưng có trigger/default khác đổi giá trị (ví dụ `id` sinh tự động), `outbox.aggregateId` có thể lệch với `comments.id` thật.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "dual-write problem", meaning: "Rủi ro mất dữ liệu khi một thao tác ghi DB và một thao tác gọi hệ thống khác không thể nằm chung một transaction phân tán." },
+    { term: "outbox pattern", meaning: "Ghi business write và một bản ghi 'ý định gửi event' trong cùng transaction, rồi để một relay riêng gửi event đó đi sau." },
+    { term: "aggregate_type / aggregate_id", meaning: "Cho biết event thuộc về thực thể nào (ví dụ comment nào) — dùng để trace/debug/replay." },
+    { term: "published_at", meaning: "Cột đánh dấu thời điểm relay gửi thành công; NULL nghĩa là 'chưa gửi, cần thử'." },
+    { term: "relay", meaning: "Tiến trình đọc các dòng outbox chưa gửi và gọi service đích — sẽ viết ở bài tiếp theo." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao route tạo comment trong module này KHÔNG gọi `notificationClient.sendNotification(...)` trực tiếp, mà chỉ insert thêm một dòng vào bảng `outbox`?"
+  options={[
+    "Vì gRPC đã bị loại bỏ khỏi taskflow-api từ module này",
+    "Vì insert vào Postgres có thể nằm trong cùng transaction với business write (atomic, đáng tin cậy), còn gọi service khác qua mạng thì không thể — nên bước gọi mạng được tách ra cho một tiến trình khác xử lý riêng, có thể retry an toàn",
+    "Vì Fastify cấm gọi gRPC bên trong route handler",
+    "Vì outbox pattern nhanh hơn gọi gRPC trực tiếp",
+  ]}
+  answerIndex={1}
+  explanation="Cốt lõi của outbox pattern: tận dụng transaction Postgres (thứ vốn đã đáng tin cậy) cho phần có thể atomic, và tách phần không thể atomic (gọi mạng) ra một bước riêng được thiết kế để retry."
+/>

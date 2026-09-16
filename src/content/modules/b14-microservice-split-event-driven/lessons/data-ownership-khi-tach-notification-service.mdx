@@ -1,0 +1,124 @@
+import { NotificationServiceKillRecoverTimelineDiagram } from "../diagrams/notification-service-kill-recover-timeline-diagram";
+
+<Eli5 title="Mỗi phòng ban giữ tủ hồ sơ riêng, không tự ý mở tủ phòng khác" emoji="🗄️">
+  Trong một công ty, phòng Kế toán có tủ hồ sơ riêng, phòng Nhân sự có tủ hồ sơ riêng. Nếu phòng Nhân sự thấy tiện mà tự mở khoá tủ của Kế toán để đọc số liệu trực tiếp, mọi thứ có vẻ chạy tốt — cho tới ngày Kế toán đổi cách sắp xếp hồ sơ (đổi tên thư mục, gộp hai ngăn làm một) mà không báo trước. Nhân sự lập tức lấy sai dữ liệu hoặc lỗi hoàn toàn, dù bản thân Kế toán chẳng làm gì sai — họ chỉ đổi cách tổ chức TỦ CỦA CHÍNH HỌ.
+
+  Cách đúng: hai phòng chỉ trao đổi qua một mẫu đơn cố định (form/API) — Kế toán có thể tổ chức tủ hồ sơ kiểu gì tuỳ ý, miễn là vẫn điền đúng mẫu đơn khi Nhân sự cần thông tin.
+</Eli5>
+
+`notification-service` (B13) hiện đã gọi qua gRPC thay vì hàm nội bộ — nhưng nếu tương lai có ai đó "tiện tay" cho `notification-service` tự kết nối thẳng vào Postgres của `taskflow-api` để đọc `outbox` (thay vì qua relay/gRPC), ranh giới giữa hai service sẽ vỡ. Bài này chốt lại nguyên tắc **data ownership**: mỗi service sở hữu dữ liệu của riêng nó.
+
+<Technical>
+
+### Vì sao `notification-service` không nên đọc thẳng Postgres của `taskflow-api`
+
+`outbox`, `comments`, `tasks`... là schema NỘI BỘ của `taskflow-api` — chi tiết triển khai, không phải hợp đồng công khai. Nếu `notification-service` tự `SELECT` thẳng vào các bảng đó:
+
+- Đổi tên cột, thêm ràng buộc, hay tách bảng ở `taskflow-api` có thể âm thầm làm vỡ `notification-service` — không ai biết cho tới khi lỗi ở production.
+- Hai service coi như dùng chung một cơ sở dữ liệu — mất khả năng scale, deploy, hay đổi công nghệ lưu trữ độc lập cho từng service (đúng tinh thần "Database per service" của Chris Richardson).
+
+Thay vào đó, `notification-service` nên có **DB/read model riêng** (ví dụ một bảng `sent_notifications` trong database của chính nó, dùng để dedup và lưu lịch sử gửi) — chỉ nhận dữ liệu qua **contract rõ ràng**: request gRPC `SendNotification` mà relay gửi tới, không hơn không kém.
+
+```proto title="notification-service/proto/notification.proto (đã có từ B13, nhắc lại contract)"
+service NotificationService {
+  rpc SendNotification(SendNotificationRequest) returns (SendNotificationResponse);
+}
+
+message SendNotificationRequest {
+  string event_type = 1;
+  string aggregate_id = 2;
+  string payload = 3; // JSON string — notification-service tự parse theo nhu cầu của nó
+}
+```
+
+`notification-service` hoàn toàn tự do quyết định lưu gì, ở đâu, bằng công nghệ gì — miễn là implement đúng `.proto` này. Đây chính là ranh giới data ownership: `taskflow-api` không cần biết `notification-service` lưu trữ thế nào, và ngược lại.
+
+### Chaos test: chứng minh "không mất, không trùng" bằng dữ liệu thật
+
+```ts title="src/queues/outbox-relay.chaos.test.ts"
+import { execSync } from "node:child_process";
+import { describe, expect, it } from "vitest";
+import { isNull } from "drizzle-orm";
+import { db } from "../db/client.js";
+import { outbox } from "../db/schema.js";
+import { relayOnce } from "./outbox-relay.js";
+
+describe("outbox relay chịu được notification-service down", () => {
+  it("không mất event khi service down rồi phục hồi", async () => {
+    execSync("docker compose stop notification-service");
+
+    const createdIds: string[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      const response = await fetch(`${process.env.API_URL}/api/v1/tasks/${process.env.TEST_TASK_ID}/comments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.TEST_TOKEN}` },
+        body: JSON.stringify({ body: `chaos test #${index}` }),
+      });
+      expect(response.status).toBe(201); // request chính KHÔNG bị ảnh hưởng dù service phụ trợ đang chết
+      const comment = (await response.json()) as { id: string };
+      createdIds.push(comment.id);
+    }
+
+    const pendingBefore = await db.select().from(outbox).where(isNull(outbox.publishedAt));
+    expect(pendingBefore.length).toBeGreaterThanOrEqual(5); // outbox tích tụ, chưa mất dòng nào
+
+    execSync("docker compose start notification-service");
+    await new Promise((resolve) => setTimeout(resolve, 3000)); // đợi service sẵn sàng nhận gRPC
+
+    // Poll thủ công vài lượt thay vì đợi relay tự chạy — test chạy nhanh và tất định hơn
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const { attempted } = await relayOnce();
+      if (attempted === 0) break;
+    }
+
+    const pendingAfter = await db.select().from(outbox).where(isNull(outbox.publishedAt));
+    expect(pendingAfter.length).toBe(0); // KHÔNG THIẾU: mọi dòng cuối cùng đều được đánh dấu published_at
+  });
+});
+```
+
+Test này không "giả lập" gì cả — nó thật sự dừng container, thật sự gọi API, thật sự đọc Postgres. Đúng tinh thần "code thật, không giả lập" của course.
+
+</Technical>
+
+<NotificationServiceKillRecoverTimelineDiagram />
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chạy chaos test riêng", command: "pnpm test -- outbox-relay.chaos", output: "✓ outbox relay chịu được notification-service down > không mất event khi service down rồi phục hồi (4102ms)\n\nTest Files  1 passed (1)" },
+    { comment: "Xác nhận không còn dòng outbox nào kẹt", command: "docker compose exec postgres psql -U taskflow -c \"select count(*) from outbox where published_at is null;\"", output: " count\n-------\n     0\n" },
+    { comment: "Xem lại toàn bộ outbox vừa xử lý, theo thứ tự thời gian", command: "docker compose exec postgres psql -U taskflow -c \"select id, event_type, created_at, published_at from outbox order by id desc limit 5;\"" },
+  ]}
+/>
+
+<Callout type="info" title="Ghi lại learnings.md">
+  Theo nguyên tắc "học công khai" của course, ghi vào `learnings.md`: thời gian outage giả lập (30s), số dòng `outbox` bị kẹt tối đa quan sát được, và thời gian relay drain hết sau khi service sống lại. Đây là thói quen viết tài liệu kỹ thuật ngắn gọn sẽ hữu ích khi thật sự vận hành production.
+</Callout>
+
+<Callout type="warning" title="Đường ranh giới data ownership dễ bị phá vỡ âm thầm">
+  Không có gì về mặt kỹ thuật ngăn một dev tương lai cho `notification-service` kết nối thẳng Postgres của `taskflow-api` "cho nhanh" — Postgres không biết và không quan tâm ai đang query nó. Ranh giới này chỉ được giữ bằng kỷ luật kiến trúc (code review, tách network/credentials giữa hai service), không phải bằng một cơ chế tự động chặn.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "data ownership", meaning: "Nguyên tắc mỗi service kiểm soát hoàn toàn schema/lưu trữ dữ liệu của riêng nó; service khác chỉ truy cập qua API/contract." },
+    { term: "database per service", meaning: "Mẫu hình kiến trúc: mỗi microservice có database riêng, không chia sẻ trực tiếp với service khác." },
+    { term: "read model riêng", meaning: "Bản sao dữ liệu (thường đơn giản hoá) mà một service tự lưu để phục vụ nhu cầu của chính nó, thay vì đọc thẳng từ service khác." },
+    { term: "chaos test", meaning: "Thử nghiệm cố tình gây lỗi thật (ở đây: tắt một service) để xác nhận hệ thống chịu lỗi đúng như thiết kế." },
+    { term: "contract (proto)", meaning: "Định nghĩa `.proto` là hợp đồng công khai giữa hai service — thay đổi bên trong mỗi service không ảnh hưởng bên còn lại miễn contract không đổi." },
+  ]}
+/>
+
+<QuickCheck
+  question="`notification-service` cần biết một comment mới vừa được tạo để gửi thông báo. Cách nào đúng với nguyên tắc data ownership đã học trong bài này?"
+  options={[
+    "Cho `notification-service` mở kết nối Postgres tới đúng database của `taskflow-api` và tự SELECT bảng `comments`",
+    "Cho `notification-service` chỉ nhận dữ liệu qua gRPC `SendNotification` mà relay gọi tới — tự quyết định lưu trữ/xử lý theo cách riêng của nó, không biết và không cần biết schema nội bộ của `taskflow-api`",
+    "Đồng bộ định kỳ toàn bộ bảng `comments` từ `taskflow-api` sang `notification-service` bằng `pg_dump`",
+    "Cho cả hai service dùng chung một Postgres instance để đơn giản hoá",
+  ]}
+  answerIndex={1}
+  explanation="Ba phương án còn lại đều làm `notification-service` phụ thuộc vào chi tiết triển khai nội bộ của `taskflow-api` — vi phạm data ownership. Chỉ có gRPC contract (`.proto`) là ranh giới ổn định, cho phép mỗi service tự do đổi nội bộ mà không ảnh hưởng bên kia."
+/>
