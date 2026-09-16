@@ -30,6 +30,7 @@ import { sd11ReliabilityPatternsModule } from "./modules/sd11-reliability-patter
 import { sd12MicroservicesApiDesignModule } from "./modules/sd12-microservices-api-design/module-meta";
 import { sd13SloCapacityMultiRegionModule } from "./modules/sd13-slo-capacity-multi-region/module-meta";
 import { sd14CaseUrlShortenerRateLimiterModule } from "./modules/sd14-case-url-shortener-rate-limiter/module-meta";
+import { sd15CaseNewsFeedNotificationModule } from "./modules/sd15-case-news-feed-notification/module-meta";
 import { sd16CaseChatPresenceModule } from "./modules/sd16-case-chat-presence/module-meta";
 import { sd17CaseVideoStreamingFileSyncModule } from "./modules/sd17-case-video-streaming-file-sync/module-meta";
 
@@ -66,6 +67,7 @@ export const curriculumModules: ModuleDefinition[] = [
   sd12MicroservicesApiDesignModule,
   sd13SloCapacityMultiRegionModule,
   sd14CaseUrlShortenerRateLimiterModule,
+  sd15CaseNewsFeedNotificationModule,
   sd16CaseChatPresenceModule,
   sd17CaseVideoStreamingFileSyncModule,
 ];

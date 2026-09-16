@@ -1,0 +1,123 @@
+import { NotificationMultichannelRetryDlqDiagram } from "../diagrams/notification-multichannel-retry-dlq-diagram";
+
+<Eli5 title="Trực tổng đài đa kênh: gọi được thì gọi, máy bận thì gọi lại, hỏng máy thì báo cấp trên" emoji="☎️">
+
+Có người vừa thích bài viết của bạn. Tổng đài phải báo cho bạn biết — nhưng báo qua đâu? Bạn đã đăng ký nhận **push app**, tắt **SMS**, còn để ngỏ **email**. Tổng đài phải tra danh bạ ưu tiên trước khi bấm số, chứ không gọi bừa cả ba số.
+
+Nếu gọi push mà máy busy (app server bên thứ ba đang lỗi), tổng đài **gọi lại vài lần** rồi mới bỏ cuộc. Bỏ cuộc thì phải ghi vào sổ "cuộc gọi lỗi" để cấp trên xử lý sau (DLQ), chứ không được lờ đi. Và quan trọng nhất: nếu cùng một tin "A thích bài viết của bạn" được xử lý hai lần (do tổng đài viên bị chuyển ca giữa chừng), bạn **không được nghe lặp lại hai lần** — đó là idempotency, chuyện bạn đã học ở SD07, giờ áp dụng lại nguyên xi.
+
+</Eli5>
+
+News feed đã xong retrieval. Bây giờ là nửa còn lại của SD15: khi có sự kiện (like, comment, follow, mention), ai cần biết, biết qua kênh nào, và làm sao không biết hai lần.
+
+<NotificationMultichannelRetryDlqDiagram />
+
+<Technical>
+
+### API & data model
+
+- `GET/PUT /users/{id}/notification-preferences` — bật/tắt từng kênh theo loại sự kiện (`{ like: { push: true, email: false, sms: false }, comment: {...} }`)
+- `GET /notifications?cursor=` — danh sách thông báo của user, `POST /notifications/{id}/read`
+
+| Bảng | Vai trò |
+|---|---|
+| `notifications(id, user_id, type, payload, created_at, read_at)` | Lưu thông báo để hiển thị trong app (không phải hàng đợi gửi) |
+| `user_preferences(user_id, event_type, channel, enabled)` | Bật/tắt kênh theo loại sự kiện |
+| `dispatch_dedup(consumer, message_id, PRIMARY KEY(consumer, message_id))` | Chặn gửi trùng — **cùng bảng pattern với `processed_messages` ở SD07** |
+
+### High-level design: nối lại outbox & idempotent consumer từ SD07
+
+Sự kiện (like/comment/follow) được ghi vào **outbox** cùng transaction với hành động nghiệp vụ (giống lab outbox ở SD07) → relay đẩy lên topic `notifications` (Redpanda) → **Notification Worker** consume:
+
+1. Tra `user_preferences` để biết user này bật kênh nào cho loại sự kiện này — lọc **trước khi** dispatch, không phải sau
+2. Với mỗi kênh còn lại, tính `idempotencyKey = hash(event_id, user_id, channel)`, tra `dispatch_dedup` — nếu đã tồn tại thì bỏ qua (đã gửi rồi, không gửi lại)
+3. Gọi channel adapter (push/email/SMS) tương ứng để gửi tới provider ngoài
+
+### Vì sao lại cần dedup key riêng theo `(event_id, user_id, channel)`
+
+Một event `OrderPlaced` ở SD07 chỉ có một consumer xử lý một side effect (gửi email). Notification thì một event có thể toả ra **nhiều người nhận × nhiều kênh** — like của A trên bài của B chỉ báo cho B, nhưng follow của A vào B có thể vừa báo cho B (qua push) vừa gửi digest email cuối ngày cho B (qua kênh khác, xử lý riêng). Idempotency key phải đủ chi tiết để phân biệt "đã gửi push cho B về event X" khác với "đã gửi email cho B về event X".
+
+```sql title="sql/dispatch-dedup.sql"
+CREATE TABLE dispatch_dedup (
+  consumer     text NOT NULL,           -- 'notification-worker'
+  message_id   text NOT NULL,           -- hash(event_id, user_id, channel)
+  dispatched_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (consumer, message_id)
+);
+```
+
+```ts title="src/workers/notification-worker.ts"
+async function dispatchOne(event: NotificationEvent, userId: string, channel: Channel) {
+  const key = hash(`${event.id}:${userId}:${channel}`);
+  const inserted = await db.query("INSERT INTO dispatch_dedup (consumer, message_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", ["notification-worker", key]);
+  if (inserted.rowCount === 0) return; // đã gửi rồi, bỏ qua
+  await sendWithRetry(channel, userId, event, { maxRetries: 3, baseDelayMs: 500 });
+}
+```
+
+### Retry, backoff & DLQ — nối lại pattern reliability ở SD11
+
+Provider ngoài (push gateway, email/SMS) có thể timeout hoặc trả 5xx tạm thời. Retry tối đa N lần (ví dụ 3) với **backoff tăng dần + jitter** để tránh dồn tải đúng lúc provider đang phục hồi. Hết retry mà vẫn lỗi → đẩy sang **DLQ** kèm event gốc, kênh, lý do lỗi, rồi **commit tiếp** — một kênh lỗi không được chặn các kênh/user khác. Alert on-call; sau khi provider ổn định, replay DLQ theo lô.
+
+Vì bảng dedup được ghi **trước khi** gọi provider (đổi lấy việc chống trùng chắc chắn hơn), job replay DLQ phải **xoá dòng dedup tương ứng** trước khi produce lại — nếu không, worker sẽ thấy key đã tồn tại và bỏ qua luôn message vừa replay.
+
+### Notification storm: khi một sự kiện toả ra hàng triệu thông báo
+
+Một bài viral nhận 2 triệu like trong 10 phút tạo ra 2 triệu event "X thích bài viết của bạn" — tất cả gửi cho **cùng một tác giả**. Gửi từng cái riêng vừa spam người dùng vừa làm nghẽn dispatch. Giải pháp chuẩn là **batching/debounce**: gộp trong một cửa sổ thời gian (ví dụ 5 phút) thành một thông báo "2.000 người vừa thích bài viết của bạn", đếm dồn thay vì liệt kê từng người.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Một topic chung, worker phân loại kênh | Đơn giản, ít hạ tầng | Một kênh chậm (email) có thể làm partition đó chậm theo, ảnh hưởng gián tiếp kênh khác cùng partition | Quy mô vừa, ít event/s |
+| Topic riêng theo kênh (`notify.push`, `notify.email`, `notify.sms`) | Cô lập hoàn toàn: kênh chậm không ảnh hưởng kênh khác, scale consumer độc lập | Thêm hạ tầng, cần route event tới đúng topic | Quy mô lớn, các kênh có SLA khác nhau rõ rệt |
+| Gửi trực tiếp đồng bộ trong request nghiệp vụ | Không cần queue | Request chính (like/comment) bị chậm theo tốc độ provider ngoài; không chịu được spike | Không nên dùng ở quy mô lớn — luôn tách async (xem lại SD07) |
+
+**Khi nào đổi ý:** nếu chỉ có một kênh (chỉ push, chưa có email/SMS) thì một topic chung là đủ — đừng tách topic riêng khi chưa có nhu cầu cô lập thật sự.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo topic riêng cho notification (tái dùng Redpanda từ SD07)", command: "docker compose exec redpanda rpk topic create notifications -p 3", output: "TOPIC         STATUS\nnotifications OK" },
+    { comment: "Bắn thử 1 event like", command: "docker compose exec redpanda rpk topic produce notifications -k user-77", output: "> {\"eventId\":\"e-501\",\"type\":\"like\",\"targetUserId\":\"user-77\",\"actorId\":\"user-9\"}\nProduced to partition 1 at offset 0" },
+    { comment: "Worker xử lý, tra preference: user-77 tắt SMS nên chỉ dispatch push + email", command: "docker compose logs -f notification-worker | grep e-501", output: "notification-worker: e-501 -> channels [push, email] (sms disabled by preference)\nnotification-worker: push sent (dedup key a1b2c3)\nnotification-worker: email sent (dedup key d4e5f6)" },
+    { comment: "Giả lập provider push lỗi 3 lần rồi vào DLQ", command: "docker compose exec redpanda rpk topic consume notifications.dlq -n 1", output: "{\"eventId\":\"e-501\",\"channel\":\"push\",\"attempts\":3,\"lastError\":\"timeout after 2000ms\"}" },
+  ]}
+/>
+
+<Callout type="mistake" title="Idempotency key tính từ nội dung message hoặc offset">
+  Offset đổi khi message được produce lại (relay retry). Hash nội dung thì hai like hợp lệ có nội dung giống hệt nhau (hiếm nhưng có thể) bị coi là trùng. Luôn dùng `event_id` ổn định từ nguồn (outbox) kết hợp `user_id` và `channel`.
+</Callout>
+
+<Callout type="warning" title="Lọc preference sau khi đã gửi">
+  Nếu Worker gửi trước rồi mới kiểm tra preference, hoặc cache preference cũ không invalidate khi user đổi cài đặt, user tắt kênh vẫn nhận được thông báo — kiểm tra preference luôn phải là bước lọc **đầu tiên**, trước dispatch.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi "làm sao đảm bảo user không nhận thông báo trùng" nên trả lời bằng đúng vốn từ đã học ở SD07: at-least-once + idempotent consumer, giải thích idempotency key gồm những gì và tại sao. Nếu được hỏi về notification storm, nhắc tới batching/debounce — đây là điểm nhiều ứng viên bỏ sót vì chỉ nghĩ tới "gửi được hay không" mà quên "gửi có làm phiền người dùng không".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "channel adapter", meaning: "Thành phần gọi tới provider ngoài của một kênh cụ thể (push gateway, email, SMS)." },
+    { term: "dispatch dedup", meaning: "Bảng chống gửi trùng theo (event_id, user_id, channel), cùng pattern processed_messages ở SD07." },
+    { term: "preference filtering", meaning: "Lọc kênh theo cài đặt của user, phải thực hiện trước khi dispatch." },
+    { term: "backoff + jitter", meaning: "Tăng dần thời gian chờ giữa các lần retry, cộng thêm độ trễ ngẫu nhiên để tránh dồn tải (SD11)." },
+    { term: "DLQ (dead-letter queue)", meaning: "Nơi chứa message thất bại sau khi hết số lần retry, kèm metadata để điều tra/replay." },
+    { term: "notification storm", meaning: "Một sự kiện lan toả tạo ra lượng lớn thông báo dồn dập cho cùng một người nhận." },
+    { term: "batching/debounce", meaning: "Gộp nhiều sự kiện cùng loại trong một cửa sổ thời gian thành một thông báo tổng hợp." },
+  ]}
+/>
+
+<QuickCheck
+  question="Notification Worker gửi push thành công nhưng crash trước khi ghi `dispatch_dedup`. Message được đọc lại từ offset cũ. Điều gì nên xảy ra?"
+  options={[
+    "Push bị gửi lần hai vì chưa có bản ghi dedup, đây là hành vi chấp nhận được và không cần sửa gì",
+    "Hệ thống nên chuyển hẳn sang commit offset trước khi gửi để tránh đọc lại",
+    "Nên gộp việc ghi `dispatch_dedup` và gọi provider vào cùng một transaction nếu có thể, hoặc chấp nhận hiếm khi trùng ở biên ngoài Kafka và ghi rõ đây là quyết định có chủ ý — vì gọi API ngoài không thể nằm chung transaction với Postgres",
+    "Xoá luôn topic notifications và tạo lại để tránh đọc lại message cũ",
+  ]}
+  answerIndex={2}
+  explanation="Giống bài học ở SD07: side effect gọi ra ngoài (provider push) không thể gói chung transaction với việc ghi dedup trong Postgres. Thứ tự đúng là ghi dedup trước rồi mới gọi provider (như code mẫu ở trên) để giảm khả năng trùng, nhưng vẫn phải thừa nhận và ghi rõ rủi ro trùng hiếm khi crash đúng lúc giữa hai bước."
+/>

@@ -1,0 +1,122 @@
+import { TimelineWriteReadHydrationStepDiagram } from "../diagrams/timeline-write-read-hydration-step-diagram";
+
+<Eli5 title="Tủ đồ ở trường học chỉ ghi số hiệu sách, không nhét cả cuốn sách vào" emoji="🗄️">
+
+Mỗi học sinh có một ngăn tủ. Khi thư viện có sách mới cho một môn, thay vì **photocopy cả cuốn sách bỏ vào tủ của từng học sinh** (tốn giấy khủng khiếp, sách sửa lỗi in thì phải đi thay lại từng tủ), thư viện chỉ bỏ vào tủ một **mảnh giấy ghi mã số sách**. Học sinh cầm mảnh giấy ra kệ chung lấy đúng cuốn sách theo mã số.
+
+Timeline hoạt động y hệt: mỗi user có một "ngăn tủ" (Redis sorted set) chỉ chứa **ID bài viết**, không chứa nội dung. Muốn xem nội dung thật, hệ thống cầm ID ra "kệ sách chung" (post store) lấy về — bước này gọi là **hydrate**.
+
+</Eli5>
+
+Lesson trước bạn đã quyết định push hay pull cho từng tài khoản. Lesson này trả lời câu hỏi tiếp theo: **push ghi cái gì, và đọc feed lấy nội dung từ đâu**.
+
+<TimelineWriteReadHydrationStepDiagram />
+
+<Technical>
+
+### API & data model
+
+**API tối thiểu**
+- `POST /posts { text, mediaRef? }` → tạo bài, trả `postId`
+- `GET /feed?cursor=&limit=20` → trả danh sách bài đã hydrate + `nextCursor`
+- `POST /follow/{targetId}`, `DELETE /follow/{targetId}`
+
+**Data model**
+
+| Kho dữ liệu | Vai trò | Vì sao chọn |
+|---|---|---|
+| Postgres `posts(id, author_id, text, media_ref, created_at)` | Nguồn sự thật của nội dung bài viết | Bền, hỗ trợ transaction, dễ join khi cần audit/xoá (xem lại SD05) |
+| Postgres `follows(follower_id, followee_id)` | Đồ thị follow | Quan hệ nhiều-nhiều, cần query "ai follow ai" cho fanout worker |
+| Redis `timeline:{userId}` (ZSET, score = `postId`/timestamp) | Danh sách ID bài đã push cho user này | Đọc `ZREVRANGE` O(log N), ghi `ZADD` O(log N) — đúng việc Redis làm tốt |
+| Redis `post:{postId}` (hash hoặc string JSON) | Cache nội dung để hydrate nhanh | Tránh đọc Postgres cho mọi lần hydrate; cache-aside như đã học ở SD04 |
+
+### Vì sao lưu ID, không lưu nội dung
+
+Nếu `timeline:{followerId}` lưu cả nội dung bài viết, một celebrity 50 triệu follower đăng 1 bài nghĩa là **50 triệu bản sao** của cùng một nội dung nằm rải rác trong Redis. Tốn storage khủng khiếp, và nếu tác giả sửa hoặc xoá bài, bạn phải phát lại thay đổi đó cho **50 triệu nơi** — chính là bài toán fan-out lần thứ hai, lần này cho update.
+
+Lưu `postId` giữ nguyên tắc: **một nội dung, một nơi lưu (post store); timeline chỉ là danh sách con trỏ**. Sửa/xoá bài chỉ cần cập nhật đúng một chỗ.
+
+### Đọc feed: hydrate & merge celebrity
+
+1. `ZREVRANGE timeline:{userId} 0 19` → 20 `postId` gần nhất (đã có sẵn nhờ push của lesson trước).
+2. Với mỗi celebrity mà user đang follow, lấy trực tiếp K bài mới nhất của họ (`ZREVRANGE posts:{celebrityId} 0 K` hoặc query Postgres) — đây là phần "pull" trong hybrid, chi phí không phụ thuộc follower count của celebrity.
+3. Merge hai danh sách theo thời gian, cắt còn 20 bài đầu.
+4. **Hydrate**: batch lấy nội dung cho toàn bộ `postId` bằng pipeline/`MGET` tới Redis post cache; cache miss thì query Postgres `WHERE id IN (...)` rồi nạp lại cache.
+5. Trả JSON kèm `nextCursor` cho lần load tiếp theo.
+
+```ts title="src/services/get-feed.ts"
+async function getFeed(userId: string, limit = 20) {
+  const ownIds = await redis.zrevrange(`timeline:${userId}`, 0, limit - 1);
+  const celebIds = await getFollowedCelebrityIds(userId); // thường rất ít (vài chục)
+  const pulled = await Promise.all(celebIds.map((id) => redis.zrevrange(`posts:${id}`, 0, 3)));
+  const merged = mergeByTimestamp(ownIds, pulled.flat()).slice(0, limit);
+
+  const cached = await redis.mget(merged.map((id) => `post:${id}`));
+  const missingIds = merged.filter((id, i) => cached[i] === null);
+  const fromDb = missingIds.length ? await db.query("SELECT * FROM posts WHERE id = ANY($1)", [missingIds]) : [];
+  await Promise.all(fromDb.map((post) => redis.set(`post:${post.id}`, JSON.stringify(post), "EX", 300)));
+
+  return hydrate(merged, cached, fromDb);
+}
+```
+
+### Trimming: đừng để timeline phình vô hạn
+
+Mỗi lần `ZADD`, kèm theo `ZREMRANGEBYRANK timeline:{userId} 0 -1001` để chỉ giữ 1.000 bài gần nhất — user hiếm khi cuộn quá sâu, và timeline không thể lớn mãi theo thời gian tồn tại của tài khoản.
+
+### Ranking (khái niệm)
+
+Mặc định feed sắp theo thời gian (reverse chronological) — đơn giản, dễ giải thích, đủ cho phần lớn thiết kế phỏng vấn cấp mid–senior. Feed dựa trên **engagement/ML ranking** thay điểm sắp xếp bằng một model dự đoán mức độ quan tâm — đó là một hệ thống ML riêng (feature store, model serving) nằm ngoài phạm vi module này; điều cần biết là **retrieval (lấy ứng viên) và ranking (sắp xếp) là hai tầng tách rời**, module này chỉ lo tầng đầu.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Lưu ID + hydrate | Storage nhỏ, sửa/xoá bài chỉ 1 chỗ | Thêm 1 bước round-trip hydrate | Mặc định cho mọi hệ thống feed thật |
+| Lưu full content trong timeline | Đọc feed không cần hydrate, nhanh hơn 1 bước | Storage nhân theo follower; update/xoá phải fan-out lại | Chỉ hợp khi bài viết bất biến và follower rất ít (hiếm khi đúng) |
+| Chronological mặc định | Dễ cài, dễ giải thích, không cần model | Không tối ưu engagement | Giai đoạn đầu, hoặc phạm vi phỏng vấn không yêu cầu ranking |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Ghi ID bài mới vào timeline của một follower (đã push ở lesson trước)", command: "redis-cli ZADD timeline:user-42 1732000005 p-1002", output: "(integer) 1" },
+    { comment: "Đọc 5 bài gần nhất — chỉ có ID, chưa có nội dung", command: "redis-cli ZREVRANGE timeline:user-42 0 4", output: "1) \"p-1002\"\n2) \"p-1001\"\n3) \"p-0998\"\n4) \"p-0991\"\n5) \"p-0987\"" },
+    { comment: "Hydrate: lấy nội dung của các ID đó cùng lúc bằng MGET", command: "redis-cli MGET post:p-1002 post:p-1001 post:p-0998", output: "1) \"{\\\"author\\\":\\\"celebrity\\\",\\\"text\\\":\\\"...\\\"}\"\n2) \"{\\\"author\\\":\\\"friend-9\\\",\\\"text\\\":\\\"...\\\"}\"\n3) (nil)  # cache miss, phải fallback Postgres" },
+    { comment: "Trim timeline chỉ giữ 1.000 bài gần nhất", command: "redis-cli ZREMRANGEBYRANK timeline:user-42 0 -1001", output: "(integer) 0" },
+  ]}
+/>
+
+<Callout type="mistake" title="Hydrate tuần tự từng bài một">
+  Lấy 20 `postId` rồi gọi 20 lần `GET post:{id}` tuần tự nhân độ trễ mạng lên 20 lần round-trip. Luôn dùng batch (`MGET`, pipeline, hoặc `WHERE id IN (...)`).
+</Callout>
+
+<Callout type="warning" title="Celebrity vẫn cần một nơi lưu 'bài mới nhất' để pull">
+  Nếu celebrity bị loại hoàn toàn khỏi cơ chế push, bạn vẫn cần một cấu trúc để tra "K bài mới nhất của celebrity X" nhanh — thường vẫn là một ZSET (`posts:{celebrityId}`), chỉ khác là **không nhân theo follower**, chỉ có đúng 1 bản.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi bị hỏi "feed lưu gì", câu trả lời mạnh là: **ID + hydrate**, giải thích rõ đánh đổi (thêm 1 round-trip nhưng tiết kiệm storage và tránh fan-out lại khi sửa/xoá bài). Nếu bị hỏi sâu về ranking, thừa nhận đó là một hệ thống ML riêng và tập trung vào phần retrieval bạn vừa thiết kế — đừng cố bịa một công thức ranking phức tạp nếu không được hỏi.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "hydrate", meaning: "Lấy nội dung đầy đủ từ post store dựa trên danh sách postId đã có." },
+    { term: "cache-aside", meaning: "Đọc cache trước, miss thì đọc nguồn sự thật rồi nạp lại cache (nối SD04)." },
+    { term: "trim (ZREMRANGEBYRANK)", meaning: "Xoá bớt phần tử cũ trong sorted set để tránh phình vô hạn." },
+    { term: "retrieval vs ranking", meaning: "Retrieval: lấy ứng viên bài viết. Ranking: sắp xếp chúng — hai tầng tách rời." },
+    { term: "post store", meaning: "Nơi lưu nội dung gốc duy nhất của một bài viết (Postgres + cache), không nhân bản theo follower." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một tác giả sửa lại nội dung bài viết sau khi đã fan-out cho 300 follower. Với thiết kế lưu ID + hydrate, cần cập nhật ở đâu?"
+  options={[
+    "Không cần làm gì vì timeline chỉ lưu ID, nội dung tự đồng bộ",
+    "Chỉ cần cập nhật post store (Postgres + cache post:{postId}); 300 timeline vẫn giữ nguyên postId cũ, lần đọc tiếp theo tự hydrate ra nội dung mới",
+    "Phải chạy lại fan-out để ghi đè nội dung mới vào cả 300 timeline",
+    "Phải xoá bài cũ và tạo postId mới rồi fan-out lại từ đầu",
+  ]}
+  answerIndex={1}
+  explanation="Đây chính là lợi ích của lưu ID thay vì nội dung: sửa bài chỉ đổi post store một lần, mọi timeline trỏ tới cùng ID sẽ hydrate ra bản mới ở lần đọc kế tiếp — không cần đụng tới 300 timeline."
+/>

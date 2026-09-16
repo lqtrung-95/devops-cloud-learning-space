@@ -1,0 +1,119 @@
+import { FanoutPushPullFollowerCountSliderDiagram } from "../diagrams/fanout-push-pull-follower-count-slider-diagram";
+
+<Eli5 title="Người đưa thư tận nhà, hay bảng tin chung cư để mọi người tự ra xem?" emoji="📬">
+
+Bạn đăng một bài viết. Cách 1: **người đưa thư photocopy ngay** bài đó và bỏ vào hộp thư của **từng người theo dõi bạn**, ngay lúc bạn vừa đăng. Người theo dõi mở hộp thư là thấy bài mới liền — rất nhanh. Đó là **fan-out-on-write (push)**.
+
+Cách 2: bạn chỉ **dán bài lên bảng tin của chính mình**. Ai muốn xem tin tức thì tự đi qua bảng tin của **tất cả những người mình theo dõi**, gom bài mới lại. Không tốn công lúc đăng, nhưng người đọc phải chạy đi nhiều nơi mỗi lần muốn xem. Đó là **fan-out-on-read (pull)**.
+
+Bây giờ tưởng tượng bạn là một celebrity có **50 triệu người theo dõi**. Cách 1 nghĩa là người đưa thư phải photocopy và giao **50 triệu bản** chỉ trong vài phút — không ai làm nổi. Nhưng nếu một người dùng bình thường chỉ có 200 người theo dõi, cách 1 lại cực rẻ và cách 2 (bắt người đọc tự đi gom) mới là phí công vô ích. **Không có cách nào đúng cho mọi trường hợp — đó là lý do hệ thống thật dùng cả hai.**
+
+</Eli5>
+
+Bạn đã xong SD01–SD13: biết ước lượng, biết cache, biết queue, biết consistency. News feed là bài toán kinh điển ghép tất cả lại — và là câu hỏi phỏng vấn xuất hiện nhiều nhất sau URL shortener. Điểm khác biệt so với hầu hết hệ thống bạn đã thiết kế: **write của MỘT người có thể tạo ra hàng chục triệu write khác** — đây là quái vật riêng của bài toán fan-out.
+
+<FanoutPushPullFollowerCountSliderDiagram />
+
+<Technical>
+
+### Requirements
+
+**Functional**
+- Follow / unfollow một tài khoản
+- Đăng bài (text, có thể kèm media — xem lại SD08 cho lưu trữ media)
+- Xem feed: danh sách bài từ những người mình follow, mặc định sắp theo thời gian gần nhất, phân trang (cursor)
+
+**Non-functional (có số, đều là giả định cần nêu rõ khi vào phỏng vấn thật)**
+- Đọc nhiều hơn ghi rất nhiều (feed là hệ thống **read-heavy** điển hình)
+- Latency đọc feed p99 cỡ vài trăm ms là chấp nhận được; độ "tươi" của bài mới trong vài giây tới vài phút là ổn (không cần real-time tuyệt đối)
+- Availability cỡ 99.9% (đọc feed cũ vẫn tốt hơn báo lỗi trắng trang)
+
+**Out of scope**: ranking bằng machine learning (chỉ bàn khái niệm), quảng cáo, video streaming (xem SD17).
+
+### Ước lượng (dùng lại cách làm tròn ở Phụ lục A/B)
+
+Giả định DAU = **500 triệu** (đề bài chuẩn cho case này), mỗi user mở feed trung bình **10 lần/ngày**:
+
+| Đại lượng | Giả định | Kết quả |
+|---|---|---|
+| Reads/ngày | 500M × 10 | 5×10⁹ |
+| QPS đọc trung bình | 5×10⁹ / 10⁵ giây | ~50.000 QPS |
+| QPS đọc đỉnh | ×2–3 (giả định) | ~100.000–150.000 QPS |
+| Posts/ngày | phần lớn user chỉ xem, giả định 5% đăng bài, mỗi người 1 bài | ~25 triệu bài/ngày |
+| QPS ghi bài gốc trung bình | 25×10⁶ / 10⁵ | ~250 QPS |
+
+Chỉ 250 QPS ghi bài gốc — nhìn tưởng nhàn. Nhưng đó **chưa tính fan-out**. Nếu dùng push, mỗi bài phải nhân với follower count:
+
+```
+Giả định trung bình mỗi user có ~200 follower (không tính celebrity):
+25 triệu bài/ngày × 200 follower ≈ 5×10⁹ lần ghi timeline/ngày
+⇒ QPS ghi timeline trung bình ≈ 50.000 — XẤP XỈ BẰNG QPS ĐỌC!
+```
+
+Đây chính là điểm mấu chốt: **write amplification của push có thể biến một hệ thống read-heavy thành cân bằng đọc/ghi**, và với celebrity thì nó vượt hẳn qua write-heavy trong vài giây. Số thật phải benchmark; số ở đây chỉ để thấy **hình dạng** của vấn đề.
+
+### Fan-out-on-write (push) vs fan-out-on-read (pull) vs hybrid
+
+**Push**: khi có bài mới, worker lặp qua danh sách follower và ghi `postId` vào timeline của từng người (`ZADD timeline:{followerId} <postId> <score>`). Đọc chỉ là `ZREVRANGE timeline:{userId}` — một lần gọi, cực nhanh.
+
+**Pull**: không ghi gì thêm lúc đăng bài. Khi user mở feed, hệ thống đọc bài mới nhất từ **tất cả** những người họ follow rồi merge theo thời gian. Ghi rẻ, nhưng đọc tốn công theo số người bạn follow (followee count) — không phải follower count.
+
+**Hybrid**: đặt một **ngưỡng follower** (ví dụ 10.000, con số thật phải tuỳ hệ thống và cần đo). Tài khoản dưới ngưỡng dùng push như bình thường. Tài khoản trên ngưỡng (celebrity) được đánh dấu, **bỏ qua fan-out-on-write**; khi một follower mở feed, hệ thống push-based timeline của họ được merge thêm bài mới nhất của celebrity lấy trực tiếp (pull) — chi phí pull cho MỘT celebrity là O(1), không phụ thuộc follower count của celebrity đó.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Push (fan-out-on-write) | Đọc cực nhanh — chỉ 1 lần `ZREVRANGE` | Ghi bùng nổ tuyến tính theo follower; celebrity 50M follower làm cliff | Tài khoản follower ít–vừa (đa số user thật) |
+| Pull (fan-out-on-read) | Ghi rẻ — chỉ 1 lần ghi post gốc | Đọc đắt theo số người bạn follow; user follow nhiều (vài nghìn) sẽ chậm | Celebrity (viết 1 lần, hàng triệu người pull cùng lúc); hoặc user hiếm khi mở app |
+| Hybrid | Đa số user hưởng đọc nhanh của push; celebrity không làm sập hệ thống ghi | Phức tạp hơn: cần ngưỡng phân loại, hai luồng code, merge lúc đọc | Hệ thống thực tế ở quy mô lớn — đây là câu trả lời chuẩn trong phỏng vấn |
+
+**Khi nào đổi ý:** nếu phần lớn user follow rất ít người (vài chục) và gần như không có celebrity, pull thuần có thể đủ rẻ và đơn giản hơn hẳn — đừng build hybrid nếu bài toán không cần.
+
+</Technical>
+
+## Thực hành
+
+Minh hoạ nhanh chi phí fan-out bằng `redis-cli` trong `sd-playground` (số liệu minh hoạ, xem Lab 1 để đo đầy đủ):
+
+<Terminal
+  commands={[
+    { comment: "Follower giả lập cho user thường (200) và celebrity (50.000, seed bằng script)", command: "redis-cli SCARD followers:normal-user", output: "(integer) 200" },
+    { command: "redis-cli SCARD followers:celebrity", output: "(integer) 50000" },
+    { comment: "Fan-out cho user thường: nhanh, không cảm nhận được độ trễ", command: "time npx tsx src/scripts/fanout-on-write.ts --author normal-user --post p-1001", output: "fanned out to 200 followers\nreal\t0m0.031s" },
+    { comment: "Fan-out cho celebrity: chậm hẳn dù chỉ là bản demo 50.000 (thật là 50 triệu)", command: "time npx tsx src/scripts/fanout-on-write.ts --author celebrity --post p-1002", output: "fanned out to 50000 followers\nreal\t0m4.870s" },
+  ]}
+/>
+
+<Callout type="mistake" title="Ước lượng chỉ QPS đọc/ghi bài gốc, quên write amplification">
+  Nhiều người tính xong QPS ghi bài gốc (thường bé) rồi kết luận "hệ thống đọc nhiều, ghi ít, dễ". Bỏ qua fan-out write (nhân với follower count) là bỏ qua đúng phần khó nhất của bài toán — và là điều interviewer chờ bạn tự phát hiện.
+</Callout>
+
+<Callout type="warning" title="Ngưỡng celebrity không phải hằng số vĩnh viễn">
+  10.000 chỉ là ví dụ minh hoạ. Ngưỡng thật phụ thuộc vào throughput ghi thực đo được của cụm fan-out — luôn nói "cần benchmark" thay vì đưa ra một con số như đinh đóng cột.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi được hỏi thiết kế news feed, đừng nhảy thẳng vào vẽ hộp. Nêu requirements, ước lượng QPS đọc/ghi **và tính luôn write amplification của fan-out** — đây là chỗ phân biệt người đã đọc lý thuyết với người hiểu bài toán. Sau đó đề xuất hybrid và giải thích ngưỡng bằng con số (ví dụ: cụm ghi được X write/s thì follower trên bao nhiêu bắt đầu gây trễ chấp nhận được/không).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "fan-out-on-write (push)", meaning: "Ghi timeline của từng follower ngay khi có bài mới; đọc rẻ, ghi tốn theo follower count." },
+    { term: "fan-out-on-read (pull)", meaning: "Không ghi trước; gom bài từ những người bạn follow khi đọc feed. Ghi rẻ, đọc tốn theo followee count." },
+    { term: "hybrid feed", meaning: "Push cho đa số user, pull (hoặc merge riêng) cho celebrity vượt ngưỡng follower." },
+    { term: "write amplification", meaning: "Một lần ghi logic (1 bài) sinh ra nhiều lần ghi vật lý (1 lần/follower)." },
+    { term: "celebrity threshold", meaning: "Ngưỡng follower để phân loại một tài khoản là 'celebrity', cần benchmark chứ không đoán." },
+    { term: "followee count", meaning: "Số người MÀ BẠN follow — yếu tố quyết định chi phí đọc trong mô hình pull." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hệ thống dùng push cho mọi tài khoản. Một celebrity 50 triệu follower đăng bài, cụm fan-out ghi được cỡ 100.000 write/s. Nhận định đúng nhất?"
+  options={[
+    "Không sao, Redis luôn ghi tức thời bất kể số lượng",
+    "Fan-out mất cỡ 500 giây (~8 phút) cho riêng bài này — followers phải chờ rất lâu mới thấy bài mới, đây là dấu hiệu cần chuyển tài khoản này sang pull",
+    "QPS ghi trung bình toàn hệ thống sẽ không đổi vì đây chỉ là 1 bài",
+    "Vấn đề chỉ xảy ra nếu celebrity đăng bài nhiều lần một ngày",
+  ]}
+  answerIndex={1}
+  explanation="50.000.000 / 100.000 = 500 giây chỉ để fan-out MỘT bài. Đây là cliff của push — không phải vấn đề tần suất đăng, mà là follower count của một tài khoản đã đủ lớn để làm nghẽn toàn cụm ghi."
+/>
