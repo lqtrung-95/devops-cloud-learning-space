@@ -1,0 +1,97 @@
+import { InterviewTimeAllocationDiagram } from "../diagrams/interview-time-allocation-diagram";
+
+<Eli5 title="45 phút phỏng vấn giống một set menu nhà hàng có giờ hẹn" emoji="🍽️">
+  Một đầu bếp phục vụ set menu 5 món cho khách có lịch bay lúc 8 giờ tối biết chia thời gian: khai vị nhanh, món chính vừa đủ, tráng miệng gọn — vì khách **phải ăn xong đúng giờ**, không phải vì món chính không quan trọng.
+
+  Đầu bếp tệ thì ngược lại: mải làm khai vị cho thật cầu kỳ, đến khi nhìn đồng hồ thì chỉ còn 10 phút cho cả món chính lẫn tráng miệng — bê nguyên nồi ra bàn, khách chưa kịp nếm đã phải rời quán.
+
+  Phỏng vấn system design cũng có "giờ bay" là 45 phút. Bạn đã biết 4 bước phải làm (SD01) — bài này dạy cách **chia thời gian** cho từng bước và nói thành tiếng việc mình đang quản lý giờ, để không rơi vào cảnh dọn nguyên nồi ra bàn.
+
+  Chỗ ví von bị hụt: khách ăn set menu không chấm điểm đầu bếp, còn interviewer thì có — và họ chấm cả cách bạn xử lý khi thấy sắp trễ giờ.
+</Eli5>
+
+Ở SD01 bạn đã học framework 4 bước: yêu cầu → ước lượng → high-level → đào sâu. Bài này thêm bước thứ 5 (wrap-up) và biến framework thành một **ngân sách thời gian cụ thể** — vì trong phỏng vấn thật, hết giờ giữa chừng tệ hơn nhiều so với thiếu một chi tiết kỹ thuật.
+
+<InterviewTimeAllocationDiagram />
+
+<Technical>
+
+### Ngân sách 45 phút (tham khảo, linh hoạt theo interviewer)
+
+| Pha | Thời gian | Mục tiêu | Tín hiệu nên chuyển pha |
+|---|---|---|---|
+| ① Làm rõ yêu cầu | ~5 phút | Chốt functional, NFR có số, out of scope | Đã trả lời được "đọc hay ghi nhiều", "quy mô cỡ nào" |
+| ② Ước lượng | ~5 phút | QPS đọc/ghi, storage — chỉ đủ để quyết định kiến trúc | Có con số đủ để chọn (ví dụ "cần cache" hay "cần shard") |
+| ③ High-level design | ~15 phút | API, data model, khối chính cho luồng quan trọng nhất | Luồng chính chạy được từ đầu tới cuối trên giấy |
+| ④ Đào sâu & trade-off | ~15 phút | 2–3 điểm khó nhất, so sánh phương án có số liệu | Đã nói được ít nhất 1 bảng trade-off hoàn chỉnh |
+| ⑤ Wrap-up | ~5 phút | Tóm tắt, nêu bottleneck còn lại, hỏi ngược interviewer | Còn thời gian dư — dấu hiệu quản lý giờ tốt |
+
+Con số trên là **tỉ lệ tương đối**, không phải luật cứng: một số interviewer bỏ qua ước lượng chi tiết, một số khác dành hẳn 25 phút chỉ cho 1 điểm đào sâu. Điều quan trọng không phải là bám đúng số phút, mà là **nhận ra mình đang lệch quá xa** và tự điều chỉnh.
+
+### Quản lý thời gian thành tiếng
+
+Interviewer không đọc được suy nghĩ của bạn — họ chỉ nghe được những gì bạn nói ra. Ba câu nói ngắn giúp bạn kiểm soát nhịp độ mà không cần liếc đồng hồ lộ liễu:
+
+- **Chốt pha:** "Mình tạm chốt yêu cầu ở đây, giả định X nếu có gì khác anh/chị cho em biết. Giờ mình sang phần ước lượng."
+- **Xin thời gian:** "Phần sinh short code này có vài cách, em muốn dành 3–4 phút so sánh trước khi chọn."
+- **Chủ động cắt:** "Do thời gian còn ít, em sẽ nói nhanh 2 điểm quan trọng nhất thay vì đi hết mọi chi tiết."
+
+Nói ra những câu này còn có tác dụng phụ quan trọng: nó **là chính nội dung** mà rubric "structured communication" đang chấm — không phải hình thức, mà là bằng chứng bạn hiểu bài toán đủ để tự quản lý nó.
+
+### Khi bị lệch ngân sách
+
+| Tình huống | Phản ứng đúng |
+|---|---|
+| Còn 15 phút, chưa xong high-level | Vẽ khối tối giản đủ chạy, bỏ qua chi tiết phụ, dành ít nhất 8–10 phút cuối cho đào sâu |
+| Interviewer hỏi thẳng vào 1 điểm giữa chừng | Trả lời ngay điểm đó — đó là tín hiệu chuyển pha, không phải câu hỏi phụ |
+| Còn dư 5 phút ở cuối | Chủ động nêu thêm 1 bottleneck chưa nói, hoặc hỏi interviewer muốn đào sâu phần nào hơn |
+| Bị hỏi ngược giữa pha ước lượng ("sao lại nhân 3?") | Trả lời rồi quay lại đúng pha đang làm — đừng để một câu hỏi kéo bạn lạc đề 10 phút |
+
+</Technical>
+
+## Thực hành
+
+Chuẩn bị "sân khấu" cho 3 mock interview ở lab của module: một nơi ghi chú có mốc thời gian sẵn, để lúc luyện tập chỉ cần tập trung nói, không mất công dò giờ.
+
+<Terminal
+  commands={[
+    { comment: "Thư mục ghi chú cho 3 mock interview bấm giờ", command: "mkdir -p ~/sd-course/mock-interviews && cd ~/sd-course/mock-interviews" },
+    { comment: "Tính giờ kết thúc nếu bắt đầu ngay bây giờ (macOS)", command: 'date -v+45M "+%H:%M"', output: "15:47" },
+    {
+      comment: "Khung ghi chú có sẵn 5 mốc thời gian theo ngân sách chuẩn",
+      command:
+        "printf '# Mock 1: Google-Docs-like collaborative editor\\n\\n00:00-00:05 Làm rõ yêu cầu\\n00:05-00:10 Ước lượng\\n00:10-00:25 High-level design\\n00:25-00:40 Đào sâu & trade-off\\n00:40-00:45 Wrap-up\\n' > google-docs-like.md",
+    },
+    { comment: "Kiểm tra đã có đủ 5 mốc thời gian trong file", command: "grep -c '^[0-9]' google-docs-like.md", output: "5" },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Nhìn đồng hồ liên tục mà không nói gì.** Im lặng liếc giờ khiến interviewer không biết bạn đang chủ động quản lý thời gian hay đang mất phương hướng. Hai hành vi trông giống hệt nhau từ bên ngoài — khác biệt chỉ nằm ở việc bạn có **nói ra** hay không.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Một câu trả lời mạnh về quản lý thời gian nghe như thế này: *"Em thấy phần sinh short code có 3 hướng, nhưng vì thời gian có hạn em sẽ chọn nhanh hướng counter + base62 vì đơn giản và đủ dùng ở quy mô này, rồi dành thời gian còn lại cho phần cache — chỗ em nghĩ sẽ có nhiều điều đáng nói hơn."* Câu này làm 3 việc cùng lúc: chọn phương án, giải thích lý do ngắn gọn, và chủ động phân bổ lại thời gian — đúng thứ interviewer muốn nghe từ một người từng làm việc thật.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Ngân sách thời gian (time budget)", meaning: "Số phút dự kiến cho mỗi pha của buổi phỏng vấn, dùng để tự kiểm tra mình có đang lệch quá xa không." },
+    { term: "Wrap-up", meaning: "Pha cuối: tóm tắt thiết kế, nêu bottleneck còn lại, chủ động hỏi ngược interviewer." },
+    { term: "Chuyển pha (phase transition)", meaning: "Thời điểm chủ động chốt một pha và chuyển sang pha tiếp theo, thường nên nói thành tiếng." },
+    { term: "Tín hiệu chuyển pha", meaning: "Dấu hiệu (câu hỏi của interviewer, hoặc tự nhận thấy) cho biết nên dừng pha hiện tại." },
+    { term: "Quản lý thời gian thành tiếng", meaning: "Nói ra quyết định phân bổ thời gian thay vì âm thầm tự làm — giúp interviewer thấy được quá trình tư duy." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn đang ở phút 20, mới xong phần high-level design cơ bản (đúng tiến độ). Interviewer im lặng chờ. Nên làm gì tiếp theo?"
+  options={[
+    "Vẽ thêm chi tiết cho high-level design vì càng đầy đủ càng tốt",
+    "Chủ động chuyển sang pha đào sâu: chọn 2–3 điểm khó nhất và nói rõ mình sắp làm gì",
+    "Hỏi lại toàn bộ yêu cầu từ đầu cho chắc",
+    "Chờ interviewer chỉ định bước tiếp theo",
+  ]}
+  answerIndex={1}
+  explanation="Đúng tiến độ (phút 20/45, xong high-level) là tín hiệu để tự chuyển pha, không cần chờ được nhắc. Vẽ thêm chi tiết ở đây là lỗi 'đào sâu sai chỗ' — high-level chỉ cần chạy được, phần điểm nằm ở đào sâu."
+/>

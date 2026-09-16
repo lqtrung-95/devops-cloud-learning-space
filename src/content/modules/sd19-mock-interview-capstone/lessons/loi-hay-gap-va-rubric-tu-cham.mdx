@@ -1,0 +1,96 @@
+import { CommonMistakesChecklistDiagram } from "../diagrams/common-mistakes-checklist-diagram";
+
+<Eli5 title="Tự chấm phỏng vấn giống vận động viên xem lại băng ghi hình sau trận đấu" emoji="🎥">
+  Vận động viên giỏi không chỉ hỏi "thắng hay thua" — họ xem lại băng, chỉ ra đúng khoảnh khắc nào phản xạ chậm, chân đặt sai chỗ, quyết định vội vàng. Xem băng không phải để tự trách, mà để **lần sau không lặp lại đúng lỗi đó**.
+
+  Phỏng vấn system design cũng cần "băng ghi hình" — chính là buổi mock interview bạn tự làm hoặc bắt cặp. Nhưng xem lại mà không có tiêu chí cụ thể thì chỉ dừng ở "hôm nay nói cũng ổn" — không giúp bạn cải thiện.
+
+  Rubric là "phiếu chấm của HLV": chia nhỏ một buổi phỏng vấn thành vài tiêu chí cụ thể, mỗi tiêu chí chấm riêng, để biết chính xác nên luyện thêm chỗ nào.
+
+  Chỗ ví von bị hụt: HLV thể thao chấm bằng mắt nhìn chuyên môn nhiều năm; rubric ở đây đơn giản hơn nhiều — nhưng đơn giản không có nghĩa là vô dụng, nó đủ để bạn tự phát hiện lỗi lặp lại.
+</Eli5>
+
+Interviewer không chấm bạn bằng cảm giác chung chung "giỏi" hay "không giỏi" — họ có (hoặc trong đầu có) một bộ tiêu chí tương tự rubric dưới đây. Biết trước tiêu chí giúp bạn luyện đúng thứ được chấm, thay vì chỉ luyện "vẽ kiến trúc cho đẹp".
+
+<CommonMistakesChecklistDiagram />
+
+<Technical>
+
+### 6 lỗi phổ biến — và vì sao chúng nguy hiểm
+
+| Lỗi | Hậu quả | Cách sửa |
+|---|---|---|
+| Vẽ hộp ngay không hỏi | Kiến trúc dựa trên đoán mò, không có căn cứ để bảo vệ khi bị hỏi ngược | Luôn dành 5–8 phút đầu cho yêu cầu (SD01) |
+| Bỏ qua non-functional requirements | Không có số để so sánh phương án (cache hay không cache? bao nhiêu replica?) | Hỏi ít nhất 2 con số: 1 latency, 1 availability/durability |
+| Dùng buzzword không giải thích | Nghe như học thuộc lòng, không thấy hiểu bản chất | Gắn mọi công nghệ với con số và cơ chế cụ thể |
+| Đào sâu sai chỗ | Dành hết thời gian cho phần dễ, bỏ lỡ phần khó interviewer quan tâm | Hỏi thẳng "anh/chị muốn em đào sâu phần nào hơn?" |
+| Phớt lờ gợi ý của interviewer | Bỏ lỡ tín hiệu quan trọng nhất trong buổi phỏng vấn — chính interviewer đang chỉ đường | Coi mọi câu hỏi giữa chừng là tín hiệu đổi hướng |
+| Im lặng suy nghĩ quá lâu | Interviewer không biết bạn có đang tư duy đúng hướng hay bế tắc | Think aloud — nói cả lúc đang phân vân giữa 2 lựa chọn |
+
+### Rubric tự chấm — 5 tiêu chí, thang 1–3
+
+| Tiêu chí | 1 điểm | 2 điểm | 3 điểm |
+|---|---|---|---|
+| **Requirements gathering** | Không hỏi hoặc hỏi qua loa, vẽ ngay | Hỏi được vài câu cơ bản khi được nhắc | Chủ động hỏi đủ functional + NFR có số, chốt out of scope |
+| **Structured communication** | Nhảy lung tung giữa các phần, khó theo dõi | Đi đúng thứ tự nhưng không nói rõ đang ở pha nào | Luôn nói rõ đang làm gì, chuyển pha rành mạch, quản lý giờ thành tiếng |
+| **Technical depth** | Chỉ nêu tên công nghệ, không giải thích cơ chế | Giải thích được cơ chế cơ bản khi được hỏi | Giải thích cơ chế + gắn với số liệu cụ thể của bài toán |
+| **Trade-off reasoning** | Chỉ đưa 1 phương án, không so sánh | So sánh 2 phương án khi được hỏi | Chủ động nêu ≥2 phương án, chọn/bỏ/vì sao/khi nào đổi ý — không cần hỏi |
+| **Handling ambiguity/feedback** | Đứng khựng khi gặp câu hỏi bất ngờ hoặc đề mơ hồ | Trả lời được nhưng cần thời gian suy nghĩ lâu | Nêu giả định rõ ràng và tiếp tục ngay; tiếp nhận gợi ý của interviewer mượt mà |
+
+Tổng điểm tối đa 15. Dùng rubric này cho cả 3 mock interview ở lab — mục tiêu không phải đạt 15/15 ngay lần đầu, mà là thấy **tiêu chí nào thấp nhất lặp lại ở cả 3 bài**, đó chính là kỹ năng cần luyện trước tiên.
+
+### Đọc kết quả rubric
+
+| Điểm thấp nhất rơi vào | Nên luyện gì tiếp theo |
+|---|---|
+| Requirements gathering | Luyện riêng phần hỏi: liệt kê 10 câu hỏi làm rõ cho 3 case study khác nhau trước khi vào high-level |
+| Structured communication | Luyện nói to theo đúng ngân sách thời gian ở bài trước, ghi âm và nghe lại xem có nói rõ "đang chuyển pha" không |
+| Technical depth | Ôn lại SD05–SD11 (database, reliability) — thường là lỗ hổng kiến thức nền, không phải lỗi kỹ năng phỏng vấn |
+| Trade-off reasoning | Luyện viết bảng trade-off cho mọi quyết định trong 1 design doc cũ, kể cả quyết định tưởng "hiển nhiên" |
+| Handling ambiguity/feedback | Nhờ người luyện cùng cố tình hỏi khó hoặc để đề mơ hồ, tập nêu giả định và đi tiếp thay vì hỏi lại quá nhiều |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo file rubric dùng chung cho cả 3 mock interview", command: "cd ~/sd-course/mock-interviews" },
+    {
+      comment: "Khung rubric: điền số 1-3 cho mỗi tiêu chí sau mỗi bài",
+      command:
+        "printf 'requirements:2\\nstructured_communication:2\\ntechnical_depth:3\\ntradeoff_reasoning:2\\nhandling_ambiguity:2\\n' > google-docs-like.rubric",
+    },
+    { comment: "Cộng tổng điểm rubric bằng awk", command: "awk -F: '{sum+=$2} END {print sum\"/15\"}' google-docs-like.rubric", output: "11/15" },
+    {
+      comment: "So điểm 3 bài để tìm tiêu chí yếu lặp lại (giả sử đã có đủ 3 file .rubric)",
+      command: "for f in *.rubric; do echo \"$f: $(awk -F: '{sum+=$2} END {print sum}' $f)/15\"; done",
+      output: "google-docs-like.rubric: 11/15\nweb-crawler.rubric: 10/15\ntop-k-leaderboard.rubric: 12/15",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Chấm rubric ngay sau khi vừa nói xong, còn hưng phấn.** Cảm giác "nói trôi chảy" không đồng nghĩa với điểm cao ở "trade-off reasoning" hay "technical depth". Nếu có ghi âm, nghỉ 10–15 phút rồi mới nghe lại và chấm — bạn sẽ khách quan hơn nhiều so với chấm ngay lúc vừa dứt lời.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Một câu trả lời mạnh cho "handling ambiguity" nghe như thế này khi interviewer hỏi bất ngờ: *"Câu này em chưa nghĩ tới trước đó — để em suy nghĩ vài giây... Em nghĩ vấn đề chính là X, và cách xử lý đơn giản nhất là Y, dù chưa tối ưu. Nếu có thêm thời gian em sẽ cân nhắc thêm Z."* Điểm mạnh không nằm ở việc trả lời đúng ngay lập tức, mà ở việc **thừa nhận đang suy nghĩ, vẫn đưa ra được hướng đi, và biết giới hạn của câu trả lời**.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Rubric", meaning: "Phiếu chấm chia nhỏ thành các tiêu chí cụ thể, mỗi tiêu chí có thang điểm và mô tả rõ ràng cho từng mức." },
+    { term: "Self-assessment", meaning: "Tự đánh giá buổi luyện tập của mình bằng tiêu chí khách quan thay vì cảm giác chung chung." },
+    { term: "Think aloud", meaning: "Nói ra suy nghĩ trong lúc đang cân nhắc, thay vì im lặng rồi chỉ nói ra kết luận cuối cùng." },
+    { term: "Buzzword rỗng", meaning: "Nhắc tên công nghệ/khái niệm mà không giải thích được cơ chế hoặc lý do phù hợp với bài toán." },
+    { term: "Tín hiệu của interviewer", meaning: "Câu hỏi hoặc phản ứng giữa chừng của interviewer, thường ngụ ý muốn bạn đổi hướng hoặc đào sâu chỗ khác." },
+  ]}
+/>
+
+<QuickCheck
+  question="Sau khi nghe lại băng ghi âm mock interview, bạn thấy mình trình bày đúng kiến trúc nhưng liên tục nhảy qua lại giữa phần data model và phần API mà không báo trước. Tiêu chí nào trong rubric nên bị trừ điểm nhiều nhất?"
+  options={["Technical depth", "Structured communication", "Requirements gathering", "Trade-off reasoning"]}
+  answerIndex={1}
+  explanation="Kiến trúc đúng nhưng trình bày lộn xộn, không báo trước khi chuyển phần, là vấn đề của 'structured communication' — interviewer phải tự ghép lại thông tin thay vì được dẫn dắt rõ ràng."
+/>

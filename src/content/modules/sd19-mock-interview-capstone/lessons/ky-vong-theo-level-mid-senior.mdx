@@ -1,0 +1,103 @@
+import { MidVsSeniorExpectationsDiagram } from "../diagrams/mid-vs-senior-expectations-diagram";
+
+<Eli5 title="Mid vs senior giống bếp phụ theo công thức và bếp trưởng tự nếm" emoji="👨‍🍳">
+  Một **bếp phụ giỏi** làm đúng công thức được đưa: đúng lượng muối, đúng thời gian, ra món đúng như mô tả. Khi được hỏi "sao cho muối lúc này mà không phải lúc khác?", họ trả lời đúng nếu đã học công thức kỹ.
+
+  Một **bếp trưởng** thì khác: tự nếm giữa chừng, tự điều chỉnh công thức khi nguyên liệu hôm nay hơi khác, và **giải thích được lý do đổi** mà không cần ai hỏi — vì họ hình dung được món ăn cuối cùng phải như thế nào, không chỉ làm đúng từng bước.
+
+  Trong phỏng vấn, mid và senior có thể vẽ ra **cùng một kiến trúc**. Khác biệt nằm ở việc ai chủ động nói "chỗ này có thể hỏng, đây là cách xử lý, và đây là lúc mình sẽ đổi ý" mà không cần được nhắc.
+
+  Chỗ ví von bị hụt: bếp phụ có thể lên bếp trưởng sau vài năm luyện tập có chủ đích — cấp độ trong phỏng vấn cũng vậy, không phải năng khiếu bẩm sinh mà là thói quen đã luyện đủ nhiều lần.
+</Eli5>
+
+Cùng một câu hỏi ("Thiết kế Google Docs"), cùng một framework 4 bước — nhưng interviewer chấm mid và senior với kỳ vọng khác nhau ở từng bước. Biết trước sự khác biệt giúp bạn tự nâng chuẩn câu trả lời của mình, thay vì chỉ "trả lời đúng".
+
+<MidVsSeniorExpectationsDiagram />
+
+<Technical>
+
+### Khác biệt kỳ vọng theo từng bước
+
+| Bước | Mid | Senior |
+|---|---|---|
+| Làm rõ yêu cầu | Trả lời đúng khi được hỏi trực tiếp | Chủ động nêu giả định, tự đề xuất out of scope, hỏi về failure tolerance |
+| Ước lượng | Tính đúng công thức khi được nhắc | Ước lượng ngay không cần nhắc, nối thẳng số vào quyết định kiến trúc |
+| High-level design | Vẽ đúng các khối tiêu chuẩn | Vẽ nhanh hơn, dành lời nói giải thích lý do chọn từng khối |
+| Đào sâu & trade-off | So sánh phương án khi được hỏi | Chủ động nêu bottleneck, failure mode, điều kiện đổi ý — không cần hỏi |
+| Nhận phản hồi | Điều chỉnh đúng theo gợi ý của interviewer | Điều chỉnh nhanh và giải thích luôn ảnh hưởng của thay đổi lên phần đã thiết kế trước đó |
+
+Không có ranh giới cứng — đây là **xu hướng chấm điểm**, không phải checklist nhị phân. Một mid-level thể hiện được 2–3 hành vi "senior" ở cột phải vẫn có thể được đánh giá cao hơn kỳ vọng cấp bậc.
+
+### Design doc thật ngoài đời — không chỉ để phỏng vấn
+
+Phần lớn công ty lớn dùng một dạng "design doc" trước khi bắt tay code hệ thống mới — không phải vì thủ tục, mà vì viết ra buộc bạn phải nghĩ rõ ràng hơn nói miệng, và cho đồng nghiệp review **trước khi** tốn công code sai hướng. Cấu trúc phổ biến (context, goals/non-goals, alternatives considered, rollout, risks) gần như trùng khớp với Phụ lục A bạn đã dùng suốt course:
+
+| Design doc thật ngoài đời | Tương ứng Phụ lục A |
+|---|---|
+| Context & problem statement | Mục 1 — Requirements (phần giới thiệu) |
+| Goals / Non-goals | Mục 1 — Functional / Out of scope |
+| Proposed design | Mục 3–5 — API, data model, high-level design |
+| Alternatives considered | Mục 7 — Trade-off & alternatives |
+| Rollout plan | Mục 8 — Bottleneck, failure modes & mở rộng (phần triển khai) |
+| Risks & mitigations | Mục 6 và 8 — Deep dive + failure modes |
+
+Capstone của bạn ở lab 2 **chính là** việc viết một design doc thật, chỉ khác là không có hệ thống production đứng sau để triển khai. Một senior engineer đọc capstone của bạn nên hiểu được thiết kế **mà không cần hỏi lại** — đó là lý do "alternatives considered" bắt buộc phải có ≥3 phương án cho quyết định lớn nhất, không phải chỉ ghi phương án đã chọn.
+
+### Từ mid lên senior: luyện gì trước?
+
+| Nếu bạn đang... | Luyện tiếp theo |
+|---|---|
+| Trả lời đúng nhưng bị động, chờ được hỏi | Tự đặt câu hỏi "chỗ nào có thể hỏng?" sau mỗi phần bạn vừa trình bày, kể cả khi tự luyện một mình |
+| Có kiến thức nhưng không nối được với con số | Sau mỗi lựa chọn kỹ thuật, tự hỏi "con số nào khiến mình chọn cái này thay vì cái khác?" |
+| Nói đúng nhưng không chủ động nêu trade-off | Luyện viết bảng trade-off cho *mọi* quyết định trong 1 design doc cũ — kể cả quyết định tưởng hiển nhiên |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chuẩn bị thư mục portfolio cho capstone design doc", command: "mkdir -p ~/sd-course/design-docs && cd ~/sd-course/design-docs" },
+    {
+      comment: "Copy khung Phụ lục A làm điểm bắt đầu cho capstone",
+      command:
+        "printf '# <Tên hệ thống>\\n\\n## 1. Requirements\\n## 2. Ước lượng\\n## 3. API\\n## 4. Data model\\n## 5. High-level design\\n## 6. Deep dive\\n## 7. Trade-off & alternatives\\n## 8. Bottleneck, failure modes & mở rộng\\n' > capstone.md",
+    },
+    { comment: "Kiểm tra đã có đủ 8 mục theo Phụ lục A", command: "grep -c '^## ' capstone.md", output: "8" },
+    {
+      comment: "Sau khi viết xong mục 7, đếm số alternatives đã liệt kê (mỗi dòng bảng = 1 hàng)",
+      command: "grep -c '^| ' capstone.md",
+      output: "5",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  **Cố "diễn" senior bằng cách nói nhiều thuật ngữ hơn.** Chêm thêm "CAP theorem", "eventual consistency", "CQRS" mà không gắn với quyết định cụ thể của bài toán chỉ tái tạo lỗi "buzzword rỗng" ở mức nặng hơn. Dấu hiệu senior thật là **số lượng quyết định có lý do rõ ràng**, không phải số lượng thuật ngữ.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Một câu trả lời mạnh thể hiện tư duy senior khi wrap-up nghe như thế này: *"Thiết kế hiện tại xử lý tốt tới khoảng 1 triệu user đồng thời chỉnh sửa document. Nếu lên 10× quy mô, điểm nghẽn đầu tiên sẽ là broadcast thay đổi tới tất cả client trong cùng document — lúc đó em sẽ cân nhắc chia nhỏ theo section thay vì broadcast toàn bộ. Đây là điều em muốn cắm cờ lại dù chưa có thời gian đào sâu."* Câu này chủ động thừa nhận giới hạn của thiết kế và nêu hướng mở rộng — không cần interviewer phải hỏi mới nói ra.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Kỳ vọng theo level", meaning: "Mức độ chủ động và chiều sâu mà interviewer mong đợi ở một cấp bậc cụ thể, dù cùng một câu hỏi." },
+    { term: "Design doc", meaning: "Tài liệu mô tả thiết kế một hệ thống trước khi xây dựng, dùng để đồng nghiệp review và ra quyết định sớm." },
+    { term: "Goals / Non-goals", meaning: "Những gì thiết kế nhắm tới đạt được, và những gì chủ động không nhắm tới — tương đương Functional/Out of scope." },
+    { term: "Alternatives considered", meaning: "Các phương án đã cân nhắc và lý do bỏ, không chỉ phương án cuối cùng được chọn." },
+    { term: "Rollout plan", meaning: "Kế hoạch triển khai thực tế: theo giai đoạn, theo % traffic, có điểm rollback hay không." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hai ứng viên trình bày đúng cùng một kiến trúc chat system. Ứng viên A chỉ dừng lại khi được hỏi 'còn gì cần lưu ý không?'. Ứng viên B tự nói thêm về nguy cơ mất tin nhắn khi client mất kết nối giữa chừng, dù không ai hỏi. Điều này phản ánh gì?"
+  options={[
+    "Ứng viên B chỉ đang nói nhiều hơn để gây ấn tượng",
+    "Không có khác biệt thật sự, cả hai đều đúng kiến trúc",
+    "Ứng viên B thể hiện hành vi chủ động nêu failure mode — dấu hiệu thường gắn với kỳ vọng senior",
+    "Ứng viên A trình bày gọn hơn nên tốt hơn",
+  ]}
+  answerIndex={2}
+  explanation="Chủ động nêu failure mode mà không cần được hỏi là đúng điểm khác biệt giữa mid và senior đã nói ở bài học: cùng kiến trúc, khác ở mức độ chủ động đào sâu điều có thể hỏng."
+/>
