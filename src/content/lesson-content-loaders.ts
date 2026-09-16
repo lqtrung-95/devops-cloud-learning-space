@@ -44,4 +44,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "sd15-case-news-feed-notification": (lessonSlug) => import(`./modules/sd15-case-news-feed-notification/lessons/${lessonSlug}.mdx`),
   "sd19-mock-interview-capstone": (lessonSlug) => import(`./modules/sd19-mock-interview-capstone/lessons/${lessonSlug}.mdx`),
   "sd18-case-proximity-booking-payment": (lessonSlug) => import(`./modules/sd18-case-proximity-booking-payment/lessons/${lessonSlug}.mdx`),
+  "b01-nodejs-runtime-project-architecture": (lessonSlug) => import(`./modules/b01-nodejs-runtime-project-architecture/lessons/${lessonSlug}.mdx`),
 };

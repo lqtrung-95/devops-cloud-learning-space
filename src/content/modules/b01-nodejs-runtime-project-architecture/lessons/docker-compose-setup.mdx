@@ -1,0 +1,127 @@
+import { DockerComposeStartupDiagram } from "../diagrams/docker-compose-startup-diagram";
+
+<Eli5 title="Docker Compose là nhạc trưởng của một dàn nhạc nhỏ" emoji="🎻">
+  Một bản nhạc cần violin, cello và piano vào đúng lúc, đúng nhịp — không phải nhạc công nào cũng tự biết khi nào nên bắt đầu. **Nhạc trưởng** (Docker Compose) đọc bản tổng phổ (`docker-compose.yml`) và ra hiệu cho từng nhạc công (service) vào đúng lúc.
+
+  `taskflow-api` bắt đầu với 3 "nhạc công": **`api`** (app của bạn), **`postgres`** (database), **`redis`** (cache/queue sau này). Compose đảm bảo cả ba khởi động và nói chuyện được với nhau chỉ bằng một lệnh duy nhất.
+</Eli5>
+
+Từ B01 trở đi, **toàn bộ 19 module** dùng chung đúng file `docker-compose.yml` này, chỉ thêm service mới (MinIO ở B08, worker ở B09...). Vì vậy tên service, port, biến môi trường ở đây phải chính xác tuyệt đối — sai một chỗ, mọi lab sau đều lệch theo.
+
+<DockerComposeStartupDiagram />
+
+<Technical>
+
+### Dockerfile multi-stage tối giản
+
+Multi-stage giúp image cuối cùng không "cõng" theo compiler TypeScript và devDependencies — sẽ tối ưu sâu hơn ở B17, nhưng bản tối giản này đã tách đúng 2 stage:
+
+```dockerfile title="Dockerfile"
+# Stage 1: build — có đủ devDependencies để biên dịch TypeScript
+FROM node:22-slim AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# Stage 2: runtime — chỉ mang theo dist/ và dependencies production
+FROM node:22-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY --from=builder /app/dist ./dist
+EXPOSE 3000
+CMD ["node", "dist/app.js"]
+```
+
+`COPY --from=builder` chỉ lấy đúng thư mục `dist/` từ stage trước — source TypeScript, `node_modules` dev, test file... đều không lọt vào image cuối.
+
+### docker-compose.yml — 3 service cố định
+
+Spec này **dùng chung cho cả course**, sao chép chính xác — không đổi tên biến, port hay service:
+
+```yaml title="docker-compose.yml"
+services:
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://taskflow:taskflow@postgres:5432/taskflow
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: taskflow
+      POSTGRES_PASSWORD: taskflow
+      POSTGRES_DB: taskflow
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    ports:
+      - "6380:6379"
+```
+
+### Cổng container vs cổng host
+
+`"5434:5432"` nghĩa là `host:container`. **Bên trong** network của Compose, `api` luôn gọi `postgres` qua cổng container gốc — `5432` — vì đó là cổng Postgres thật sự lắng nghe. `5434` chỉ tồn tại để bạn `psql` từ máy host vào container. Cùng logic cho Redis: container luôn là `6379`, host là `6380`.
+
+Vì vậy `DATABASE_URL` trong biến môi trường của `api` luôn dùng `postgres:5432` (tên service + cổng container), không phải `localhost:5434`.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Build image và khởi động cả 3 service ở chế độ nền", command: "docker compose up -d --build" },
+    { comment: "Kiểm tra trạng thái từng service", command: "docker compose ps", output: "NAME                  STATUS\ntaskflow-api-api-1        Up 4 seconds\ntaskflow-api-postgres-1   Up 10 seconds (healthy)\ntaskflow-api-redis-1      Up 10 seconds" },
+    { comment: "Xem log của postgres nếu healthcheck mãi không pass", command: "docker compose logs postgres --tail 20" },
+    { comment: "Gọi thử health-check qua port map ra host (3000)", command: "curl http://localhost:3000/api/v1/health", output: "{\"status\":\"ok\"}" },
+    { comment: "Vào thẳng psql bên trong container để kiểm tra user/db", command: "docker compose exec postgres psql -U taskflow -d taskflow -c '\\conninfo'" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Khai báo `DATABASE_URL` với `localhost:5434` thay vì `postgres:5432`. Bên trong container `api`, `localhost` là chính nó, không phải máy host — và cổng đúng để gọi service khác trong cùng network Compose luôn là cổng container gốc.
+</Callout>
+
+<Callout type="warning" title="taskflow/taskflow chỉ dùng cho dev">
+  Mật khẩu Postgres `taskflow` là quy ước **chỉ dành cho môi trường lab local** — không bao giờ dùng lại giá trị này (hay hard-code bất kỳ secret nào) khi triển khai thật. Quản lý secret đúng cách sẽ học ở B15.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Docker Compose", meaning: "Công cụ định nghĩa và chạy nhiều container liên kết với nhau bằng một file YAML." },
+    { term: "multi-stage build", meaning: "Dockerfile có nhiều FROM, chỉ mang kết quả cần thiết của stage trước sang stage sau." },
+    { term: "healthcheck", meaning: "Lệnh Docker chạy định kỳ để biết container đã thật sự sẵn sàng, không chỉ đang \"running\"." },
+    { term: "port mapping (host:container)", meaning: "Cổng bên trái là cổng bạn thấy từ máy host, bên phải là cổng container thật sự lắng nghe." },
+    { term: "depends_on condition", meaning: "Điều kiện Compose dùng để chờ service khác healthy/started trước khi start service hiện tại." },
+  ]}
+/>
+
+<QuickCheck
+  question="Trong docker-compose.yml của taskflow-api, service api cần kết nối tới Postgres. DATABASE_URL nào đúng theo spec cố định của cả course?"
+  options={[
+    "postgres://taskflow:taskflow@localhost:5434/taskflow",
+    "postgres://taskflow:taskflow@postgres:5432/taskflow",
+    "postgres://postgres:postgres@postgres:5432/postgres",
+    "postgres://taskflow:taskflow@postgres:5434/taskflow",
+  ]}
+  answerIndex={1}
+  explanation="Bên trong network Docker Compose, service gọi nhau bằng tên service (postgres) và cổng container gốc (5432). User/password/db đều cố định là taskflow. localhost và cổng 5434 chỉ dùng khi gọi từ máy host ra ngoài container."
+/>

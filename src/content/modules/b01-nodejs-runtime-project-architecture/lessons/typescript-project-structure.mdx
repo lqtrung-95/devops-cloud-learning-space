@@ -1,0 +1,144 @@
+import { LayeredRequestFlowDiagram } from "../diagrams/layered-request-flow-diagram";
+
+<Eli5 title="taskflow-api giống một nhà hàng có phân công rõ ràng" emoji="🍽️">
+  Một nhà hàng chạy tốt không để đầu bếp vừa ra tiếp khách vừa nấu vừa đi lấy hàng trong kho. Có **phục vụ** (ghi order, mang đồ ăn ra), có **đầu bếp** (nấu theo công thức), có **kho nguyên liệu** (chỉ đầu bếp mới vào).
+
+  `taskflow-api` cũng vậy: **`routes/`** chỉ "tiếp khách" (nhận HTTP request, trả response), **`services/`** là "đầu bếp" (chứa toàn bộ logic nghiệp vụ), **`db/`** là "kho" (chỉ lo truy vấn dữ liệu). Ai cũng chỉ làm đúng một việc — đổi công thức món ăn không cần huấn luyện lại phục vụ.
+</Eli5>
+
+Đây là lần duy nhất trong course bạn dựng khung project từ đầu — 18 module còn lại chỉ **thêm vào** đúng cấu trúc này. Dựng đúng ngay từ B01 giúp bạn không phải refactor lại toàn bộ khi B04 thêm database thật, B08 thêm file upload, B13 tách microservice.
+
+<LayeredRequestFlowDiagram />
+
+<Technical>
+
+### CommonJS vs ESM
+
+Node.js hỗ trợ 2 hệ thống module:
+
+| | CommonJS (cũ) | ESM — ES Module (taskflow-api dùng cái này) |
+|---|---|---|
+| Cú pháp | `require()` / `module.exports` | `import` / `export` |
+| Bật bằng | Mặc định nếu không khai báo gì | `"type": "module"` trong `package.json` |
+| Import file tương đối | Không cần đuôi file | **Bắt buộc** ghi đuôi `.js` kể cả khi source là `.ts` |
+| Top-level `await` | Không hỗ trợ | Hỗ trợ |
+
+```json title="package.json"
+{
+  "name": "taskflow-api",
+  "type": "module",
+  "engines": { "node": ">=22" }
+}
+```
+
+Vì taskflow-api viết bằng TypeScript nhưng chạy trên Node ESM thật, import file nội bộ phải ghi đuôi `.js` (đuôi của file **sau khi biên dịch**), dù file nguồn là `.ts`:
+
+```ts title="src/app.ts"
+import { registerHealthRoute } from "./routes/health.js"; // đúng — dù file thật là health.ts
+```
+
+### tsconfig.json cho backend Node 22
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"]
+}
+```
+
+- `"strict": true` bật toàn bộ kiểm tra kiểu chặt (`strictNullChecks`, `noImplicitAny`...) — bắt lỗi lúc biên dịch thay vì lúc production.
+- `"module"` và `"moduleResolution": "NodeNext"` làm TypeScript mô phỏng đúng cách Node.js thật sự resolve module ESM, bao gồm cả quy tắc bắt buộc đuôi `.js` ở trên.
+
+### Cấu trúc thư mục theo layer
+
+```
+taskflow-api/
+├── src/
+│   ├── app.ts              # khởi tạo Fastify instance, đăng ký route/plugin
+│   ├── config/
+│   │   └── env.ts          # validate biến môi trường bằng Zod
+│   ├── routes/
+│   │   └── health.ts       # lớp HTTP — chỉ nhận request, gọi service, trả response
+│   ├── services/
+│   │   └── health-service.ts  # logic nghiệp vụ thật
+│   ├── db/
+│   │   └── client.ts       # kết nối Postgres (dùng thật từ B04)
+│   └── plugins/            # Fastify plugin dùng chung (log, error handler...)
+├── docker-compose.yml
+├── Dockerfile
+├── tsconfig.json
+└── package.json
+```
+
+### Validate biến môi trường bằng Zod
+
+Đừng tin `.env` một cách mù quáng — thiếu một biến môi trường lúc chạy production tệ hơn nhiều so với báo lỗi ngay lúc khởi động:
+
+```ts title="src/config/env.ts"
+import "dotenv/config";
+import { z } from "zod";
+
+const envSchema = z.object({
+  PORT: z.coerce.number().int().positive().default(3000),
+  DATABASE_URL: z.string().url(),
+  REDIS_URL: z.string().url(),
+});
+
+// Ném lỗi và dừng process ngay nếu thiếu/sai biến — không để app chạy "nửa vời".
+export const env = envSchema.parse(process.env);
+```
+
+Gọi `import { env } from "./config/env.js"` ở bất kỳ đâu cần `env.PORT`, `env.DATABASE_URL` — TypeScript biết chính xác kiểu dữ liệu, không còn `process.env.PORT` kiểu `string | undefined`.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo cấu trúc thư mục theo layer", command: "mkdir -p src/routes src/services src/db src/plugins src/config" },
+    { comment: "Tạo file validate env", command: "touch src/config/env.ts" },
+    { comment: "Biên dịch thử để bắt lỗi type sớm, không sinh file", command: "npx tsc --noEmit", output: "(không có output nghĩa là không có lỗi type)" },
+    { comment: "Chạy app ở chế độ dev bằng tsx (tự nạp lại khi sửa file)", command: "npx tsx watch src/app.ts", output: "Server đang chạy tại http://localhost:3000" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Quên đuôi `.js` khi import file tương đối dưới cấu hình `NodeNext` (`import { env } from "./config/env"` — thiếu đuôi). TypeScript báo lỗi resolve module ngay lúc biên dịch, nhưng nhiều người tưởng nhầm là lỗi cấu hình khác.
+</Callout>
+
+<Callout type="warning" title="Đừng commit file .env">
+  `.env` chứa `DATABASE_URL`/`REDIS_URL` (và sau này là secret thật) — luôn thêm vào `.gitignore` ngay từ commit đầu tiên. Dùng `.env.example` để ghi lại tên biến cần có, không kèm giá trị thật.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "ESM (ES Module)", meaning: "Hệ thống module dùng import/export, bật bằng \"type\": \"module\"." },
+    { term: "CommonJS", meaning: "Hệ thống module cũ của Node, dùng require()/module.exports." },
+    { term: "strict mode (TypeScript)", meaning: "Bật toàn bộ kiểm tra kiểu chặt trong tsconfig.json." },
+    { term: "NodeNext", meaning: "Chế độ module/moduleResolution mô phỏng đúng cách Node.js thật resolve module." },
+    { term: "layered architecture", meaning: "Tách routes/services/db theo trách nhiệm, mỗi lớp chỉ lo một việc." },
+    { term: "environment validation", meaning: "Kiểm tra biến môi trường đúng kiểu/định dạng ngay lúc khởi động app, dùng Zod." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn import `import { env } from './config/env'` (không có đuôi file) trong một file TypeScript của taskflow-api. Chuyện gì xảy ra khi biên dịch với `moduleResolution: NodeNext`?"
+  options={[
+    "Biên dịch bình thường, TypeScript tự thêm đuôi .js giúp bạn",
+    "Lỗi resolve module — NodeNext bắt buộc ghi rõ đuôi file cho import tương đối",
+    "Chỉ cảnh báo (warning), vẫn chạy được bình thường",
+    "Không liên quan tới NodeNext, lỗi này chỉ xảy ra ở runtime",
+  ]}
+  answerIndex={1}
+  explanation="NodeNext mô phỏng đúng hành vi Node.js ESM thật — import tương đối bắt buộc phải có đuôi file (.js, dù nguồn là .ts) ngay từ lúc biên dịch, không phải chỉ lúc chạy."
+/>

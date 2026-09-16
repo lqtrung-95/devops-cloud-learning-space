@@ -1,4 +1,5 @@
 import type { ModuleDefinition } from "./content-types";
+import { b01NodejsRuntimeProjectArchitectureModule } from "./modules/b01-nodejs-runtime-project-architecture/module-meta";
 import { m01LinuxShellModule } from "./modules/m01-linux-shell/module-meta";
 import { m02NetworkingModule } from "./modules/m02-networking/module-meta";
 import { m03DevopsMindsetGitModule } from "./modules/m03-devops-mindset-git/module-meta";
@@ -38,6 +39,7 @@ import { sd19MockInterviewCapstoneModule } from "./modules/sd19-mock-interview-c
 
 /** All modules of every course (order within a course comes from `module.order`). Add modules after they pass `pnpm validate:module`. */
 export const curriculumModules: ModuleDefinition[] = [
+  b01NodejsRuntimeProjectArchitectureModule,
   m01LinuxShellModule,
   m02NetworkingModule,
   m03DevopsMindsetGitModule,

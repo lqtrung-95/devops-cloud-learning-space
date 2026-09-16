@@ -1,0 +1,99 @@
+import { EventLoopOrderingDiagram } from "../diagrams/event-loop-ordering-diagram";
+
+<Eli5 title="Node.js giống như một pha chế cực nhanh, chỉ có một tay" emoji="☕">
+  Tưởng tượng một quán cà phê chỉ có **một pha chế**. Khách A gọi espresso — pha chế bấm nút máy pha (việc chậm), rồi **không đứng đó chờ** mà quay lại nhận order của khách B ngay. Khi máy pha xong, nó "kêu bíp" và pha chế quay lại lấy ly cà phê giao cho khách A.
+
+  Pha chế đó chính là **luồng chính (main thread)** của Node.js. Máy pha espresso là các việc I/O chậm (đọc file, gọi database, gọi HTTP). **Event loop** là cách pha chế quyết định: "giờ tới lượt việc gì được làm tiếp?".
+
+  Điểm khác: pha chế còn có một cuốn sổ ưu tiên riêng (`process.nextTick`) — việc ghi vào đó luôn được xử lý trước cả những việc "khách quen đã hẹn trước" (Promise).
+</Eli5>
+
+Đây là chương đầu tiên của cả course Backend Development vì mọi thứ bạn viết sau này — route Fastify, query Drizzle, worker BullMQ — đều chạy bên trong đúng một luồng này. Hiểu sai thứ tự thực thi là nguồn gốc của rất nhiều bug khó tái hiện (race condition, response bị trễ không rõ lý do).
+
+<EventLoopOrderingDiagram />
+
+<Technical>
+
+### Một luồng, không chặn (single-threaded, non-blocking)
+
+Node.js chạy JavaScript của bạn trên **một luồng chính duy nhất**. Không có threads song song cho code của bạn như Java hay Go. Vậy vì sao Node vẫn xử lý được hàng ngàn request cùng lúc?
+
+Vì các việc **I/O chậm** (đọc file, query Postgres, gọi Redis, gọi API khác) không được thực hiện trực tiếp trên luồng chính — chúng được giao cho **libuv** (thư viện C bên dưới Node), thứ có một **thread pool** riêng và dùng các cơ chế bất đồng bộ của hệ điều hành. Luồng chính chỉ đăng ký "khi nào xong thì gọi lại callback này", rồi rảnh tay làm việc khác ngay.
+
+### Call stack — nơi code đang chạy
+
+**Call stack** là nơi JavaScript engine (V8) thực thi code đồng bộ, theo kiểu ngăn xếp (LIFO — vào sau ra trước). Khi bạn gọi một hàm, nó được đẩy lên đỉnh stack; hàm chạy xong thì bị lấy ra.
+
+Event loop chỉ được phép chuyển sang bước tiếp theo (xử lý queue nào đó) khi **call stack hoàn toàn rỗng**.
+
+### Ba loại "hàng đợi" callback
+
+| Hàng đợi | Ví dụ | Khi nào được xử lý |
+|---|---|---|
+| `process.nextTick` queue | `process.nextTick(fn)` | Ngay sau khi call stack rỗng, **trước cả** microtask — đặc thù riêng của Node |
+| Microtask queue | `Promise.then/catch/finally`, `queueMicrotask` | Sau khi nextTick queue rỗng, **trước** khi sang macrotask tiếp theo |
+| Macrotask queue (theo phase) | `setTimeout`, `setInterval`, I/O callback, `setImmediate` | Từng phase một của event loop (Timers → Pending callbacks → Poll → Check → Close) |
+
+Quy tắc quan trọng nhất: **sau mỗi callback đơn lẻ nào chạy xong** (kể cả một macrotask), Node xả hết `nextTick` queue rồi tới microtask queue, trước khi tiếp tục bất cứ việc gì khác. Không phải chỉ "giữa các phase" mà là sau **mỗi tác vụ**.
+
+### Ví dụ đã kiểm chứng từng bước
+
+```ts title="scripts/event-loop-order.ts"
+console.log("1: start");
+
+setTimeout(() => console.log("2: setTimeout"), 0);
+
+Promise.resolve().then(() => console.log("3: promise"));
+
+process.nextTick(() => console.log("4: nextTick"));
+
+console.log("5: end");
+```
+
+Lần theo từng bước: code đồng bộ chạy hết trước, in `1: start` rồi `5: end` (ba dòng ở giữa chỉ *đăng ký* callback, không chạy ngay). Call stack rỗng → Node xả `nextTick` queue: in `4: nextTick`. Xong nextTick, xả microtask queue: in `3: promise`. Cuối cùng, cả hai hàng đợi ưu tiên đã rỗng, event loop mới cho phép phase Timers chạy: in `2: setTimeout`.
+
+**Output thật:** `1: start`, `5: end`, `4: nextTick`, `3: promise`, `2: setTimeout`.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo file script trong repo taskflow-api", command: "touch scripts/event-loop-order.ts" },
+    { comment: "Chạy script bằng tsx (không cần biên dịch trước)", command: "npx tsx scripts/event-loop-order.ts", output: "1: start\n5: end\n4: nextTick\n3: promise\n2: setTimeout" },
+    { comment: "Thêm vòng lặp đồng bộ nặng ngay trước console.log('5: end'), chạy lại", command: "npx tsx scripts/event-loop-order.ts", output: "(mất vài giây mới thấy dòng đầu tiên in ra — call stack bận, event loop bị chặn hoàn toàn)" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Nghĩ rằng `setTimeout(fn, 0)` chạy "ngay lập tức". Nó chỉ được đăng ký vào macrotask queue — vẫn phải đợi call stack rỗng **và** cả `nextTick` lẫn microtask queue rỗng trước, nên trong ví dụ trên nó luôn chạy **cuối cùng**, dù được gọi đầu tiên trong 3 lệnh async.
+</Callout>
+
+<Callout type="warning" title="Đừng lạm dụng process.nextTick">
+  Gọi `process.nextTick` đệ quy liên tục (tự gọi lại chính nó) sẽ khiến hàng đợi nextTick không bao giờ rỗng — event loop bị "đói" (starvation), không bao giờ tới được phase Timers hay xử lý I/O thật. Đây là lỗi thật đã từng làm treo cả server Node trong production.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "event loop", meaning: "Vòng lặp quyết định thứ tự chạy các callback khi call stack rỗng." },
+    { term: "call stack", meaning: "Nơi code đồng bộ đang thực thi, theo kiểu ngăn xếp LIFO." },
+    { term: "non-blocking I/O", meaning: "Việc I/O chậm được giao cho libuv xử lý nền, không chặn luồng chính." },
+    { term: "microtask queue", meaning: "Hàng đợi callback của Promise, xử lý ngay sau nextTick, trước macrotask tiếp theo." },
+    { term: "process.nextTick", meaning: "Hàng đợi callback riêng của Node, ưu tiên cao nhất, xử lý trước cả microtask." },
+    { term: "macrotask / phase Timers", meaning: "Hàng đợi callback của setTimeout/setInterval, xử lý theo từng phase của event loop." },
+    { term: "libuv", meaning: "Thư viện C bên dưới Node cung cấp event loop và thread pool cho I/O bất đồng bộ." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một handler Fastify vô tình chạy một phép tính đồng bộ mất 3 giây (ví dụ hash mật khẩu bằng vòng lặp tay thay vì thư viện async). Điều gì xảy ra với các request khác đang tới trong 3 giây đó?"
+  options={[
+    "Không ảnh hưởng gì vì Node có nhiều luồng xử lý request song song",
+    "Tất cả request khác (kể cả health-check) đều bị chặn, phải đợi call stack rảnh",
+    "Chỉ request cùng loại (POST) bị chặn, GET vẫn chạy bình thường",
+    "Node tự động tạo worker thread mới để xử lý request khác",
+  ]}
+  answerIndex={1}
+  explanation="Node.js chạy code JS trên một luồng duy nhất. Bất kỳ đoạn code đồng bộ nào chiếm call stack cũng chặn TOÀN BỘ request khác, không phân biệt loại — đây là lý do mọi việc nặng phải làm bất đồng bộ hoặc đẩy ra worker/queue (sẽ học ở B09)."
+/>
