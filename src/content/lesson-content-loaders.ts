@@ -53,4 +53,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "b08-file-upload-object-storage": (lessonSlug) => import(`./modules/b08-file-upload-object-storage/lessons/${lessonSlug}.mdx`),
   "b09-background-jobs-scheduling": (lessonSlug) => import(`./modules/b09-background-jobs-scheduling/lessons/${lessonSlug}.mdx`),
   "b07-testing-backend": (lessonSlug) => import(`./modules/b07-testing-backend/lessons/${lessonSlug}.mdx`),
+  "b10-caching-for-backend": (lessonSlug) => import(`./modules/b10-caching-for-backend/lessons/${lessonSlug}.mdx`),
 };

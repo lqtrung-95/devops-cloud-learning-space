@@ -1,0 +1,135 @@
+import { CacheAsideHitVsMissRequestPathDiagram } from "../diagrams/cache-aside-hit-vs-miss-request-path-diagram";
+
+<Eli5 title="Redis giống ngăn kéo trên bàn thư ký, Postgres giống kho hồ sơ dưới tầng hầm" emoji="🗄️">
+  Thư ký giỏi không chạy xuống kho mỗi lần có người hỏi. Cô ấy giữ sẵn vài bản photo hay được hỏi ngay trong ngăn kéo bàn — hỏi ngăn kéo trước, có thì đưa luôn, không có mới lục thang xuống kho.
+
+  `taskflow-api` cũng vậy: `GET /api/v1/projects/:projectId/tasks` bị hỏi liên tục (board Kanban tự refresh, nhiều thành viên cùng xem một project), trong khi task chỉ đổi thỉnh thoảng khi ai đó thao tác. Đa số lần hỏi có thể trả lời ngay từ "ngăn kéo" Redis mà không cần lục "kho" Postgres.
+</Eli5>
+
+Từ B04, mỗi lần gọi endpoint này là một lượt round-trip tới Postgres — kể cả khi 10 người đang mở cùng một board và không ai vừa đổi gì. Thêm cache-aside giảm tải Postgres cho đúng phần lớn traffic đó (đọc lặp lại) mà không đổi API contract: client vẫn gọi y hệt endpoint cũ, response y hệt shape cũ.
+
+<CacheAsideHitVsMissRequestPathDiagram />
+
+<Technical>
+
+### Cache-aside là gì
+
+Cache-aside (hay "lazy loading") là pattern đơn giản nhất: **ứng dụng** (không phải Redis) chịu trách nhiệm đọc/ghi cache, theo đúng 4 bước:
+
+1. Nhận request đọc → build cache key từ tham số request
+2. Hỏi Redis (`GET key`) — có (**HIT**) thì trả luôn, xong
+3. Không có (**MISS**) → query Postgres như bình thường
+4. Lưu kết quả vào Redis (`SET key value EX ttl`) trước khi trả response, để lần sau HIT
+
+Điểm quan trọng: Redis không tự động biết phải chứa gì — nó chỉ là một cái kho lưu trữ key-value thụ động. Toàn bộ logic "khi nào đọc, khi nào ghi" nằm trong code route handler.
+
+### Áp dụng cho GET /api/v1/projects/:projectId/tasks
+
+```typescript title="src/lib/redis-client.ts"
+import Redis from "ioredis";
+
+// Cùng REDIS_URL đã có từ B01 (ioredis cũng là driver BullMQ dùng ở B09)
+export const redis = new Redis(process.env.REDIS_URL ?? "redis://redis:6379");
+```
+
+```typescript title="src/lib/task-list-cache-key.ts"
+interface TaskListCacheKeyParams {
+  status?: string;
+  cursor?: string;
+  limit: number;
+}
+
+export function buildTaskListCacheKey(projectId: string, { status, cursor, limit }: TaskListCacheKeyParams): string {
+  return `tasks:${projectId}:list:status=${status ?? "all"}:cursor=${cursor ?? "first"}:limit=${limit}`;
+}
+
+export function taskListRegistryKey(projectId: string): string {
+  return `tasks:${projectId}:list:keys`;
+}
+```
+
+```typescript title="src/routes/tasks.route.ts"
+import { redis } from "../lib/redis-client";
+import { buildTaskListCacheKey, taskListRegistryKey } from "../lib/task-list-cache-key";
+
+const TASK_LIST_TTL_SECONDS = 30;
+
+fastify.get(
+  "/api/v1/projects/:projectId/tasks",
+  { schema: { params: projectParamsSchema, querystring: listTasksQuerySchema } },
+  async (request) => {
+    const { projectId } = request.params;
+    const { status, cursor, limit } = request.query;
+    const cacheKey = buildTaskListCacheKey(projectId, { status, cursor, limit });
+
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+
+    const result = await queryTaskListFromPostgres(projectId, { status, cursor, limit }); // hàm Drizzle đã có từ B04
+
+    await redis.set(cacheKey, JSON.stringify(result), "EX", TASK_LIST_TTL_SECONDS);
+    await redis.sadd(taskListRegistryKey(projectId), cacheKey);
+
+    return result;
+  },
+);
+```
+
+`redis.sadd` ghi thêm `cacheKey` vào một Redis Set riêng cho project đó — registry này không phục vụ việc đọc, chỉ để bài sau (invalidation) biết chính xác cần xoá key nào mà không phải quét (`KEYS`) toàn bộ keyspace.
+
+### TTL 30 giây: lưới an toàn, không phải giải pháp chính
+
+TTL 30 giây có nghĩa là dù invalidation ở bài sau có lỡ bị bỏ sót ở đâu đó, cache tự "tự sửa" chậm nhất sau 30 giây. Chọn TTL là một đánh đổi:
+
+| TTL | Ưu | Nhược |
+|---|---|---|
+| Rất ngắn (vài giây) | Dữ liệu cũ tồn tại rất ngắn kể cả khi quên invalidate | Hit rate thấp hơn, gần như luôn phải hỏi Postgres |
+| 30 giây (chọn ở đây) | Hit rate cao cho board đang mở liên tục; đủ ngắn để không ai chờ quá lâu nếu có invalidation bị sót | Vẫn có cửa sổ 30s dữ liệu cũ NẾU không invalidate chủ động |
+| Rất dài (phút/giờ) | Hit rate cực cao | Nếu quên invalidate, người dùng thấy sai trong thời gian dài — rủi ro lớn cho dữ liệu hay đổi như task list |
+
+30 giây hợp lý cho endpoint đọc nhiều, ghi thỉnh thoảng như task list — nhưng **chỉ là lưới an toàn**. Bài tiếp theo mới là phần quan trọng: invalidate chủ động ngay khi có write, để không ai phải chờ hết TTL mới thấy dữ liệu đúng.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Lần đầu — cache MISS, phải query Postgres", command: "curl -s -o /dev/null -w 'time_total=%{time_total}s status=%{http_code}\\n' 'localhost:3000/api/v1/projects/8f14e2a0.../tasks?status=todo&limit=20'", output: "time_total=0.038s status=200" },
+    { comment: "Gọi lại NGAY với cùng tham số — cache HIT", command: "curl -s -o /dev/null -w 'time_total=%{time_total}s status=%{http_code}\\n' 'localhost:3000/api/v1/projects/8f14e2a0.../tasks?status=todo&limit=20'", output: "time_total=0.006s status=200" },
+    { comment: "Xem key vừa được lưu trong Redis (host port 6380 theo docker-compose.yml)", command: "redis-cli -p 6380 GET 'tasks:8f14e2a0...:list:status=todo:cursor=first:limit=20'", output: "\"{\\\"data\\\":[...],\\\"meta\\\":{\\\"cursor\\\":\\\"...\\\"}}\"" },
+    { comment: "TTL còn lại tính bằng giây", command: "redis-cli -p 6380 TTL 'tasks:8f14e2a0...:list:status=todo:cursor=first:limit=20'", output: "26" },
+    { comment: "Đổi tham số (limit khác) — key khác, chắc chắn MISS lại", command: "curl -s -o /dev/null -w 'time_total=%{time_total}s\\n' 'localhost:3000/api/v1/projects/8f14e2a0.../tasks?status=todo&limit=5'", output: "time_total=0.041s" },
+  ]}
+/>
+
+Chênh lệch 38ms → 6ms không phải phép màu: lần thứ hai chỉ mất một round-trip Redis (trong cùng mạng Docker), bỏ hẳn phần connection pool + planner + đọc index của Postgres.
+
+<Callout type="mistake" title="Đừng đặt cache check ở hook chạy trước authorization">
+  Fastify chạy hook theo thứ tự `onRequest` → ... → `preHandler` (nơi `resolveOrganizationContext` + `requireRole` của B06 chạy) → handler. Nếu vì muốn "tối ưu thêm" mà chuyển việc `redis.get` lên `onRequest` để trả sớm hơn, request sẽ nhận được cache HIT **trước khi** RBAC kịp kiểm tra user có thuộc project/organization đó hay không. Cache-aside trong bài này nằm trong route handler — luôn chạy SAU toàn bộ `preHandler` — và phải giữ nguyên vị trí đó.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "cache-aside", meaning: "Ứng dụng tự đọc/ghi cache: hỏi cache trước, miss thì query DB rồi tự lưu lại." },
+    { term: "TTL (Time To Live)", meaning: "Thời gian một key tồn tại trước khi Redis tự xoá — lưới an toàn, không thay thế invalidation." },
+    { term: "HIT / MISS", meaning: "HIT: key có trong cache. MISS: không có, phải hỏi nguồn dữ liệu gốc." },
+    { term: "ioredis", meaning: "Redis client cho Node.js, cùng driver BullMQ (B09) đang dùng ngầm." },
+    { term: "EX (flag của SET)", meaning: "Đặt TTL tính bằng giây ngay khi ghi key, ví dụ `SET key value EX 30`." },
+    { term: "registry set", meaning: "Một Redis Set nhớ danh sách cache key đã tạo cho một project, dùng để invalidate chính xác." },
+  ]}
+/>
+
+<QuickCheck
+  question="Route GET /api/v1/projects/:projectId/tasks dùng cache-aside với TTL 30 giây. User gọi lại đúng cùng URL (cùng status, cursor, limit) 5 giây sau lần gọi đầu. Lần gọi thứ hai sẽ..."
+  options={[
+    "Luôn MISS vì Redis không lưu được dữ liệu dạng JSON",
+    "HIT — trả thẳng dữ liệu đã lưu trong Redis, không chạm Postgres",
+    "MISS vì phải đợi đủ 30 giây TTL mới được đọc cache",
+    "Redis sẽ tự động gọi lại Postgres để xác nhận dữ liệu còn đúng trước khi trả HIT",
+  ]}
+  answerIndex={1}
+  explanation="5 giây vẫn nằm trong TTL 30 giây và tham số giống hệt nên cache key giống hệt — HIT ngay, không cần chạm Postgres. Cache-aside không tự xác nhận lại với nguồn gốc khi HIT, đó là lý do invalidation ở bài sau lại quan trọng."
+/>

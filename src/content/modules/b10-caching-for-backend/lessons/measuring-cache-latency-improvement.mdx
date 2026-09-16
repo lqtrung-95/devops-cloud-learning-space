@@ -1,0 +1,97 @@
+import { LatencyBeforeAfterCachingDiagram } from "../diagrams/latency-before-after-caching-diagram";
+
+<Eli5 title="Đừng đoán 'chắc là nhanh hơn' — bấm giờ ở quầy có nhiều người xếp hàng" emoji="⏱️">
+  Một quầy phục vụ thêm một trợ lý nhanh nhẹn (cache) đứng phía trước để trả lời những câu hỏi hay lặp lại, để nhân viên chính (Postgres) chỉ xử lý câu khó. Nếu chỉ thử bấm giờ đúng 1 khách, bạn không biết quầy có thật sự nhanh hơn khi có 50 người xếp hàng cùng lúc hay không — phải bấm giờ cả một dòng người, rồi nhìn người chờ lâu nhất (không phải người trung bình).
+</Eli5>
+
+Curriculum của course yêu cầu "có số đo latency trước/sau" — không phải "cảm giác nhanh hơn". Bài này dùng `autocannon` để tạo tải đồng thời thật lên `GET /api/v1/projects/:projectId/tasks`, đo trước khi có cache-aside và sau khi có, rồi so sánh đúng số liệu.
+
+<LatencyBeforeAfterCachingDiagram />
+
+<Technical>
+
+### Vì sao đo bằng tải đồng thời, không phải 1 request
+
+Một `curl` đơn lẻ chỉ cho biết latency của ĐÚNG lần gọi đó — có thể vô tình rơi vào HIT (nhanh) hoặc MISS (chậm), không nói lên điều gì về hành vi tổng thể. `autocannon` mở nhiều connection đồng thời trong một khoảng thời gian, tạo ra một phân phối latency thật — đúng với cách nhiều client cùng dùng board Kanban cùng lúc trong thực tế.
+
+### Đọc bảng kết quả autocannon
+
+```bash
+npx autocannon -c 20 -d 15 http://localhost:3000/api/v1/projects/8f14.../tasks?status=todo
+```
+
+- `-c 20`: 20 connection đồng thời
+- `-d 15`: chạy trong 15 giây
+- Kết quả quan trọng nhất: bảng **Latency** (đơn vị ms) và **Req/Sec**
+
+| Phân vị | Ý nghĩa |
+|---|---|
+| p50 (trung vị) | Nửa số request nhanh hơn con số này — "trải nghiệm điển hình" |
+| p95 | 95% request nhanh hơn con số này — SLA hay dùng con số này, không dùng trung bình |
+| p99 | 99% request nhanh hơn — phần đuôi, thường lộ ra vấn đề mà trung vị che giấu |
+
+### So sánh trước/sau — và vì sao p99 "cứng đầu"
+
+Chạy đúng lệnh autocannon ở trên hai lần: một lần tắt tạm cache-aside (chỉ query Postgres), một lần bật lại. Kết quả điển hình trên một máy dev (Docker Compose local, dataset nhỏ vài trăm task):
+
+```
+Trước cache (chỉ Postgres):
+┌─────────┬──────┬──────┬───────┐
+│ Phân vị │ p50  │ p95  │ p99   │
+├─────────┼──────┼──────┼───────┤
+│ Latency │ 16ms │ 42ms │ 68ms  │
+└─────────┴──────┴──────┴───────┘
+
+Sau cache-aside (TTL 30s):
+┌─────────┬──────┬──────┬───────┐
+│ Phân vị │ p50  │ p95  │ p99   │
+├─────────┼──────┼──────┼───────┤
+│ Latency │ 4ms  │ 13ms │ 55ms  │
+└─────────┴──────┴──────┴───────┘
+```
+
+p50 và p95 giảm rất mạnh (phần lớn request giờ chỉ chạm Redis). Nhưng p99 chỉ nhích nhẹ — 1% request chậm nhất trong lần đo "sau" gần như chắc chắn là các request MISS (key vừa hết TTL, hoặc lọc theo `status` hiếm ai hỏi) vẫn phải đi trọn đường Postgres như trước. **Cache không xoá tail latency, nó chỉ giảm SỐ LƯỢNG request rơi vào đó.** Con số cụ thể trên máy bạn sẽ khác — quan trọng là hình dạng: p50/p95 cải thiện rõ, p99 cải thiện ít hơn hẳn.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài autocannon", command: "pnpm add -D autocannon" },
+    { comment: "Tạm comment redis.get/redis.set trong route, chỉ còn Postgres — đo baseline", command: "npx autocannon -c 20 -d 15 http://localhost:3000/api/v1/projects/8f14.../tasks?status=todo", output: "Latency (ms): p50 16 | p95 42 | p99 68\nReq/Sec avg: 480" },
+    { comment: "Bỏ comment, bật lại cache-aside, chạy lại đúng lệnh trên", command: "npx autocannon -c 20 -d 15 http://localhost:3000/api/v1/projects/8f14.../tasks?status=todo", output: "Latency (ms): p50 4 | p95 13 | p99 55\nReq/Sec avg: 1650" },
+    { comment: "Tăng tải để thấy khoảng cách rõ hơn", command: "npx autocannon -c 100 -d 15 http://localhost:3000/api/v1/projects/8f14.../tasks?status=todo" },
+    { comment: "Ghi cả 2 bảng và nhận xét vào learnings.md của module", command: "echo 'B10: p50 16ms→4ms, p95 42ms→13ms, p99 68ms→55ms (dataset ~300 task, docker compose local)' >> learnings.md" },
+  ]}
+/>
+
+<Callout type="mistake" title="Đo trên máy đang chạy nặng việc khác">
+  Chạy `autocannon` trong lúc IDE đang index lại project, hoặc trình duyệt đang mở 40 tab, sẽ làm nhiễu kết quả (CPU cạnh tranh giữa `api`, `postgres`, `redis` container và tiến trình đo). Đóng bớt ứng dụng nặng trước khi đo, và chạy mỗi cấu hình ít nhất 2 lần để chắc con số ổn định, không phải nhiễu ngẫu nhiên.
+</Callout>
+
+<Callout type="tip" title="Seed đủ dữ liệu trước khi đo">
+  Nếu project chỉ có 3 task, Postgres vốn đã cực nhanh (toàn bộ nằm gọn trong cache của chính Postgres) và bạn sẽ không thấy khác biệt rõ giữa có/không cache ở tầng ứng dụng. Seed vài trăm task trước khi benchmark để phép đo có ý nghĩa.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "autocannon", meaning: "Công cụ load test HTTP viết bằng Node.js, tạo nhiều connection đồng thời." },
+    { term: "p50 / p95 / p99", meaning: "Phân vị latency: trung vị / 95% nhanh hơn / 99% nhanh hơn con số đó." },
+    { term: "tail latency", meaning: "Latency của phần nhỏ request chậm nhất (thường là p95 trở lên)." },
+    { term: "throughput (Req/Sec)", meaning: "Số request server xử lý được mỗi giây dưới tải đang test." },
+    { term: "baseline", meaning: "Số đo TRƯỚC khi thay đổi, dùng làm mốc so sánh." },
+  ]}
+/>
+
+<QuickCheck
+  question="Sau khi thêm cache-aside, p50 giảm từ 16ms xuống 4ms, p95 từ 42ms xuống 13ms, nhưng p99 chỉ giảm từ 68ms xuống 55ms. Cách giải thích nào hợp lý nhất?"
+  options={[
+    "autocannon đo sai ở phân vị cao, nên bỏ qua số p99",
+    "1% request chậm nhất phần lớn là cache MISS, vẫn phải chạm Postgres như trước khi có cache — cache giảm SỐ LƯỢNG request rơi vào đường chậm, không xoá đường đó",
+    "Redis có lỗi ngẫu nhiên khiến 1% request bị delay",
+    "p99 luôn cao hơn p95 đúng bằng một hằng số cố định, không liên quan tới cache",
+  ]}
+  answerIndex={1}
+  explanation="Cache-aside chỉ tăng tỉ lệ HIT, không loại bỏ hoàn toàn đường Postgres. Request MISS vẫn đi trọn đường cũ — đó là lý do đuôi p99 cải thiện ít hơn nhiều so với p50/p95."
+/>

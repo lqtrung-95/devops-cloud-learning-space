@@ -1,0 +1,121 @@
+import { CacheKeyCompositionCollisionBugDiagram } from "../diagrams/cache-key-composition-collision-bug-diagram";
+import { CacheInvalidationOnWriteDiagram } from "../diagrams/cache-invalidation-on-write-diagram";
+
+<Eli5 title="Cache key giống địa chỉ hộp thư, invalidate giống báo bưu điện khi có người chuyển nhà" emoji="📬">
+  Nếu địa chỉ hộp thư chỉ ghi "Số 8, Đường ABC" mà thiếu "Tầng 3, Phòng 5", hai căn hộ khác nhau trên cùng con đường sẽ nhận nhầm thư của nhau. Cache key cũng vậy — thiếu một mảnh thông tin (như `status`) là hai request khác nhau dùng chung một "hộp thư".
+
+  Còn khi ai đó dọn nhà (task đổi trạng thái), bưu điện phải được báo NGAY để ngừng giao thư theo địa chỉ cũ — không phải mở từng lá thư cũ ra sửa lại nội dung bên trong. Đó là bản chất của invalidate: xoá, không vá.
+</Eli5>
+
+<CacheKeyCompositionCollisionBugDiagram />
+
+<Technical>
+
+### Cache key phải chứa MỌI tham số ảnh hưởng response
+
+`buildTaskListCacheKey` ở bài trước đã đưa `status`, `cursor`, `limit` vào key — không phải ngẫu nhiên. Quy tắc chung: **bất kỳ giá trị nào làm thay đổi nội dung response đều phải nằm trong cache key**, nếu không hai request khác nhau sẽ vô tình dùng chung một cache entry.
+
+| Tham số | Ảnh hưởng response? | Có trong key? |
+|---|---|---|
+| `projectId` | Có — mỗi project một danh sách task riêng | Có |
+| `status` | Có — lọc theo trạng thái khác nhau, kết quả khác nhau | Có |
+| `cursor` | Có — trang khác nhau của cùng danh sách | Có |
+| `limit` | Có — số phần tử trả về khác nhau | Có |
+| Header `Accept-Language` (giả sử có sau này) | Nếu response có text dịch theo ngôn ngữ thì CÓ | Phải thêm nếu dùng |
+
+Nếu công thức key bỏ sót `status` (như minh hoạ ở diagram trên), hai request lọc `todo` và `done` build ra cùng một key. Request đến sau đọc trúng cache của request đến trước — HIT vẫn trả `200`, không có exception nào cả, nên lỗi này thường chỉ bị phát hiện khi người dùng report "sao tôi lọc `done` mà vẫn thấy task `todo`".
+
+### Invalidate khi ghi: xoá, không vá
+
+Có một câu đùa kinh điển trong ngành: "chỉ có hai thứ khó trong khoa học máy tính — đặt tên biến và invalidate cache". Phần khó thật sự không phải kỹ thuật xoá key (chỉ là một lệnh Redis), mà là **nhớ gọi nó ở đúng MỌI chỗ dữ liệu có thể thay đổi**.
+
+Cơ chế chính xác cho `taskflow-api`: mỗi khi một task trong project bị tạo/sửa/xoá, xoá **toàn bộ** các key list đang cache cho project đó — không cố "vá" từng phần tử bên trong JSON đã cache (tìm đúng task, sửa field, ghi lại). Lý do:
+
+- Một project có thể có nhiều key cùng lúc (`status=all`, `status=todo`, `status=done`, nhiều `cursor` khác nhau) — task vừa đổi có thể xuất hiện hoặc biến mất khỏi từng danh sách đó theo cách khác nhau.
+- Sửa tay JSON đã cache dễ sai thứ tự, sai cursor, quên field liên quan (ví dụ đếm tổng số task).
+- Xoá nguyên rồi để cache-aside tự nạp lại (bài trước) luôn cho kết quả đúng 100% — vì nó chạy lại đúng câu query gốc.
+
+```typescript title="src/lib/task-list-cache-invalidation.ts"
+import { redis } from "./redis-client";
+import { taskListRegistryKey } from "./task-list-cache-key"; // đã có từ bài trước
+
+export async function invalidateProjectTaskListCache(projectId: string): Promise<void> {
+  const registryKey = taskListRegistryKey(projectId);
+  const keys = await redis.smembers(registryKey);
+
+  if (keys.length > 0) {
+    await redis.unlink(...keys); // xoá không blocking, khác DEL (blocking)
+  }
+  await redis.unlink(registryKey);
+}
+```
+
+```typescript title="src/routes/tasks.route.ts"
+import { invalidateProjectTaskListCache } from "../lib/task-list-cache-invalidation";
+
+fastify.patch(
+  "/api/v1/projects/:projectId/tasks/:id",
+  { schema: { params: taskParamsSchema, body: updateTaskBodySchema } },
+  async (request) => {
+    const { projectId, id } = request.params;
+
+    const updated = await db.transaction(async (tx) => {
+      return updateTaskInProject(tx, projectId, id, request.body); // logic Drizzle đã có từ B04/B06
+    });
+
+    // Invalidate SAU KHI Postgres commit thành công — không phải trước
+    await invalidateProjectTaskListCache(projectId);
+
+    return updated;
+  },
+);
+```
+
+`invalidateProjectTaskListCache` phải được gọi trong **cả ba** route ghi: tạo task, sửa task, xoá task — mỗi route đều lấy `projectId` từ `request.params` (đã xác thực qua RBAC ở B06), không phải từ body, để tránh trường hợp client cố tình gửi `projectId` khác trong payload.
+
+</Technical>
+
+<CacheInvalidationOnWriteDiagram />
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Nạp cache: gọi list 2 lần để chắc chắn đang HIT", command: "curl -s 'localhost:3000/api/v1/projects/8f14.../tasks?status=todo' | jq '.data[0].status'", output: '"todo"' },
+    { comment: "Xem registry đang giữ bao nhiêu key cho project này", command: "redis-cli -p 6380 SMEMBERS 'tasks:8f14...:list:keys'", output: "1) \"tasks:8f14...:list:status=todo:cursor=first:limit=20\"\n2) \"tasks:8f14...:list:status=all:cursor=first:limit=20\"" },
+    { comment: "Sửa task sang done — route PATCH gọi invalidate ngay sau commit", command: "curl -s -X PATCH 'localhost:3000/api/v1/projects/8f14.../tasks/9c21...' -H 'Content-Type: application/json' -d '{\"status\":\"done\"}' -w '\\n%{http_code}\\n'", output: "200" },
+    { comment: "Registry phải rỗng — cả 2 key vừa bị UNLINK", command: "redis-cli -p 6380 SMEMBERS 'tasks:8f14...:list:keys'", output: "(empty array)" },
+    { comment: "Gọi lại list status=todo — MISS, và task vừa sửa không còn ở đây nữa", command: "curl -s 'localhost:3000/api/v1/projects/8f14.../tasks?status=todo' | jq '[.data[].id] | contains([\"9c21...\"])'", output: "false" },
+  ]}
+/>
+
+<Callout type="mistake" title="Chỉ nhớ invalidate ở route tạo, quên route xoá">
+  Một lỗi rất phổ biến: dev nhớ gọi `invalidateProjectTaskListCache` ở `POST` (tạo task, vì hay test route đó nhất) và `PATCH`, nhưng quên ở `DELETE /api/v1/projects/:projectId/tasks/:id`. Kết quả: xoá task xong, `GET` list vẫn thấy task đó trong tối đa 30 giây (TTL) — vì cache chưa hề biết task đã biến mất. Checklist đơn giản: mọi route làm `INSERT`/`UPDATE`/`DELETE` lên bảng `tasks` đều phải gọi invalidate, không có ngoại lệ.
+</Callout>
+
+<Callout type="tip" title="UNLINK, không phải DEL">
+  `UNLINK` xoá key khỏi keyspace ngay lập tức nhưng giải phóng bộ nhớ ở một thread khác — không block Redis. Với vài key nhỏ như ở đây khác biệt không đáng kể, nhưng dùng `UNLINK` là thói quen tốt để không bị bất ngờ khi sau này cache những value lớn hơn.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "cache key collision", meaning: "Hai request khác nhau vô tình build ra cùng một key vì công thức thiếu tham số." },
+    { term: "delete-on-write", meaning: "Xoá cache liên quan ngay khi có ghi dữ liệu, thay vì cố sửa cache tại chỗ." },
+    { term: "SADD / SMEMBERS", meaning: "Lệnh Redis thêm phần tử vào Set / liệt kê toàn bộ phần tử của Set." },
+    { term: "UNLINK", meaning: "Xoá key không blocking — khác DEL ở chỗ giải phóng bộ nhớ bất đồng bộ." },
+    { term: "registry set", meaning: "Redis Set nhớ toàn bộ cache key đã sinh cho một project, dùng để invalidate chính xác." },
+    { term: "stale data", meaning: "Dữ liệu cũ vẫn được phục vụ sau khi nguồn gốc (Postgres) đã đổi, do cache chưa được invalidate." },
+  ]}
+/>
+
+<QuickCheck
+  question="Route DELETE /api/v1/projects/:projectId/tasks/:id xoá một task khỏi Postgres nhưng KHÔNG gọi invalidateProjectTaskListCache. Điều gì xảy ra khi gọi lại GET list ngay sau đó?"
+  options={[
+    "Task vẫn xuất hiện trong kết quả GET list cho tới khi TTL 30 giây hết, vì cache chưa biết task đã bị xoá",
+    "Redis tự phát hiện Postgres đã đổi và tự xoá cache liên quan",
+    "GET list sẽ trả lỗi 500 vì dữ liệu không khớp",
+    "Không ảnh hưởng gì vì DELETE luôn đi kèm invalidate mặc định trong Fastify",
+  ]}
+  answerIndex={0}
+  explanation="Redis không biết Postgres vừa đổi — nó chỉ biết những gì được lệnh xoá/ghi rõ ràng. Thiếu invalidate ở DELETE để lại đúng loại bug này cho tới khi TTL tự hết."
+/>

@@ -8,6 +8,7 @@ import { b06AuthorizationMultiTenantRbacModule } from "./modules/b06-authorizati
 import { b07TestingBackendModule } from "./modules/b07-testing-backend/module-meta";
 import { b08FileUploadObjectStorageModule } from "./modules/b08-file-upload-object-storage/module-meta";
 import { b09BackgroundJobsSchedulingModule } from "./modules/b09-background-jobs-scheduling/module-meta";
+import { b10CachingForBackendModule } from "./modules/b10-caching-for-backend/module-meta";
 import { m01LinuxShellModule } from "./modules/m01-linux-shell/module-meta";
 import { m02NetworkingModule } from "./modules/m02-networking/module-meta";
 import { m03DevopsMindsetGitModule } from "./modules/m03-devops-mindset-git/module-meta";
@@ -56,6 +57,7 @@ export const curriculumModules: ModuleDefinition[] = [
   b07TestingBackendModule,
   b08FileUploadObjectStorageModule,
   b09BackgroundJobsSchedulingModule,
+  b10CachingForBackendModule,
   m01LinuxShellModule,
   m02NetworkingModule,
   m03DevopsMindsetGitModule,
