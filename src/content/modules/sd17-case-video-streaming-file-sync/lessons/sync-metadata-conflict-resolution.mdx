@@ -1,0 +1,101 @@
+import { SyncConflictResolutionDiagram } from "../diagrams/sync-conflict-resolution-diagram";
+
+<Eli5 title="Sổ theo dõi phiên bản, và cách xử lý khi hai người cùng sửa một trang lúc mất liên lạc" emoji="🗃️">
+  Ngoài kho lưu chunk (bài trước), hệ thống cần một cuốn **sổ cái riêng** ghi: "file X, version 7, gồm đúng những chunk nào, theo thứ tự nào". Đây là **metadata service** — nó không giữ nội dung file, chỉ giữ "công thức lắp ráp".
+
+  Vấn đề khó hơn: nếu bạn sửa file lúc mất mạng, và đồng nghiệp cũng sửa đúng file đó lúc bạn offline, ai đúng khi cả hai cùng đồng bộ? Giống hai người cùng mượn một cuốn sổ giấy đem về nhà sửa riêng, rồi cùng mang trả — thư viện (server) phải có luật rõ ràng để không làm mất bản sửa của ai.
+</Eli5>
+
+<SyncConflictResolutionDiagram />
+
+<Technical>
+
+### 1. Metadata service: theo dõi chunk hash theo version
+
+Nối tiếp bài trước, mỗi file có nhiều **version**, mỗi version là một danh sách hash chunk theo đúng thứ tự (đã định nghĩa ở bảng `file_versions` bài trước). Metadata service chịu trách nhiệm:
+
+- Biết version **hiện tại** (mới nhất) của mỗi file.
+- Khi client gửi version mới, so sánh danh sách hash với version hiện tại để tính **delta** (chunk nào mới cần upload, chunk nào tái dùng).
+- Phát hiện **xung đột**: client phải gửi kèm version nó dựa vào để sửa (base version). Nếu base version ≠ version hiện tại trên server, đây là 2 nhánh sửa đồng thời từ cùng gốc.
+
+```http
+POST /files/{id}/versions
+Body: { baseVersion: 5, chunkHashes: ["h1", "h2new", "h3", ...] }
+
+# Server hiện đang ở version 6 (không phải 5) -> conflict!
+Response: 409 Conflict
+{ "currentVersion": 6, "yourBaseVersion": 5 }
+```
+
+### 2. Điều kiện phát hiện xung đột
+
+Đây thực chất là **optimistic concurrency control** (đã gặp ở SD05/SD10 dưới dạng version column / compare-and-swap): client luôn thao tác dựa trên một version cụ thể, và server chỉ chấp nhận ghi nếu version đó vẫn là version hiện tại. Nếu không khớp — có ai đó đã ghi trước — server từ chối và để client (hoặc một chiến lược tự động) quyết định cách xử lý.
+
+Vector clock là cách chính xác hơn để biết *quan hệ nhân quả* giữa 2 version (A có "thấy" bản sửa của B trước khi sửa không, hay 2 bản hoàn toàn độc lập) — hữu ích khi có **nhiều hơn 2 thiết bị** sửa đồng thời và cần phân biệt "B sửa sau khi biết về A" (không xung đột thật) với "B sửa mà chưa từng thấy bản của A" (xung đột thật). Nhưng vector clock có chi phí phức tạp: kích thước tăng theo số thiết bị, và vẫn cần một luật giải quyết ở bước cuối khi phát hiện đúng là xung đột thật.
+
+**Lựa chọn trong bài này:** dùng **base-version compare (đơn giản hơn vector clock)** để phát hiện xung đột, cộng thêm **last-writer-wins (LWW) + conflicted copy** để giải quyết — vì phần lớn hệ thống sync cho người dùng cá nhân (ít thiết bị/user, không cần causality chính xác tuyệt đối giữa nhiều actor) ưu tiên đơn giản và **không bao giờ mất dữ liệu người dùng**, hơn là độ chính xác causal tuyệt đối của vector clock.
+
+### 3. Giải quyết xung đột: LWW thuần vs LWW + conflicted copy
+
+Khi phát hiện xung đột (base version lệch), hai lựa chọn:
+
+- **LWW thuần:** so `updated_at` (hoặc timestamp đồng bộ) của 2 bản, giữ bản mới hơn, **bỏ hẳn** bản còn lại. Đơn giản nhưng có thể **mất vĩnh viễn** một thay đổi hợp lệ — người dùng không hề biết.
+- **LWW + conflicted copy:** vẫn chọn một bản làm "canonical" theo timestamp (file giữ tên gốc), nhưng bản thua **không bị xoá** — được lưu thành file mới, ví dụ `report (conflicted copy from Laptop, 2026-09-16).docx`. Người dùng thấy cả 2, tự quyết định gộp hay xoá.
+
+| Chiến lược | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| LWW thuần | Đơn giản nhất, không tốn thêm storage | Có thể âm thầm mất dữ liệu hợp lệ của bên "thua" — không chấp nhận được cho file người dùng quan trọng | Dữ liệu có thể tái tạo lại dễ dàng, hoặc chấp nhận rủi ro mất bản cũ (ví dụ cache, dữ liệu tạm) |
+| LWW + conflicted copy | Không bao giờ mất dữ liệu do hệ thống tự quyết định sai; đơn giản hơn vector clock | Người dùng đôi khi phải tự gộp 2 file thủ công; tăng số file nếu xung đột xảy ra thường xuyên | Sync file cá nhân/nhóm nhỏ (đúng mô hình Dropbox) — đánh đổi hợp lý giữa đơn giản và an toàn dữ liệu |
+| Vector clock + merge tự động (nếu merge được) | Phân biệt đúng "xung đột thật" vs "tuần tự nhân quả"; có thể tự merge nếu định dạng hỗ trợ (ví dụ CRDT cho text) | Phức tạp triển khai, kích thước vector tăng theo số actor, vẫn cần luật fallback khi không tự merge được | Hệ thống nhiều actor đồng thời, cần độ chính xác causal cao (ví dụ số liệu phân tán kiểu Dynamo), hoặc dữ liệu có cấu trúc hỗ trợ merge tự động |
+
+**Khi nào đổi ý:** nếu xung đột xảy ra rất thường xuyên và conflicted copy làm phình số file khó chịu cho người dùng, cân nhắc thêm bước gợi ý merge tự động cho các định dạng hỗ trợ (ví dụ text thuần), giữ conflicted copy làm fallback khi không merge được.
+
+### 4. Notify thiết bị khác khi có thay đổi
+
+Sau khi server chấp nhận một version mới, các thiết bị khác của cùng người dùng cần biết để tải về. Áp dụng lại lựa chọn communication đã học ở SD02:
+
+- **Polling định kỳ:** đơn giản, nhưng lãng phí nếu poll dày trong khi thay đổi hiếm, hoặc chậm cảm nhận nếu poll thưa.
+- **Long polling / WebSocket:** thiết bị giữ một kết nối chờ sẵn; server đẩy một event nhỏ (`{fileId, newVersion}`) ngay khi có thay đổi — thiết bị nhận event rồi mới gọi API lấy đúng delta cần tải (giống mô hình notify ở SD15/SD16, không truyền nội dung qua kênh notify).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Client A gửi version dựa trên base=5 nhưng server đã ở version 6", command: "curl -s -X POST localhost:8080/files/f1/versions -d '{\"baseVersion\":5,\"chunkHashes\":[\"h1\",\"h2new\",\"h3\"]}' -H 'content-type: application/json'", output: "HTTP/1.1 409 Conflict\n{\"currentVersion\":6,\"yourBaseVersion\":5}" },
+    { comment: "Client kiểm tra version hiện tại và nội dung để tự quyết định (hoặc app tự động theo chiến lược đã chọn)", command: "curl -s localhost:8080/files/f1/versions/6", output: "{\"version\":6,\"updatedBy\":\"device-B\",\"updatedAt\":\"2026-09-16T08:12:00Z\"}" },
+    { comment: "App server tạo conflicted copy theo chiến lược đã chọn", command: "curl -s -X POST localhost:8080/files/f1/conflicted-copy -d '{\"fromDevice\":\"device-A\",\"baseVersion\":5,\"chunkHashes\":[\"h1\",\"h2new\",\"h3\"]}' -H 'content-type: application/json'", output: "{\"newFileId\":\"f1-conflict-device-A\",\"path\":\"report (conflicted copy from device-A, 2026-09-16).docx\"}" },
+  ]}
+/>
+
+<Callout type="mistake" title="Coi 'server ghi timestamp lúc nhận request' là an toàn cho LWW">
+  Nếu server dùng thời điểm **nhận được** request (thay vì thời điểm **người dùng thực sự sửa** trên thiết bị) để so sánh "ai mới hơn", một thiết bị mạng chậm có thể luôn "thắng" giả tạo dù sửa trước về mặt thời gian thực. Ghi timestamp ở phía client lúc sửa, đồng thời chấp nhận rằng đồng hồ thiết bị không hoàn toàn đáng tin (clock skew) — đây là một trong những lý do vector clock hấp dẫn hơn trong hệ thống cần độ chính xác cao.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  "Thiết kế Dropbox" gần như luôn có một câu hỏi phụ về conflict: "hai thiết bị sửa cùng lúc thì sao?". Trả lời tốt nêu rõ: (1) cách phát hiện (so base version, không phải so nội dung), (2) chọn một chiến lược giải quyết cụ thể (không nói chung chung "xử lý xung đột"), và (3) nêu được đánh đổi của chiến lược đó — ví dụ tại sao chọn LWW + conflicted copy thay vì vector clock cho use case người dùng cá nhân.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "metadata service", meaning: "Dịch vụ lưu 'công thức lắp ráp' file theo version (danh sách hash chunk), tách biệt khỏi nơi lưu nội dung chunk thật." },
+    { term: "base version", meaning: "Version mà client dựa vào lúc bắt đầu sửa — dùng để server phát hiện có ai ghi trước hay không." },
+    { term: "optimistic concurrency control", meaning: "Cho phép sửa song song, chỉ kiểm tra xung đột lúc ghi (so version) thay vì khoá trước khi sửa." },
+    { term: "last-writer-wins (LWW)", meaning: "Chọn bản có timestamp mới hơn làm bản thắng khi có xung đột." },
+    { term: "conflicted copy", meaning: "Bản sao lưu lại nội dung của bên 'thua' trong xung đột, dưới dạng file mới, để không mất dữ liệu." },
+    { term: "vector clock", meaning: "Cấu trúc theo dõi số lần sửa của từng actor, cho biết chính xác quan hệ nhân quả giữa 2 version thay vì chỉ dựa vào timestamp." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hệ thống chọn chiến lược 'LWW + conflicted copy'. Thiết bị A (offline, sửa lúc 10:00) và thiết bị B (online, sửa lúc 10:05, đồng bộ ngay) cùng sửa file X từ version 5. A kết nối lại lúc 10:10 và đẩy bản của mình lên. Kết quả đúng là gì?"
+  options={[
+    "Server từ chối thẳng thừng bản của A, không lưu lại gì cả",
+    "File X (canonical) giữ bản của B (mới hơn theo timestamp 10:05); đồng thời server tạo thêm một file mới chứa bản của A (ví dụ 'X (conflicted copy from A)') để không mất thay đổi của A",
+    "Server tự động gộp nội dung 2 bản thành 1 file duy nhất mà không cần hỏi ai",
+    "File X giữ bản của A vì A là người đẩy lên sau cùng (10:10)"
+  ]}
+  answerIndex={1}
+  explanation="LWW dùng timestamp lúc SỬA (10:00 vs 10:05), không phải lúc đồng bộ lên server (10:10) — B thắng vì sửa sau A về mặt thời gian thực. Nhưng vì chiến lược có kèm conflicted copy, bản của A không bị xoá mà được lưu thành file riêng, đúng tinh thần 'không bao giờ mất dữ liệu do hệ thống tự quyết định'."
+/>

@@ -1,0 +1,141 @@
+import { VideoUploadTranscodingPipelineDiagram } from "../diagrams/video-upload-transcoding-pipeline-diagram";
+
+<Eli5 title="Một xưởng phim mini: nhận phim gốc, cắt ra nhiều bản sao ở nhiều 'độ nét'" emoji="🎞️">
+  Bạn gửi cuộn phim gốc (video 1080p vừa quay) tới một xưởng tráng phim. Xưởng không bắt bạn đứng chờ — bạn bỏ cuộn phim vào **hộp nhận hàng** (object storage) rồi về, xưởng sẽ nhắn lại khi xong.
+
+  Bên trong xưởng có một **hàng đợi việc cần làm** và nhiều **tổ thợ** (worker pool). Mỗi cuộn phim gốc được nhân bản thành 4 bản: bản nét thấp (240p) để xem trên mạng yếu, tới bản nét cao (1080p) cho mạng khoẻ. Bốn tổ thợ có thể làm song song — tổ làm bản 240p xong trước vì việc nhẹ hơn, không cần chờ tổ làm 1080p.
+
+  Đây chính xác là pattern "job queue" đã học ở SD07, chỉ khác: việc ở đây là `ffmpeg` transcode thay vì gửi email hay ghi log.
+</Eli5>
+
+Case study này áp dụng lại toàn bộ nền tảng đã học: upload lớn không qua app server (SD08), việc nặng đẩy vào queue cho worker xử lý (SD07). Điểm mới là **một video sinh ra nhiều output** (multi-rendition) thay vì 1-1, và hệ thống phải biết khi nào "đủ" để công bố video sẵn sàng xem.
+
+<VideoUploadTranscodingPipelineDiagram />
+
+<Technical>
+
+### 1. Requirements
+
+**Functional**
+- Người dùng upload video (tối đa vài GB, có thể mất vài phút với mạng chậm).
+- Hệ thống mã hoá video gốc thành nhiều rendition (bitrate/resolution khác nhau) — chi tiết ABR ở bài sau.
+- Người dùng khác xem được video khi đã sẵn sàng; xem được view count (không cần chính xác tuyệt đối theo thời gian thực).
+
+**Non-functional**
+- Durability video gốc rất cao (mất video gốc = mất vĩnh viễn nội dung người dùng) — dùng storage class durability cao (bài SD08).
+- Upload phải chịu được mạng không ổn định (retry từng phần, không upload lại từ đầu).
+- Thời gian từ "upload xong" tới "xem được" có thể vài phút (không cần real-time) nhưng cần hiển thị trạng thái tiến trình rõ ràng.
+- Out of scope ở case này: live streaming (khác hẳn kiến trúc — không có bước transcode trước khi phát).
+
+### 2. Ước lượng (giả định minh hoạ, không phải số thật của một hãng cụ thể)
+
+| Đại lượng | Giả định | Kết quả |
+|---|---|---|
+| Video mới | 2 triệu video/tháng, trung bình gốc 200 MB (video ~10 phút, 1080p) | ~400 TB video gốc/tháng |
+| Overhead do đa rendition | 4 rendition tổng cỡ ~1,3× dung lượng gốc (rendition thấp nhẹ hơn nhiều so với gốc) | ~520 TB/tháng cần lưu (gốc + rendition) |
+| Upload QPS | 2 triệu / (30 × 86.400s) | ~0,8 QPS trung bình; đỉnh giờ cao điểm có thể gấp 5–10× — **cần benchmark thực tế**, đây chỉ là cỡ tham khảo |
+
+Con số quan trọng nhất rút ra: **storage tăng nhanh và không đều theo rendition** — đây là lý do gần như mọi dịch vụ video đều có lifecycle policy chuyển rendition ít xem sang storage class rẻ hơn (khái niệm storage tier từ SD08).
+
+### 3. API (rút gọn)
+
+```http
+POST /videos/upload-init        # body: {filename, sizeBytes} -> {videoId, uploadUrl | multipartUploadId}
+POST /videos/{id}/complete      # client báo đã upload xong -> app enqueue TranscodeRequested
+GET  /videos/{id}                # -> {status: "uploading"|"queued"|"transcoding"|"ready"|"failed", manifestUrl?}
+GET  /videos/{id}/manifest.m3u8  # phục vụ qua CDN khi status = ready
+```
+
+### 4. Data model
+
+```sql title="schema rút gọn"
+CREATE TABLE videos (
+  id UUID PRIMARY KEY,
+  owner_id UUID NOT NULL,
+  title TEXT NOT NULL,
+  raw_key TEXT NOT NULL,          -- object key video gốc, ví dụ raw/<id>.mp4
+  status TEXT NOT NULL,           -- uploading | queued | transcoding | ready | failed
+  view_count BIGINT DEFAULT 0,    -- đếm gần đúng, xem SD15 (đếm gần đúng/eventually consistent)
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE video_renditions (
+  video_id UUID REFERENCES videos(id),
+  name TEXT,                      -- '240p', '480p', '720p', '1080p'
+  bitrate_kbps INT,
+  object_key TEXT,                -- hls/<id>/<name>/prog.m3u8
+  status TEXT,                    -- pending | encoding | done | failed
+  PRIMARY KEY (video_id, name)
+);
+```
+
+### 5. High-level design
+
+```
+Client → App (auth + metadata, xin presigned/multipart URL)
+       → Object storage `raw/` (client PUT thẳng, app không cầm bytes — SD08)
+App nhận sự kiện "upload xong" → ghi videos.status='queued' → enqueue TranscodeRequested
+Queue → Worker pool: mỗi worker tải raw video, chạy ffmpeg sinh 1+ rendition song song
+Worker ghi từng rendition xong vào object storage `hls/<id>/<rendition>/`, cập nhật video_renditions.status
+Khi đủ rendition cần thiết → sinh master.m3u8 → videos.status='ready'
+Viewer → CDN (cache segment) → origin object storage khi cache miss
+```
+
+### 6. Deep dive: vì sao transcode phải là job queue, không phải request đồng bộ
+
+Transcode 1 video 10 phút ra 4 rendition có thể mất từ vài chục giây tới vài phút tuỳ độ phân giải và tải CPU — hoàn toàn không phù hợp giữ một HTTP request chờ. Tách thành job queue cho phép:
+
+- **Scale độc lập:** thêm worker khi backlog tăng, không ảnh hưởng app server phục vụ request khác.
+- **Retry tự nhiên:** worker crash giữa chừng → job quay lại queue, worker khác nhận lại (cần idempotency: kiểm tra rendition đã tồn tại trước khi encode lại, giống bài học delivery semantics ở SD07).
+- **Ưu tiên công bằng:** hàng đợi có thể ưu tiên video ngắn/rendition thấp trước để người dùng thấy "có gì đó xem được" sớm hơn, thay vì chờ đủ cả 1080p mới cho xem.
+
+| Cách tổ chức | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Transcode đồng bộ trong request upload | Đơn giản, không cần hạ tầng queue | Request treo hàng phút, không scale được, 1 video chậm ảnh hưởng cả app server | Chỉ hợp cho demo/prototype, không dùng thật |
+| 1 job "transcode toàn bộ" chạy tuần tự 4 rendition | Đơn giản hơn DAG, dễ debug | Rendition nặng nhất (1080p) làm chậm luôn cả rendition nhẹ vốn có thể xong sớm | Quy mô nhỏ, không cần "xem sớm" khi rendition thấp đã xong |
+| Job queue, mỗi rendition là 1 việc song song (DAG đơn giản) | Rendition nhẹ xong sớm, scale worker theo loại việc, chịu lỗi từng phần | Phức tạp hơn: cần theo dõi trạng thái từng rendition, biết khi nào "đủ" | Quy mô vừa/lớn, muốn công bố video sớm và scale worker linh hoạt |
+
+**Khi nào đổi ý:** nếu chi phí vận hành nhiều loại worker chuyên biệt vượt quá lợi ích (đội nhỏ, ít video), gộp lại thành 1 job tuần tự cho đơn giản, chấp nhận độ trễ "xem được" cao hơn.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Sinh video test 60 giây bằng ffmpeg (không cần file mẫu thật)", command: "ffmpeg -f lavfi -i testsrc=duration=60:size=1280x720:rate=30 -f lavfi -i sine=frequency=1000:duration=60 sample.mp4", output: "frame=  1800 fps= 45 ... video:2456kB audio:938kB" },
+    { comment: "Xem thông tin video vừa tạo", command: "ffprobe -v error -show_entries stream=codec_name,width,height,bit_rate sample.mp4", output: "codec_name=h264\nwidth=1280\nheight=720\nbit_rate=2831000" },
+    { comment: "Transcode ra 1 rendition 480p để thử nhanh trước khi làm cả 4", command: "ffmpeg -i sample.mp4 -vf scale=w=854:h=480 -b:v 1400k -c:a aac -b:a 128k out-480p.mp4", output: "frame= 1800 ... Lsize=   12345kB" },
+    { comment: "So sánh dung lượng gốc vs rendition thấp hơn", command: "ls -lh sample.mp4 out-480p.mp4", output: "-rw-r--r-- 1 you you 3.4M sample.mp4\n-rw-r--r-- 1 you you 1.7M out-480p.mp4" },
+  ]}
+/>
+
+<Callout type="mistake" title="Coi transcode xong = video sẵn sàng ngay lập tức">
+  Nhiều thiết kế quên bước trung gian: worker ghi file rendition lên object storage rồi mới cập nhật DB. Nếu app đánh dấu `status='ready'` ngay khi enqueue thành công (thay vì khi rendition thật sự tồn tại), người dùng có thể bấm xem và gặp lỗi 404 vì file chưa kịp ghi xong.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi "thiết kế YouTube" gần như luôn tách 2 luồng riêng: **write path** (upload → transcode, có thể chậm, ưu tiên đúng/đủ) và **read path** (xem video, phải nhanh, ưu tiên cache/CDN). Interviewer thường hỏi thêm: "worker crash giữa chừng transcode thì sao?" — câu trả lời tốt nhắc tới idempotency (kiểm tra rendition đã có trước khi làm lại) chứ không chỉ "queue tự retry".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "rendition", meaning: "Một bản mã hoá của cùng video gốc ở một bitrate/resolution cụ thể (ví dụ 720p @ 3 Mbps)." },
+    { term: "transcode", meaning: "Quá trình giải mã video gốc rồi mã hoá lại ở định dạng/bitrate khác." },
+    { term: "worker pool", meaning: "Nhóm tiến trình/máy chuyên pull job từ queue và xử lý, scale độc lập với app server." },
+    { term: "DAG (job)", meaning: "Tập việc có phụ thuộc lẫn nhau (ví dụ: phải có rendition trước khi sinh manifest); ở đây các rendition độc lập nên chạy song song được." },
+    { term: "progressive readiness", meaning: "Cho phép xem video ngay khi có rendition đầu tiên, không cần chờ đủ mọi rendition." },
+  ]}
+/>
+
+<QuickCheck
+  question="Worker đang encode rendition 1080p cho video X thì bị kill (OOM). Job quay lại queue, worker khác nhận lại và bắt đầu encode 1080p từ đầu. Điều gì cần đảm bảo để việc 'làm lại' này an toàn?"
+  options={[
+    "Không cần gì đặc biệt, encode lại luôn luôn an toàn",
+    "Worker mới cần kiểm tra rendition 1080p đã tồn tại/hoàn chỉnh trên object storage chưa trước khi ghi đè — hoặc ghi vào object key tạm rồi move/rename khi xong — để tránh để lại file dở dang bị coi là 'done'",
+    "Phải xoá toàn bộ video X và bắt người dùng upload lại",
+    "Chuyển hẳn sang transcode đồng bộ để tránh vấn đề này"
+  ]}
+  answerIndex={1}
+  explanation="Đây là idempotency cho một side-effect ngoài DB (ghi file). Nếu worker cũ đã ghi được một phần file trước khi bị kill, worker mới ghi đè trực tiếp có thể để lại file hỏng nếu chính worker mới cũng crash giữa chừng. Cách an toàn: ghi ra key tạm, chỉ 'commit' (đổi tên/cập nhật DB) khi file đã hoàn chỉnh."
+/>

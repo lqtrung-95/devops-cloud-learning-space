@@ -31,6 +31,7 @@ import { sd12MicroservicesApiDesignModule } from "./modules/sd12-microservices-a
 import { sd13SloCapacityMultiRegionModule } from "./modules/sd13-slo-capacity-multi-region/module-meta";
 import { sd14CaseUrlShortenerRateLimiterModule } from "./modules/sd14-case-url-shortener-rate-limiter/module-meta";
 import { sd16CaseChatPresenceModule } from "./modules/sd16-case-chat-presence/module-meta";
+import { sd17CaseVideoStreamingFileSyncModule } from "./modules/sd17-case-video-streaming-file-sync/module-meta";
 
 /** All modules of every course (order within a course comes from `module.order`). Add modules after they pass `pnpm validate:module`. */
 export const curriculumModules: ModuleDefinition[] = [
@@ -66,4 +67,5 @@ export const curriculumModules: ModuleDefinition[] = [
   sd13SloCapacityMultiRegionModule,
   sd14CaseUrlShortenerRateLimiterModule,
   sd16CaseChatPresenceModule,
+  sd17CaseVideoStreamingFileSyncModule,
 ];

@@ -1,0 +1,156 @@
+import { ChunkingBoundaryInsertionDiagram } from "../diagrams/chunking-boundary-insertion-diagram";
+
+<Eli5 title="Cắt cuốn sổ theo 'đoạn ý' thay vì theo 'số trang cố định'" emoji="📓">
+  Bạn và đồng nghiệp cùng giữ bản sao một cuốn sổ tay dài. Mỗi khi có ai sửa một câu ở đầu sổ, thay vì gửi lại nguyên cuốn, bạn chỉ muốn gửi **đúng phần đã đổi**.
+
+  Cách 1 (ngây thơ): cắt sổ thành từng xấp đúng 10 trang một, đánh số xấp theo thứ tự. Chèn thêm 1 trang ở đầu sổ → mọi trang từ đó dịch xuống 1 vị trí → **toàn bộ các xấp phía sau đều khác trước**, dù nội dung logic gần như không đổi.
+
+  Cách 2 (thông minh hơn): cắt sổ tại những **chỗ có đặc điểm nội dung riêng** (ví dụ luôn cắt ngay sau một câu kết thúc bằng dấu chấm và có từ "xong"). Ranh giới này "bám" theo nội dung, không theo số trang — chèn thêm 1 trang ở đầu chỉ làm xấp chứa trang đó đổi, các xấp phía sau vẫn y hệt vì ranh giới của chúng vẫn nằm đúng những câu cũ.
+</Eli5>
+
+Đây là ý tưởng cốt lõi đứng sau **content-defined chunking (CDC)** — kỹ thuật Dropbox và nhiều hệ thống sync/backup dùng để chia file thành các khối (chunk) sao cho một chỉnh sửa nhỏ chỉ ảnh hưởng vài chunk lân cận, thay vì làm hỏng dedup của toàn bộ phần còn lại của file.
+
+<ChunkingBoundaryInsertionDiagram />
+
+<Technical>
+
+### 1. Requirements (Dropbox-like)
+
+**Functional**
+- Người dùng có 1 thư mục đồng bộ trên nhiều thiết bị; sửa file ở một thiết bị, các thiết bị khác nhận được thay đổi.
+- Chỉ truyền phần dữ liệu đã đổi (delta sync), không truyền lại nguyên file mỗi lần sửa.
+- Không lưu trùng lặp nội dung giống hệt nhau nhiều lần (dedup) — kể cả giữa các version của cùng 1 file.
+
+**Non-functional**
+- Băng thông là tài nguyên quý (nhiều người dùng mạng di động/giới hạn) — ưu tiên truyền ít nhất có thể.
+- Storage cần hiệu quả ở quy mô hàng trăm triệu file × nhiều version.
+- Đồng bộ không cần real-time tuyệt đối nhưng cần "nhanh cảm nhận được" (vài giây tới vài chục giây).
+
+### 2. Ước lượng (giả định minh hoạ)
+
+| Đại lượng | Giả định | Kết quả |
+|---|---|---|
+| Người dùng | 10 triệu user, trung bình 2GB dữ liệu/user | 20 PB dữ liệu logic (chưa tính dedup/version) |
+| Tần suất sửa | Trung bình 20 lần sửa file/ngày/user, mỗi lần đổi ~1% dung lượng file đó | Nếu chunk theo nội dung, lượng dữ liệu cần truyền lại mỗi lần sửa ~ vài chunk (KB) thay vì cả file |
+| Hiệu quả dedup | Nhiều file người dùng khác nhau trùng nội dung (ảnh mẫu, template, thư viện) | Dedup toàn cục theo hash chunk có thể giảm đáng kể storage thật — tỉ lệ cụ thể tuỳ dữ liệu, **cần đo trên tập dữ liệu thật**, không giả định một con số cố định |
+
+### 3. API & data model (rút gọn)
+
+```http
+POST /files/{id}/versions        # client gửi danh sách hash chunk của version mới
+                                  # -> server trả về hash nào ĐÃ CÓ (không cần upload) và hash nào CẦN upload
+PUT  /chunks/{hash}               # upload đúng những chunk server báo thiếu
+POST /files/{id}/versions/{v}/commit   # xác nhận version mới đã đủ chunk, server ghi nhận version
+```
+
+```sql title="schema rút gọn"
+CREATE TABLE files (
+  id UUID PRIMARY KEY,
+  owner_id UUID,
+  path TEXT,
+  latest_version INT
+);
+
+CREATE TABLE file_versions (
+  file_id UUID REFERENCES files(id),
+  version INT,
+  chunk_hashes TEXT[],        -- danh sách hash chunk theo đúng thứ tự tạo nên file ở version này
+  created_at TIMESTAMPTZ,
+  PRIMARY KEY (file_id, version)
+);
+
+CREATE TABLE chunks (
+  hash TEXT PRIMARY KEY,      -- ví dụ SHA-256 của nội dung chunk
+  size_bytes INT,
+  object_key TEXT,            -- vị trí lưu thật trong object storage
+  ref_count BIGINT DEFAULT 1  -- bao nhiêu version/file đang tham chiếu chunk này — dùng khi cần dọn rác
+);
+```
+
+Điểm quan trọng của thiết kế này: `chunks` là bảng **toàn cục**, không thuộc riêng file nào. Hai file khác nhau (thậm chí của hai user khác nhau, nếu hệ thống dedup toàn cục) chứa cùng một đoạn nội dung sẽ **trỏ chung một hàng `chunks`** — đây chính là dedup.
+
+### 4. Content-defined chunking hoạt động thế nào
+
+Thay vì cắt theo vị trí byte cố định, CDC trượt một **cửa sổ nhỏ** (ví dụ 48 byte) qua dữ liệu và tính một **rolling hash** của cửa sổ đó tại mỗi vị trí. Khi rolling hash thoả một điều kiện hiếm gặp (ví dụ N bit thấp đều bằng 0), vị trí đó được chọn làm **ranh giới chunk**. Vì rolling hash chỉ phụ thuộc vào 48 byte cục bộ (nội dung), không phụ thuộc offset tuyệt đối trong file, nên:
+
+- Ranh giới "bám" theo nội dung xung quanh nó.
+- Chèn/xoá dữ liệu ở một chỗ chỉ làm thay đổi ranh giới của (các) chunk chứa chỗ sửa đó — mọi ranh giới ở xa vẫn rơi đúng vị trí cũ (vì nội dung ở đó không đổi).
+- Thường giới hạn thêm **kích thước tối thiểu/tối đa** cho mỗi chunk (ví dụ 2KB–64KB) để tránh chunk quá nhỏ (overhead metadata) hoặc quá lớn (mất lợi ích dedup khi có sửa đổi).
+
+```ts title="cdc-chunker.ts (rút gọn, minh hoạ ý tưởng — không phải cài đặt Rabin fingerprint đầy đủ)"
+import { createHash } from "node:crypto";
+
+interface Chunk { hash: string; length: number }
+
+function cdcChunk(buffer: Buffer, opts: { min: number; max: number; windowSize: number; maskBits: number }): Chunk[] {
+  const chunks: Chunk[] = [];
+  let start = 0;
+  for (let i = opts.windowSize; i < buffer.length; i++) {
+    const sinceStart = i - start;
+    const window = buffer.subarray(i - opts.windowSize, i);
+    const rollingValue = simpleRollingHash(window); // thay bằng Rabin fingerprint thật trong hệ thống production
+    const isBoundary = (rollingValue & ((1 << opts.maskBits) - 1)) === 0;
+    if ((isBoundary && sinceStart >= opts.min) || sinceStart >= opts.max) {
+      chunks.push({ hash: sha256(buffer.subarray(start, i)), length: i - start });
+      start = i;
+    }
+  }
+  chunks.push({ hash: sha256(buffer.subarray(start)), length: buffer.length - start });
+  return chunks;
+}
+
+function sha256(data: Buffer): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+```
+
+| Cách chia chunk | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Fixed-size (offset cố định) | Cực đơn giản, tốc độ chia nhanh nhất | Chèn/xoá dữ liệu làm lệch mọi ranh giới phía sau — dedup/delta sync gần như vô dụng sau điểm sửa | File không bao giờ chèn/xoá giữa chừng, chỉ append hoặc ghi đè toàn bộ (ví dụ log file chỉ append) |
+| Content-defined (rolling hash) | Chèn/xoá chỉ ảnh hưởng chunk lân cận — dedup/delta sync hiệu quả với mọi kiểu sửa | Tính rolling hash tốn CPU hơn, kích thước chunk không đều (cần giới hạn min/max) | File người dùng chỉnh sửa tuỳ ý (document, code, ảnh đã chỉnh) — đúng use case của Dropbox |
+
+**Khi nào đổi ý:** nếu dữ liệu chỉ ghi theo kiểu append-only (ví dụ log, backup tăng dần), fixed-size đã đủ tốt và đơn giản hơn nhiều — CDC chỉ đáng giá thêm phức tạp khi chỉnh sửa có thể xảy ra ở giữa file.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo file test ~2MB từ log mẫu lặp lại có cấu trúc", command: "node -e \"const lines=[]; for(let i=0;i<40000;i++) lines.push(`2024-01-01 req_id=${i} status=200`); require('fs').writeFileSync('original.log', lines.join('\\n'))\"", output: "" },
+    { comment: "Chèn 1 dòng vào giữa file để tạo bản đã sửa", command: "node -e \"const fs=require('fs'); const c=fs.readFileSync('original.log','utf8'); const mid=Math.floor(c.length/2); fs.writeFileSync('edited.log', c.slice(0,mid)+'\\nINSERTED LINE\\n'+c.slice(mid))\"", output: "" },
+    { comment: "Chạy fixed-size chunker (8KB) trên cả 2 file, đếm chunk trùng", command: "node scripts/fixed-chunker.js original.log edited.log", output: "original: 250 chunk, edited: 251 chunk\nchunk trùng (dedup): 12 / 251 (~4.8%)" },
+    { comment: "Chạy content-defined chunker trên cả 2 file, đếm chunk trùng", command: "node scripts/cdc-chunker.js original.log edited.log", output: "original: 268 chunk, edited: 270 chunk\nchunk trùng (dedup): 265 / 270 (~98.1%)" },
+  ]}
+/>
+
+<Callout type="mistake" title="Quên đặt min/max size cho content-defined chunking">
+  Không giới hạn kích thước, rolling hash có thể (hiếm nhưng có thể) tạo ra chunk cực nhỏ (vài byte, tốn overhead lưu hash/metadata cho mỗi chunk) hoặc cực lớn (nếu lâu không gặp điều kiện boundary, mất luôn lợi ích dedup cho cả đoạn dài đó). Luôn đặt `min`/`max` rõ ràng và cắt cứng khi chạm `max`.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi kinh điển: "vì sao Dropbox không chỉ diff toàn bộ file như `git diff`?" — điểm mấu chốt để trả lời tốt: diff dạng text (byte-by-byte, kiểu Myers diff) tốn CPU tuyến tính theo kích thước file mỗi lần so sánh và không tận dụng được dedup TOÀN CỤC giữa nhiều file/user khác nhau. Chunking theo nội dung cho phép so sánh bằng hash (rẻ hơn nhiều) và dedup vượt ra ngoài phạm vi một file.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "content-defined chunking (CDC)", meaning: "Chia file thành chunk dựa trên đặc điểm nội dung cục bộ (rolling hash), không dựa trên vị trí byte cố định." },
+    { term: "rolling hash", meaning: "Hàm băm tính lại nhanh khi cửa sổ trượt đi 1 byte, không cần băm lại toàn bộ cửa sổ từ đầu (ví dụ Rabin fingerprint)." },
+    { term: "fixed-size chunking", meaning: "Chia file thành các đoạn có kích thước cố định theo vị trí byte — đơn giản nhưng dễ vỡ dedup khi chèn/xoá dữ liệu." },
+    { term: "dedup (deduplication)", meaning: "Chỉ lưu một bản duy nhất cho mỗi nội dung chunk giống hệt nhau, dùng chung giữa nhiều file/version." },
+    { term: "delta sync", meaning: "Chỉ truyền phần dữ liệu (chunk) đã thay đổi giữa 2 version của file, thay vì truyền lại toàn bộ." },
+    { term: "ref_count", meaning: "Số lượng version/file đang tham chiếu tới một chunk — cần biết để quyết định khi nào xoá chunk khỏi storage an toàn." },
+  ]}
+/>
+
+<QuickCheck
+  question="File A (10MB) chia fixed-size 1MB (10 chunk) và file B là bản sao của A nhưng chèn thêm 500 byte ở đầu file. Nếu dùng fixed-size chunking để tìm chunk trùng giữa A và B, kết quả mong đợi là gì?"
+  options={[
+    "Cả 10 chunk đều trùng vì nội dung file gần như giống hệt nhau",
+    "Gần như không chunk nào trùng, vì việc chèn 500 byte ở đầu làm lệch toàn bộ nội dung của mọi cửa sổ 1MB tính từ đó — mỗi chunk giờ chứa một tổ hợp byte khác trước",
+    "Chỉ chunk cuối cùng không trùng",
+    "Không thể xác định nếu không chạy thử"
+  ]}
+  answerIndex={1}
+  explanation="Đây đúng là nhược điểm cốt lõi của fixed-size chunking: ranh giới theo offset tuyệt đối. Chèn dữ liệu ở đầu dịch toàn bộ byte phía sau, nên mọi chunk 1MB tính từ vị trí đó trở đi đều chứa nội dung khác hoàn toàn so với bản gốc dù ý nghĩa logic của file gần như không đổi."
+/>

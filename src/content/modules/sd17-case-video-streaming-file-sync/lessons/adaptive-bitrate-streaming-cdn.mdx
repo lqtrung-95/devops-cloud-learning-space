@@ -1,0 +1,103 @@
+import { AdaptiveBitratePlayerDiagram } from "../diagrams/adaptive-bitrate-player-diagram";
+
+<Eli5 title="Xem phim theo tốc độ đường dây, đổi 'kênh' đúng lúc hết một đoạn" emoji="📶">
+  Tưởng tượng một kênh truyền hình chia phim thành nhiều **đoạn ngắn 6 giây**, và quay sẵn mỗi đoạn ở 4 "kênh" chất lượng khác nhau (giống 4 kênh SD/HD/FullHD/4K). TV của bạn liên tục đo tốc độ đường dây, và **trước khi tải đoạn tiếp theo**, nó chọn kênh phù hợp nhất với tốc độ hiện tại.
+
+  Điều quan trọng: TV **không thể đổi kênh giữa một đoạn đang phát** — nó chỉ quyết định lại ở đầu mỗi đoạn mới. Nếu mạng đột nhiên chậm giữa đoạn đang phát, bạn vẫn phải xem hết đoạn đó ở chất lượng cũ, rồi đoạn sau mới đổi xuống.
+</Eli5>
+
+Đây là cơ chế **adaptive bitrate (ABR)** đứng sau HLS (Apple) và MPEG-DASH — hai chuẩn phổ biến nhất cho streaming qua HTTP thường (không cần giao thức chuyên dụng như RTMP).
+
+<AdaptiveBitratePlayerDiagram />
+
+<Technical>
+
+### Segment + manifest: cấu trúc cốt lõi
+
+Cả HLS và DASH đều dựa trên cùng một ý tưởng: cắt video thành các **segment** ngắn (thường 2–10 giây, mã hoá sẵn ở nhiều bitrate/resolution), và một file **manifest** mô tả segment nào ứng với rendition nào.
+
+```
+master.m3u8                      # manifest cấp cao: liệt kê các rendition
+├── #EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=426x240   → v0/prog.m3u8
+├── #EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=854x480  → v1/prog.m3u8
+├── #EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1280x720 → v2/prog.m3u8
+└── #EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080→ v3/prog.m3u8
+
+v2/prog.m3u8                     # manifest cấp rendition: liệt kê segment theo thứ tự
+├── #EXTINF:6.0, segment000.ts
+├── #EXTINF:6.0, segment001.ts
+└── #EXTINF:6.0, segment002.ts
+```
+
+(DASH dùng file XML `.mpd` và định dạng segment khác — MPEG-DASH — nhưng ý tưởng "manifest liệt kê rendition + segment" giống hệt.)
+
+### Player chọn rendition thế nào
+
+Player (HLS.js, Shaka Player, hoặc player gốc của trình duyệt/thiết bị) chạy một **ABR heuristic**, thường kết hợp:
+
+- **Băng thông đo được** từ tốc độ tải các segment gần nhất.
+- **Mức buffer hiện có** (còn bao nhiêu giây video đã tải nhưng chưa phát) — buffer thấp thì thận trọng chọn rendition thấp hơn dù băng thông tạm ổn, để tránh hết buffer giữa chừng (rebuffering, trải nghiệm tệ hơn nhiều so với chất lượng thấp).
+- Một **hệ số an toàn** (margin) để không dùng hết 100% băng thông đo được — mạng dao động (jitter) có thể làm đo sai.
+
+**Điểm hay bị hiểu sai:** quyết định đổi rendition chỉ áp dụng cho segment **tiếp theo**. Không có chuyện "đổi giữa chừng" một segment .ts/.mp4 đang tải hay đang phát — vì mỗi segment là một file độc lập, đã mã hoá xong ở một bitrate cố định.
+
+### Vai trò CDN
+
+Một video phổ biến có thể được hàng triệu người xem cùng một segment giống hệt nhau trong vài giờ đầu. Nếu mọi request đều tới thẳng object storage gốc (origin):
+
+- Origin phải chịu tải khổng lồ, dễ thành điểm nghẽn và tốn chi phí egress bandwidth rất cao.
+- Người xem ở xa origin (khác châu lục) chịu latency round-trip lớn hơn nhiều so với việc lấy từ một edge server gần họ.
+
+CDN giải quyết cả hai: cache segment tại các điểm gần người xem (edge), chỉ request tới origin khi **cache miss** (lần đầu tiên một edge phục vụ segment đó). Vì HLS/DASH segment là các file HTTP tĩnh (không đổi sau khi ghi), chúng **rất hợp để cache** — khác hẳn API động.
+
+| Thành phần phục vụ | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Origin object storage trực tiếp | Đơn giản, không cần cấu hình CDN | Chi phí egress cao, latency cao với người xem xa, dễ nghẽn khi video viral | Traffic nhỏ, nội bộ, hoặc giai đoạn demo |
+| CDN cache đứng trước origin | Giảm tải/chi phí origin mạnh, latency thấp cho người xem | Thêm một lớp cần cấu hình cache key/TTL/invalidation; cache miss đầu tiên vẫn chậm | Traffic công khai, quy mô vừa/lớn — gần như mặc định cho dịch vụ video thật |
+| Segment size ngắn (2s) | Đổi rendition mượt hơn, phản ứng nhanh với thay đổi băng thông | Nhiều request nhỏ hơn (overhead HTTP header/handshake), nhiều file quản lý hơn | Mạng dao động mạnh (di động), ưu tiên trải nghiệm mượt hơn hiệu năng server |
+| Segment size dài (10s) | Ít request hơn, cache/CDN hiệu quả hơn, ít overhead | Phản ứng chậm hơn khi băng thông đổi đột ngột — phải chờ hết segment dài mới đổi | Mạng ổn định (cáp quang, wifi tốt), ưu tiên hiệu năng server/CDN |
+
+**Khi nào đổi ý:** nếu phần lớn người xem trên di động/mạng dao động mạnh, ưu tiên segment ngắn hơn dù tốn thêm overhead request; nếu chi phí origin/CDN là mối lo lớn hơn trải nghiệm mượt, chọn segment dài hơn.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra manifest cấp cao vừa tạo ở lab trước", command: "cat media/hls/master.m3u8", output: "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\nv0/prog.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=960x540\nv1/prog.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720\nv2/prog.m3u8" },
+    { comment: "Xem manifest cấp rendition: danh sách segment theo thứ tự", command: "cat media/hls/v1/prog.m3u8", output: "#EXTM3U\n#EXT-X-TARGETDURATION=6\n#EXTINF:6.0,\nsegment000.ts\n#EXTINF:6.0,\nsegment001.ts\n#EXT-X-ENDLIST" },
+    { comment: "Đếm số segment mỗi rendition — rendition nào cũng phải có cùng số lượng", command: "for d in media/hls/v*/; do echo \"$d: $(ls $d/*.ts | wc -l) segment\"; done", output: "media/hls/v0/: 10 segment\nmedia/hls/v1/: 10 segment\nmedia/hls/v2/: 10 segment" },
+  ]}
+/>
+
+<Callout type="warning" title="Buffer thấp không chỉ do băng thông thấp">
+  Một mạng nhanh nhưng có độ trễ tải segment không đều (jitter cao) vẫn có thể làm buffer cạn nếu ABR chỉ nhìn "băng thông trung bình" mà bỏ qua độ biến thiên. Heuristic tốt kết hợp cả mức buffer hiện tại, không chỉ tốc độ đo được — đây là lý do các ABR thuật toán thật (ví dụ BOLA, throughput-based hybrid) phức tạp hơn nhiều so với "chọn rendition ≤ băng thông đo".
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi được hỏi "vì sao không dùng một bitrate cố định cho mọi người xem", câu trả lời tốt nhắc đúng 3 ý: (1) băng thông người xem khác nhau và thay đổi theo thời gian, (2) segment hoá theo thời gian cho phép đổi rendition mà không cần re-buffer từ đầu, và (3) việc đổi chỉ xảy ra ở ranh giới segment — một chi tiết nhỏ nhưng hay bị bỏ qua, và interviewer thường hỏi thẳng "vậy giữa segment thì sao?" để kiểm tra hiểu sâu hay chỉ thuộc từ khoá.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "ABR (adaptive bitrate)", meaning: "Cơ chế player tự chọn rendition phù hợp băng thông/buffer hiện tại, quyết định lại ở mỗi ranh giới segment." },
+    { term: "manifest (m3u8/mpd)", meaning: "File mô tả các rendition có sẵn và danh sách segment của mỗi rendition, theo thứ tự phát." },
+    { term: "segment", meaning: "Một đoạn video ngắn (2–10s), là một file độc lập đã mã hoá xong ở một bitrate cố định." },
+    { term: "buffer (playback buffer)", meaning: "Lượng video đã tải nhưng chưa phát; buffer cạn gây gián đoạn (rebuffering)." },
+    { term: "CDN edge", meaning: "Điểm cache gần người xem về mặt địa lý/mạng; phục vụ segment đã cache mà không cần chạm origin." },
+    { term: "cache miss (origin fetch)", meaning: "Lần đầu một edge server chưa có segment trong cache, phải lấy từ origin object storage." },
+  ]}
+/>
+
+<QuickCheck
+  question="Người xem đang phát segment thứ 8 (rendition 720p, dài 6 giây). Ở giây thứ 3 của segment này, băng thông đo được giảm đột ngột xuống rất thấp. Player sẽ hành xử thế nào theo cơ chế HLS/DASH chuẩn?"
+  options={[
+    "Ngắt ngay lập tức và tải phần còn lại của segment 8 ở rendition thấp hơn",
+    "Tiếp tục phát hết segment 8 ở 720p (đã tải xong nguyên file), rồi mới quyết định rendition thấp hơn cho segment 9 dựa trên băng thông mới đo được",
+    "Dừng phát hoàn toàn cho tới hết video",
+    "Tự động chuyển sang tải lại toàn bộ manifest từ segment 1"
+  ]}
+  answerIndex={1}
+  explanation="Segment là một file độc lập đã mã hoá xong — không thể 'cắt ngang' để đổi bitrate giữa chừng. Quyết định ABR chỉ áp dụng cho segment kế tiếp; đây là lý do buffer đóng vai trò quan trọng: nếu đã có sẵn vài segment trong buffer, người xem không thấy gián đoạn ngay cả khi băng thông giảm đột ngột."
+/>
