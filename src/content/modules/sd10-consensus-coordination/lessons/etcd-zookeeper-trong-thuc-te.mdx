@@ -1,0 +1,106 @@
+import { EtcdLeaseLeaderElectionDiagram } from "../diagrams/etcd-lease-leader-election-diagram";
+
+<Eli5 title="Thuê hẳn công ty bảo vệ chuyên nghiệp thay vì tự huấn luyện đội lính gác bầu cử" emoji="🏢">
+
+Bài trước dạy bạn cách một đội lính gác TỰ bầu chỉ huy bằng hô to xin phiếu (Raft). Nhưng nếu công ty bạn chỉ cần "biết ai đang trực ca này" cho vài worker xử lý batch job, tự huấn luyện cả một đội lính gác biết bầu cử đúng luật là quá tốn công.
+
+Thay vào đó, bạn thuê hẳn một công ty bảo vệ chuyên nghiệp — công ty này ĐÃ có sẵn quy trình bầu ca trưởng nội bộ của họ (etcd dùng Raft, ZooKeeper dùng Zab — một họ hàng gần với Paxos). Bạn không cần biết họ bầu cử thế nào; bạn chỉ cần: đăng ký "xin giữ chìa khoá ca trực" (lease) và nhờ họ "báo cho tôi ngay khi ai đó trả lại chìa" (watch). Nếu người giữ chìa biến mất mà không trả (crash), công ty bảo vệ tự thu hồi chìa sau một thời gian quy định (TTL) rồi cấp cho người tiếp theo đang chờ.
+
+Chỗ ví von hụt: công ty bảo vệ ở đây thực ra CŨNG chỉ là một cụm máy chủ (thường 3 hoặc 5 node) chạy Raft/Zab y hệt bài trước — bạn không tránh được consensus, bạn chỉ tránh phải TỰ CÀI nó.
+
+</Eli5>
+
+etcd và ZooKeeper là hai "coordination service" phổ biến nhất: etcd đứng sau Kubernetes (lưu toàn bộ state cluster), ZooKeeper đứng sau Kafka (phiên bản cũ), Hadoop, HBase. Cả hai giải quyết cùng nhóm bài toán: leader election, distributed lock, service discovery, config tập trung — bằng cách để bạn thao tác qua API đơn giản (get/put/watch), trong khi Raft/Zab lo phần khó ở bên trong.
+
+<EtcdLeaseLeaderElectionDiagram />
+
+<Technical>
+
+### Lease — quyền tạm thời có hạn dùng
+
+Một `lease` trong etcd là một khoảng thời gian sống (TTL) gắn với một hoặc nhiều key. Client phải gọi `KeepAlive` định kỳ (thường bằng khoảng 1/3 TTL) để renew; nếu ngừng gọi (crash, network cắt, GC pause dài), etcd tự xoá key gắn với lease đó khi TTL hết. ZooKeeper có khái niệm tương đương là **ephemeral node** gắn với session — session hết hạn thì node biến mất.
+
+### Watch — biết ngay thay vì polling
+
+Thay vì liên tục hỏi "chìa khoá còn ai giữ không" (polling, tốn tài nguyên và có độ trễ bằng chu kỳ poll), client đăng ký `Watch` trên một key/prefix và được **đẩy (push)** sự kiện ngay khi key đó thay đổi (tạo, sửa, xoá). Đây là cơ chế worker B trong diagram dùng để biết ngay khi worker A "buông chìa" mà không cần hỏi liên tục.
+
+### Leader election bằng etcd — không cần tự cài gì thêm
+
+Quy trình chuẩn (etcd gọi là `Campaign`, tương đương pattern trong ZooKeeper dùng ephemeral sequential node):
+
+1. Mỗi ứng viên xin một `lease` (TTL X giây).
+2. Mỗi ứng viên thử `put` một key cố định (vd `/election/leader`) gắn lease đó theo kiểu **compare-and-swap** (chỉ thành công nếu key CHƯA tồn tại) — bản thân etcd dùng Raft nội bộ để đảm bảo chỉ đúng MỘT request `put` thắng dù nhiều ứng viên gửi cùng lúc.
+3. Ứng viên thắng trở thành leader, phải `KeepAlive` liên tục để giữ ghế.
+4. Ứng viên thua chuyển sang `Watch` key đó, chờ sự kiện xoá (do lease hết hạn hoặc leader chủ động từ chức) để `Campaign` lại.
+
+### Thời gian failover bị chặn dưới bởi TTL — không có phép màu
+
+Đây là điểm hay bị bỏ sót: nếu leader crash CỨNG (không kịp gửi tín hiệu gì), etcd **không có cách nào biết ngay lập tức**. Nó chỉ biết "không nhận KeepAlive trong X giây". Nghĩa là thời gian failover tối thiểu ≈ TTL kể từ lần renew cuối — TTL càng ngắn, phát hiện càng nhanh nhưng tốn tài nguyên renew hơn (và dễ bị "false positive" step down khi chỉ là GC pause ngắn hoặc mạng chập chờn nhất thời, không phải crash thật). Đây chính là tiền đề cho bài tiếp theo: TTL ngắn để failover nhanh lại làm tăng nguy cơ 2 client cùng tưởng mình giữ được quyền trong một khoảng hẹp.
+
+### etcd vs ZooKeeper — khi nào chọn cái nào
+
+| Tiêu chí | etcd | ZooKeeper |
+|---|---|---|
+| Thuật toán nội bộ | Raft | Zab (họ hàng Paxos) |
+| API | gRPC, key-value phẳng, dễ dùng | Cây node phân cấp (giống filesystem), API cũ hơn |
+| Hệ sinh thái | Kubernetes, nhiều tool cloud-native mới | Kafka (bản cũ), Hadoop, HBase — hệ sinh thái JVM lâu đời |
+| Vận hành | Đơn giản hơn, ít thao tác thủ công | Cần hiểu rõ hơn về session/watch một lần (one-time trigger) |
+
+**Khi nào đổi ý:** nếu đã có Kubernetes chạy sẵn, gần như luôn tận dụng etcd sẵn có (qua Kubernetes API — Lease object, ConfigMap) thay vì dựng thêm cụm coordination riêng, trừ khi có lý do cách ly rõ ràng (tránh ảnh hưởng control-plane của K8s).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Cụm etcd 3 node trong sd-playground: leader election bằng lease"
+  prompt="$"
+  commands={[
+    { comment: "Dựng cụm etcd 3 node (đã thêm vào sd-playground)", command: "docker compose up -d etcd1 etcd2 etcd3" },
+    { comment: "Kiểm tra cả 3 node khoẻ", command: "docker compose exec etcd1 etcdctl --endpoints=etcd1:2379,etcd2:2379,etcd3:2379 endpoint health", output: "etcd1:2379 is healthy\netcd2:2379 is healthy\netcd3:2379 is healthy" },
+    { comment: "Worker A campaign trước, giành được leader", command: "npx tsx sd10/leader-election-worker.ts --name workerA", output: "[workerA] tôi là leader (lease=7587877412345)" },
+    { comment: "Worker B campaign sau, chuyển sang watch", command: "npx tsx sd10/leader-election-worker.ts --name workerB", output: "[workerB] đang watch /election/leader..." },
+    { comment: "Kill workerA, đợi khoảng TTL rồi xem workerB nhận ghế", command: "kill -9 $(pgrep -f workerA)", output: "[workerB] key đã xoá, tôi giành được leader sau ~10.2s" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Đặt TTL lease quá ngắn (vd 1–2 giây) "cho failover nhanh" mà không tính tới độ trễ mạng và GC pause bình thường của runtime (Node.js, JVM). Một GC pause vài trăm ms hoàn toàn bình thường có thể khiến worker bị coi là "chết" và mất leader dù nó vẫn sống — gây flapping liên tục.
+
+</Callout>
+
+<Callout type="warning">
+
+`Watch` của etcd đảm bảo thứ tự sự kiện nhưng KHÔNG đảm bảo bạn nhận được TỪNG sự kiện trung gian nếu client bị mất kết nối tạm thời — luôn xử lý theo kiểu "đọc lại state hiện tại khi reconnect", đừng giả định watch stream không bao giờ đứt.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Nếu được hỏi "thiết kế leader election cho N worker", câu trả lời tốt nhắc ngay tới việc dùng etcd/ZooKeeper thay vì tự cài Raft (trừ khi có lý do đặc biệt), và chủ động nói rõ trade-off TTL: TTL ngắn = failover nhanh nhưng dễ false positive; TTL dài = ổn định hơn nhưng downtime lâu hơn khi leader thật sự chết. Nói được số cụ thể (vd "TTL 10s, renew mỗi 3s") cho thấy bạn hiểu chứ không chỉ thuộc tên công cụ.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "lease", meaning: "Thời gian sống (TTL) gắn với key trong etcd; hết hạn mà không renew (KeepAlive) thì key tự bị xoá." },
+    { term: "KeepAlive", meaning: "Request định kỳ client gửi để renew lease trước khi hết hạn." },
+    { term: "watch", meaning: "Đăng ký nhận sự kiện đẩy (push) khi một key/prefix thay đổi, thay vì polling liên tục." },
+    { term: "ephemeral node", meaning: "Khái niệm tương đương lease trong ZooKeeper — node tự biến mất khi session tạo ra nó kết thúc." },
+    { term: "Campaign", meaning: "Thao tác client dùng để tranh giành một key election bằng compare-and-swap nguyên tử." },
+    { term: "Zab", meaning: "Thuật toán consensus nội bộ của ZooKeeper, cùng họ với Paxos, tương tự vai trò Raft trong etcd." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một team đặt TTL lease = 30 giây cho leader election qua etcd để 'chắc ăn, ít bị step down oan'. Đánh đổi thực tế của lựa chọn này là gì?"
+  options={[
+    "Không có đánh đổi nào, TTL dài luôn tốt hơn TTL ngắn",
+    "TTL dài làm hệ thống RENEW tốn tài nguyên hơn nhưng ổn định hơn",
+    "TTL dài giảm nguy cơ step down oan do GC pause/mạng chập chờn ngắn hạn, NHƯNG khi leader crash thật, hệ thống phải chờ tới gần 30 giây mới có leader mới — thời gian downtime failover dài hơn tương ứng",
+    "TTL dài làm etcd tự động chuyển sang dùng ZooKeeper để bù trừ",
+  ]}
+  answerIndex={2}
+  explanation="Giống việc thuê bảo vệ với quy định 'chờ 30 phút không thấy ai lấy chìa mới coi là bỏ ca' — ít báo động giả hơn, nhưng nếu ca trực thật sự bỏ vị trí, khách phải đợi rất lâu mới có người mới. TTL là núm vặn đánh đổi giữa 'ổn định trước nhiễu ngắn hạn' và 'tốc độ phát hiện sự cố thật', không có giá trị nào đúng tuyệt đối."
+/>

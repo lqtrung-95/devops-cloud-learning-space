@@ -1,0 +1,116 @@
+import { LamportClockVsWallclockDiagram } from "../diagrams/lamport-clock-vs-wallclock-diagram";
+import { SnowflakeIdBitLayoutDiagram } from "../diagrams/snowflake-id-bit-layout-diagram";
+
+<Eli5 title="Hai đồng hồ treo tường lệch giờ — thay vì tin đồng hồ, mỗi lá thư mang theo số thứ tự riêng" emoji="🕰️">
+
+Hai chi nhánh bưu điện gửi thư qua lại. Đồng hồ treo tường ở mỗi chi nhánh chạy lệch nhau vài phút — chi nhánh A nhanh hơn, chi nhánh B chính xác hơn. Nếu ghi sổ theo giờ treo tường của MÌNH, hoàn toàn có thể xảy ra chuyện vô lý: thư B "nhận được" lại có giờ ghi sổ SỚM HƠN giờ A "gửi đi" — vì đồng hồ A chạy nhanh.
+
+Giải pháp không phải "sửa đồng hồ cho thật chuẩn" (không bao giờ chuẩn tuyệt đối được) mà là đổi cách đánh dấu: mỗi chi nhánh giữ một cuốn SỔ ĐẾM riêng, không liên quan gì tới giờ treo tường. Mỗi khi có việc xảy ra (soạn thư, nhận thư), chi nhánh tăng số đếm lên 1. Khi gửi thư, đính kèm số đếm hiện tại. Khi nhận thư, chi nhánh nhận lấy số đếm LỚN HƠN giữa (số đếm của chính mình) và (số đính kèm trong thư), rồi CỘNG THÊM 1. Luật này đảm bảo: số đếm của "nhận thư" LUÔN LỚN HƠN số đếm của "gửi thư" — không bao giờ đảo ngược, bất kể đồng hồ treo tường lệch bao nhiêu.
+
+Việc đánh số ID cho đơn hàng cũng gặp vấn đề tương tự khi có NHIỀU máy cùng sinh ID: nếu chỉ ghép "giờ hiện tại + số ngẫu nhiên", hai máy có đồng hồ lệch nhau có thể sinh trùng hoặc sai thứ tự. Giải pháp Snowflake ghép thêm "ai sinh ra nó" (worker id) và "sinh thứ mấy trong cùng một mili-giây đó" (sequence) vào chính con số ID.
+
+</Eli5>
+
+Bài này khép lại module bằng hai công cụ nhỏ nhưng dùng ở khắp nơi: đồng hồ logic (để sắp thứ tự sự kiện đúng mà không cần tin đồng hồ vật lý) và ID generator phân tán (để nhiều máy tự sinh ID không trùng mà gần như không cần phối hợp qua lại).
+
+<LamportClockVsWallclockDiagram />
+
+<Technical>
+
+### NTP và giới hạn thật của nó
+
+NTP (Network Time Protocol) đồng bộ đồng hồ các máy về gần nhau, nhưng KHÔNG bao giờ đạt độ lệch bằng 0 tuyệt đối. Trong điều kiện tốt (cùng datacenter, NTP server ổn định), độ lệch cỡ vài mili-giây; qua Internet hoặc khi NTP server có vấn đề, độ lệch có thể tới hàng chục, hàng trăm mili-giây hoặc hơn. Hệ quả trực tiếp: **so sánh timestamp vật lý giữa hai máy khác nhau để suy ra thứ tự nhân-quả là không đáng tin**, như minh hoạ ở diagram trên.
+
+### Lamport clock — đồng hồ logic
+
+Luật Lamport rất đơn giản:
+
+1. Mỗi node giữ một bộ đếm nguyên `L`, khởi tạo `0`.
+2. Trước mỗi sự kiện cục bộ, `L = L + 1`.
+3. Khi gửi message, đính kèm giá trị `L` hiện tại.
+4. Khi nhận message mang giá trị `L_msg`, cập nhật `L = max(L, L_msg) + 1`.
+
+Đảm bảo duy nhất mà Lamport clock cho: nếu sự kiện `a` "happens-before" sự kiện `b` (có quan hệ nhân-quả — vd `a` là gửi, `b` là nhận cùng message, hoặc chuỗi gửi/nhận bắc cầu), thì `L(a) < L(b)`. **Chiều ngược lại không đúng**: `L(a) < L(b)` không có nghĩa `a` happens-before `b` — có thể chúng độc lập (concurrent) và chỉ tình cờ có số đếm khác nhau. Đây là lý do Lamport clock đủ dùng cho một số bài toán sắp thứ tự (vd log phân tán, tie-breaking) nhưng không thay thế được version vector khi cần phát hiện CONCURRENT writes thật sự (đã học ở SD09).
+
+Lamport clock **không** cho biết khoảng cách thời gian THỰC giữa hai sự kiện — chỉ cho biết thứ tự trước/sau. Đây là đánh đổi có chủ đích: bỏ thông tin "bao lâu" để đổi lấy đảm bảo "đúng thứ tự" không phụ thuộc đồng hồ vật lý.
+
+<SnowflakeIdBitLayoutDiagram />
+
+### Snowflake ID — timestamp + worker id + sequence
+
+ID kiểu Snowflake (khởi nguồn từ Twitter, dùng lại ở Discord, Instagram, Sony...) ghép 3 phần vào một số nguyên 64-bit:
+
+- **Timestamp** (thường 41 bit): số mili-giây kể từ một **custom epoch** tự chọn gần đây (không phải Unix epoch 1970) — dồn epoch lên gần đây để 41 bit đủ dùng hàng chục năm.
+- **Worker id** (thường 10 bit): định danh máy/process sinh ID, cấp tĩnh lúc khởi động — đảm bảo hai worker không bao giờ tự sinh trùng ID trong cùng một mili-giây.
+- **Sequence** (thường 12 bit): bộ đếm cục bộ trong CÙNG một worker, reset về 0 mỗi khi timestamp đổi — cho phép một worker sinh nhiều ID trong cùng 1ms (tối đa 4096 với 12 bit) mà không trùng.
+
+### "Roughly time-sortable" — chính xác nghĩa là gì
+
+ID sinh SAU luôn có phần timestamp (41 bit đầu) LỚN HƠN HOẶC BẰNG ID sinh trước — vì thời gian chỉ tiến, không lùi. Đây là phần "time-sortable" đúng. Phần "roughly" (tương đối) nằm ở chỗ: hai ID sinh ra trong CÙNG một mili-giây, ở HAI worker khác nhau, thứ tự SỐ giữa chúng do phần worker id quyết định (worker id lớn hơn ⇒ số lớn hơn) — không phản ánh worker nào thực sự gọi hàm sinh ID trước trong thực tế. Đừng dùng Snowflake ID để suy luận thứ tự chính xác tuyệt đối ở độ chi tiết dưới 1 mili-giây giữa các worker khác nhau.
+
+### Trade-off: các cách sinh ID phân tán
+
+| Cách sinh ID | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Auto-increment 1 DB duy nhất | Đơn giản, đúng thứ tự tuyệt đối | Bottleneck ghi, không scale ngang, single point of failure | Hệ thống nhỏ, 1 database |
+| UUID v4 (random) | Sinh độc lập hoàn toàn, không cần phối hợp | Không sort được theo thời gian, index B-tree kém hiệu quả (ghi ngẫu nhiên khắp cây) | Không cần sort theo thời gian, ưu tiên đơn giản |
+| Snowflake (timestamp+worker+sequence) | Roughly time-sortable, sinh độc lập theo worker, không cần round-trip mạng | Cần cấp phát worker id không trùng (qua ZooKeeper/etcd hoặc cấu hình tĩnh), lệ thuộc đồng hồ hệ thống tiến đều | Cần ID sort gần đúng theo thời gian ở quy mô nhiều worker |
+| ID range do service trung tâm cấp phát trước (Ticket server) | Đúng thứ tự tuyệt đối, không cần đồng bộ đồng hồ | Cần gọi mạng để xin range, service trung tâm là điểm cần scale riêng | Cần đúng thứ tự tuyệt đối, chấp nhận thêm 1 dependency |
+
+**Khi nào đổi ý:** nếu về sau phát hiện cần sort CHÍNH XÁC tuyệt đối theo thứ tự sinh (không chỉ "roughly"), Snowflake không đáp ứng được — cần chuyển sang cơ chế có phối hợp trung tâm (ticket server) hoặc chấp nhận thêm một cột `sequence_global` riêng.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Sinh Snowflake ID từ 4 worker song song, kiểm tra không trùng"
+  prompt="$"
+  commands={[
+    { comment: "Chạy 4 worker song song, mỗi worker sinh 100.000 id", command: "for w in 0 1 2 3; do npx tsx sd10/snowflake.ts --worker $w --count 100000 > sd10/ids-$w.txt & done; wait" },
+    { comment: "Gộp và đếm số id bị trùng", command: "cat sd10/ids-*.txt | sort | uniq -d | wc -l", output: "0" },
+    { comment: "Kiểm tra thứ tự: id nhỏ nhất và lớn nhất", command: "cat sd10/ids-*.txt | sort -n | head -1; cat sd10/ids-*.txt | sort -n | tail -1", output: "517815266181121\n517815308386303" },
+    { comment: "Giải mã bit timestamp của id nhỏ nhất — đúng bằng mili-giây lúc chạy sớm nhất", command: "node -e \"console.log((517815266181121n >> 22n).toString())\"", output: "123456780" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Dùng `Date.now()` trực tiếp làm phần timestamp mà không kiểm tra đồng hồ hệ thống có bị CHỈNH LÙI hay không (NTP correction, admin sửa tay). Nếu đồng hồ máy chủ nhảy lùi dù chỉ vài mili-giây, worker có thể sinh ra ID NHỎ HƠN một ID đã sinh trước đó — vi phạm tính "roughly time-sortable". Cách vá phổ biến: nếu phát hiện `now < lastTimestamp`, dừng sinh ID (throw lỗi) cho tới khi đồng hồ đuổi kịp trở lại.
+
+</Callout>
+
+<Callout type="warning">
+
+Lamport clock không thay thế được version vector khi bạn cần biết CHÍNH XÁC hai sự kiện có độc lập (concurrent) hay không (đã học ở SD09) — Lamport chỉ cho một thứ tự toàn cục nhất quán, có thể "ép" hai sự kiện độc lập vào một thứ tự tuỳ ý mà không cảnh báo gì.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu hỏi "thiết kế ID generator cho hệ thống phân tán" gần như luôn dẫn tới Snowflake. Câu trả lời mạnh nêu rõ 3 phần bit và LÝ DO của từng phần (timestamp để sort gần đúng, worker id để tránh trùng giữa các máy, sequence để một máy sinh nhiều ID/ms), đồng thời chủ động nói rõ giới hạn "roughly" — nhiều ứng viên chỉ thuộc tên "Snowflake" mà không giải thích được vì sao nó không sort tuyệt đối.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "NTP", meaning: "Network Time Protocol — giao thức đồng bộ đồng hồ giữa các máy, giảm nhưng không triệt tiêu clock skew." },
+    { term: "clock skew", meaning: "Độ lệch giữa đồng hồ vật lý của các máy khác nhau tại cùng một thời điểm thực." },
+    { term: "Lamport clock", meaning: "Bộ đếm logic tăng theo luật gửi/nhận, đảm bảo thứ tự nhân-quả (happens-before) không phụ thuộc đồng hồ vật lý." },
+    { term: "happens-before", meaning: "Quan hệ nhân-quả giữa hai sự kiện (vd gửi luôn happens-before nhận cùng message)." },
+    { term: "Snowflake ID", meaning: "ID 64-bit ghép timestamp + worker id + sequence, roughly time-sortable, sinh độc lập theo từng worker." },
+    { term: "custom epoch", meaning: "Mốc thời gian 0 tự chọn (không phải Unix epoch 1970) để phần bit timestamp đủ dùng lâu hơn." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một service dùng Lamport clock để gắn số thứ tự cho các thao tác trên 3 node độc lập, không có message nào trao đổi giữa node X và node Y trong suốt 1 giờ. Cuối giờ, thao tác trên X có `L=50`, thao tác trên Y có `L=48`. Kết luận nào đúng?"
+  options={[
+    "Thao tác trên X chắc chắn xảy ra SAU thao tác trên Y về mặt thời gian thực, vì L(X) > L(Y)",
+    "Không thể kết luận X happens-before hay after Y chỉ từ việc so sánh L — vì không có message nào trao đổi giữa X và Y, hai chuỗi thao tác này là ĐỘC LẬP (concurrent); Lamport chỉ đảm bảo chiều 'happens-before ⇒ L nhỏ hơn', không đảm bảo chiều ngược lại",
+    "L(X) > L(Y) nghĩa là X có nhiều thao tác hơn Y đúng theo tỉ lệ",
+    "Đây là lỗi cấu hình, hai node phải luôn có L bằng nhau nếu dùng đúng Lamport clock",
+  ]}
+  answerIndex={1}
+  explanation="Đúng chỗ dễ hiểu lầm nhất của Lamport clock: nó chỉ đảm bảo MỘT CHIỀU (happens-before thì L nhỏ hơn). Khi không có trao đổi message nào giữa hai chuỗi sự kiện, chúng độc lập (concurrent) và việc so sánh L giữa chúng không mang ý nghĩa nhân-quả gì — L lớn hơn có thể chỉ vì node đó có nhiều sự kiện cục bộ hơn, không liên quan gì tới X có xảy ra sau Y hay không."
+/>

@@ -1,0 +1,106 @@
+import { SplitBrainScenarioDiagram } from "../diagrams/split-brain-scenario-diagram";
+
+<Eli5 title="Hai tổng đài viên trực đêm, đường dây nội bộ chập chờn, đồng hồ tường hai phòng lệch giờ" emoji="☎️">
+
+Hai tổng đài viên A và B thay nhau trực đường dây nóng khẩn cấp — luật là chỉ MỘT người trực tại một thời điểm, người kia nghỉ. Bình thường A trực, cứ mỗi giây A nhấc điện thoại nội bộ "báo còn sống" cho B nghe.
+
+Một đêm, đường dây nội bộ giữa hai phòng bị chập chờn (đứt kết nối), nhưng đường dây khẩn cấp ra ngoài của cả hai phòng vẫn hoạt động bình thường. B không nghe được tiếng báo còn sống của A quá lâu, nên B tự nghĩ "chắc A ngất xỉu rồi" và tự đứng ra trực thay. Vấn đề là A không hề biết đường dây nội bộ đứt — A vẫn tưởng mình đang trực một mình như mọi khi, vẫn tiếp tục nhận cuộc gọi khẩn cấp. Giờ CẢ HAI cùng trực, cùng ra quyết định cho cùng một tình huống — có thể mâu thuẫn nhau.
+
+Thêm một rắc rối: nếu hai phòng định dùng đồng hồ treo tường để quyết định "ai trực trước, ai trực sau" thì càng tệ hơn — đồng hồ tường hai phòng lệch nhau vài phút, hoàn toàn có thể kết luận sai thứ tự sự kiện.
+
+Chỗ ví von hụt: hai tổng đài viên thực ra chỉ có 2 người, "nói chuyện trực tiếp" là đủ để họ tự dàn xếp. Thuật toán đồng thuận thật (Raft, Paxos) không dựa vào 1-1 mà dựa vào việc xin xác nhận từ ĐA SỐ trong một nhóm — bài học kế tiếp mới đi sâu vào cơ chế đó.
+
+</Eli5>
+
+Trong hệ thống thật, "A" và "B" là hai instance của cùng một service (hoặc hai node database) đóng vai leader/follower. Split brain và đồng hồ không đáng tin là hai lý do gốc khiến bạn không thể tự chế một cơ chế bầu leader "cho nhanh" mà vẫn an toàn — cả trong công việc lẫn khi bị hỏi phỏng vấn "vì sao không tự viết leader election bằng heartbeat đơn giản".
+
+<SplitBrainScenarioDiagram />
+
+<Technical>
+
+### Split brain là gì, và vì sao heartbeat đơn thuần không đủ
+
+Split brain xảy ra khi **từ hai node trở lên đồng thời tin rằng mình là leader hợp lệ** và cùng nhận ghi. Nó không cần lỗi phần mềm — chỉ cần network partition giữa các node coordination trong lúc mỗi node vẫn phục vụ được client riêng của nó.
+
+Cơ chế "heartbeat + timeout, không kiểm tra majority" (diagram chế độ "Heartbeat đơn thuần") có lỗ hổng gốc: quyết định "tôi là leader" của một node chỉ dựa trên NHỮNG GÌ NÓ TỰ QUAN SÁT được (không nghe heartbeat), không có bước nào xác nhận với phần còn lại của hệ thống rằng leader cũ THẬT SỰ đã chết. Node cũ, nếu chỉ mất kết nối tới các node khác nhưng vẫn phục vụ được client, không có cách nào tự biết mình cần dừng lại.
+
+### Vì sao majority sửa được vấn đề
+
+Cách sửa (diagram chế độ "Lease theo đa số"): một node chỉ được **giữ** hoặc **giành** vai trò leader khi có xác nhận từ **đa số (majority, quá bán)** của một nhóm coordination. Đây là lý do toán học:
+
+- Với `N` node, một "majority set" có kích thước `> N/2`.
+- Hai majority set bất kỳ trong cùng một nhóm N node **luôn có ít nhất một node chung** (pigeonhole — giống hệt điều kiện quorum `W+R>N` ở SD09).
+- Node chung đó chỉ có thể xác nhận cho MỘT leader tại một thời điểm (nó không đồng ý hai lần cho hai leader khác nhau trong cùng kỳ) → không thể có 2 majority set cùng tồn tại cho 2 leader khác nhau cùng lúc.
+
+Vì vậy leader cũ, khi mất liên lạc với majority, **tự biết mình không còn hợp lệ** (không renew được lease) và chủ động dừng ghi — thà từ chối phục vụ còn hơn ghi sai. Đây chính là ý tưởng lõi mà Raft (bài tiếp theo) và etcd/ZooKeeper (bài sau nữa) hiện thực hoá.
+
+### Đồng hồ không đáng tin (clock skew)
+
+Đồng hồ vật lý (wall-clock) của các máy trong cùng một hệ thống **không bao giờ đồng bộ tuyệt đối**. NTP (Network Time Protocol) giữ các máy gần nhau, nhưng độ lệch thực tế vẫn tồn tại — cỡ vài mili-giây trong điều kiện tốt, có thể tới hàng trăm mili-giây hoặc hơn nếu NTP server lỗi, mạng chập chờn, hoặc máy ảo bị "steal" CPU. Hệ quả: **không dùng wall-clock timestamp để quyết định "sự kiện nào xảy ra trước"** giữa hai máy khác nhau, và càng không dùng nó để quyết định ai là leader (vd "ai có timestamp mới hơn thì thắng" — dễ bị máy có đồng hồ chạy nhanh hơn thắng oan). Bài 5 sẽ đi sâu vào hệ quả cụ thể của việc này (Lamport clock).
+
+### Trade-off: các cách chọn leader
+
+| Cách chọn leader | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Leader tĩnh (hardcode 1 node) | Đơn giản nhất, không tốn round-trip | Không failover — node chết là hệ thống chết | Hệ thống nhỏ, không cần HA, dev/test |
+| Heartbeat + timeout, không majority | Đơn giản hơn Raft/Paxos, dễ tự viết | Split brain khi network partition giữa các node coordination | Prototype nội bộ, KHÔNG production |
+| Majority-based consensus (Raft/Paxos) tự cài | An toàn với partition, không phụ thuộc dịch vụ ngoài | Phức tạp để cài đúng, cần ≥3 node lẻ, tốn round-trip mỗi quyết định | Cần tự kiểm soát hoàn toàn, có đội ngũ đủ kinh nghiệm |
+| Dùng external lock service (etcd/ZooKeeper) | Không phải tự cài consensus, đã kiểm chứng ở production quy mô lớn | Thêm dependency vận hành, thêm latency gọi qua mạng | Đa số hệ thống thực tế cần leader election/lock |
+
+**Khi nào đổi ý:** nếu team đã có đủ 3 node etcd/ZooKeeper chạy sẵn cho mục đích khác (service discovery, config), gần như luôn nên dùng lại nó thay vì tự cài Raft riêng — chi phí vận hành thêm gần như bằng 0.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Quan sát 2 instance app tranh nhau vai trò leader (naive heartbeat) trong sd-playground"
+  prompt="$"
+  commands={[
+    { comment: "2 instance app cùng chạy naive leader election qua heartbeat, không majority", command: "docker compose up -d --scale app=2", output: "app-1  Up 3s\napp-2  Up 2s" },
+    { comment: "Instance nào đang tự nhận là leader?", command: "curl -s localhost:3000/whoami | jq .role", output: "\"leader\"" },
+    { comment: "Cắt kết nối nội bộ giữa 2 instance bằng toxiproxy (mô phỏng chập chờn)", command: "docker compose exec toxiproxy toxiproxy-cli toggle app-internal-proxy" },
+    { comment: "Cả 2 instance giờ đều tự nhận leader — split brain tái hiện", command: "curl -s localhost:3000/whoami | jq .role; curl -s localhost:3001/whoami | jq .role", output: "\"leader\"\n\"leader\"" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Nghĩ rằng "chỉ cần heartbeat timeout đủ ngắn là an toàn". Timeout ngắn chỉ làm split brain xảy ra NHANH HƠN khi có partition, không loại bỏ được nó. Vấn đề gốc không phải tốc độ phát hiện, mà là thiếu điều kiện majority trước khi tự phong leader.
+
+</Callout>
+
+<Callout type="warning">
+
+Đừng dùng độ lệch `timestamp` giữa hai node để suy luận "ai mới hơn, ai cũ hơn" khi hai node đó có đồng hồ vật lý độc lập. Chênh lệch vài chục mili-giây do NTP skew đủ để đảo ngược kết luận.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi được hỏi "thiết kế leader election cho service X", đừng vội nhảy vào chi tiết Raft. Câu trả lời mạnh bắt đầu bằng: chỉ ra RÕ tại sao heartbeat/timeout đơn thuần không an toàn (split brain khi partition), rồi mới giới thiệu majority là điều kiện bắt buộc, và cuối cùng đề xuất dùng etcd/ZooKeeper thay vì tự cài consensus — trừ khi có lý do đặc biệt phải tự cài.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "split brain", meaning: "Từ hai node trở lên đồng thời tin mình là leader hợp lệ và cùng nhận ghi, thường do network partition giữa các node coordination." },
+    { term: "network partition", meaning: "Một nhóm node mất kết nối với nhóm khác trong khi cả hai vẫn hoạt động bình thường với client riêng của mình." },
+    { term: "majority (quá bán)", meaning: "Tập hợp lớn hơn N/2 trong N node — hai majority set bất kỳ luôn giao nhau ít nhất một node." },
+    { term: "lease", meaning: "Quyền tạm thời (vd làm leader) có thời hạn (TTL), phải renew trước khi hết hạn nếu muốn giữ tiếp." },
+    { term: "clock skew", meaning: "Độ lệch giữa đồng hồ vật lý của các máy khác nhau, không thể triệt tiêu tuyệt đối kể cả có NTP." },
+    { term: "step down", meaning: "Hành động một node tự nguyện từ bỏ vai trò leader khi phát hiện mình không còn hợp lệ (vd không renew được lease)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một service dùng luật: 'node nào giữ được lock trên chính đĩa cục bộ của nó (file lock) thì là leader, không cần hỏi node khác'. Nếu service này chạy trên 3 máy vật lý riêng biệt (không có đĩa dùng chung), luật này có tránh được split brain không?"
+  options={[
+    "Có, vì file lock luôn đảm bảo tính đúng đắn tuyệt đối",
+    "Không — mỗi máy có đĩa cục bộ RIÊNG, nên cả 3 máy đều có thể tự khoá file lock cục bộ của mình và đều tự tin mình là leader; đây thậm chí còn không có bước xác nhận nào giữa các node, tệ hơn cả heartbeat/timeout",
+    "Có, vì file lock nhanh hơn network call nên an toàn hơn",
+    "Không thể xác định nếu không biết hệ điều hành đang dùng",
+  ]}
+  answerIndex={1}
+  explanation="Giống hai tổng đài viên trực ở hai phòng khác nhau, mỗi người tự nhìn đồng hồ RIÊNG của phòng mình để quyết định — không có sự xác nhận qua lại nào cả. File lock cục bộ không có ý nghĩa gì cho việc điều phối GIỮA các máy; cần một cơ chế mà quyết định phải được xác nhận bởi đa số các bên liên quan."
+/>

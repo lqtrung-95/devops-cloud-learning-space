@@ -1,0 +1,107 @@
+import { LockFencingTokenDiagram } from "../diagrams/lock-fencing-token-diagram";
+
+<Eli5 title="Chìa khoá kho cho thuê tạm — nếu người thuê ngủ quên, ai đảm bảo họ không lẻn vào sau khi hết hạn?" emoji="🔑">
+
+Một phòng kho chỉ có một chìa khoá, cho thuê tạm 5 phút mỗi lần. Người A thuê chìa, định vào kho sắp xếp lại vài thùng hàng. Nhưng A ngủ quên trong lúc đứng đợi thang máy, quá 5 phút mà chưa vào tới kho.
+
+Quản lý thấy hết hạn thuê, cho người B thuê chìa MỚI. B vào kho, sắp xếp xong, trả chìa, ra về. Ngay sau đó, A giật mình tỉnh dậy — A KHÔNG BIẾT chìa của mình đã hết hạn từ lâu, A cứ tưởng mình vẫn đang thuê hợp lệ, đi thẳng vào kho và sắp xếp lại theo kế hoạch CŨ của mình (dựa trên tình trạng kho TRƯỚC khi B vào) — vô tình làm hỏng sắp xếp mà B vừa hoàn thành.
+
+Giải pháp: mỗi lần cho thuê chìa, quản lý ghi thêm một SỐ THỨ TỰ tăng dần lên chìa (chìa của A là số 33, chìa của B là số 34). Kho có một cuốn sổ ghi "lần sắp xếp gần nhất là chìa số mấy". Khi A tới sắp xếp với chìa số 33, kho tra sổ thấy đã có người dùng chìa số 34 (mới hơn) — TỪ CHỐI, không cho A động vào gì cả.
+
+Chỗ ví von hụt: trong đời thực, "kho" ở đây không phải là ổ khoá — nó phải là chính HỆ THỐNG LƯU DỮ LIỆU (storage) đứng sau, vì chỉ storage mới có đủ thông tin để kiểm tra số thứ tự MỚI NHẤT nó từng thấy.
+
+</Eli5>
+
+Đây là ví dụ kinh điển nhất trong bài viết "How to do distributed locking" của Martin Kleppmann, và là câu hỏi phỏng vấn hay gặp khi bàn về distributed lock: một cái lock có TTL/lease KHÔNG đủ an toàn nếu bên nhận ghi cuối cùng (storage) không tự kiểm tra thêm gì.
+
+<LockFencingTokenDiagram />
+
+<Technical>
+
+### Vì sao lease một mình không đủ
+
+Redis lock kiểu `SET lock:key value NX PX ttl` giải quyết đúng MỘT việc: xác định ai đang "được phép nghĩ mình giữ lock" tại một thời điểm. Nó **không** và **không thể** đảm bảo rằng client giữ lock luôn hành động trong đúng khoảng TTL đó. Nguyên nhân phổ biến khiến một client "trễ" hơn TTL dù code hoàn toàn đúng:
+
+- **GC pause** (đặc biệt ngôn ngữ có garbage collector dừng-thế-giới như Java, hoặc Node.js dưới tải cao): có thể kéo dài hàng giây.
+- **Page fault / swap**, **CPU bị steal** trên máy ảo/container dùng chung tài nguyên.
+- **Network partition tạm thời** giữa client và Redis (client vẫn chạy, chỉ không biết lock đã hết hạn).
+
+Khi bất kỳ điều nào trong số này xảy ra LÂU HƠN TTL, client cũ (A) vẫn tiếp tục chạy code của nó — và nếu request ghi cuối cùng của A đi THẲNG tới storage (không đi qua Redis để kiểm tra lại lock), storage hoàn toàn không có cách nào biết A đã "hết hạn" từ trước.
+
+### Fencing token — chuyển trách nhiệm về đúng nơi
+
+Ý tưởng: mỗi lần một client giành được lock, lock service (Redis, etcd, ZooKeeper) cấp kèm một **số tăng dần đơn điệu** (fencing token) — có thể đơn giản bằng `INCR` trong Redis, hoặc `mod_revision` có sẵn trong etcd. Client PHẢI gửi token này kèm mọi request ghi. **Storage** (không phải lock service) lưu lại `lastToken` đã chấp nhận, và chỉ ghi khi `token mới > lastToken` — ngược lại từ chối.
+
+Điểm mấu chốt: an toàn không nằm ở việc NGĂN client cũ gửi request (không ngăn được, và không cần ngăn) — mà nằm ở việc STORAGE, nơi hậu quả thật sự xảy ra, tự kiểm tra và từ chối dữ liệu cũ. Đây là lý do fencing token phải được kiểm tra **ở đúng lớp nhận ghi cuối cùng**, không phải chỉ ở lớp xin lock.
+
+### Vì sao không dùng timestamp thay cho token tăng dần
+
+Có thể có ý tưởng "dùng thời điểm giành lock (wall-clock) làm token, so sánh ai mới hơn". Đây chính là lỗi ở Lesson 1: đồng hồ vật lý giữa các client lệch nhau (clock skew) — client B có đồng hồ chạy chậm hơn có thể tính ra "timestamp" nhỏ hơn dù nó giành lock SAU A. Một bộ đếm tăng dần đơn điệu do MỘT nguồn tập trung cấp phát (Redis `INCR`, etcd revision) không phụ thuộc đồng hồ của bất kỳ client nào, nên không có rủi ro này.
+
+### Trade-off: các lựa chọn distributed lock
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Redis `SET NX PX`, không fencing | Cực nhanh, dễ cài | Không an toàn nếu storage bị ghi trực tiếp bởi client cũ đã hết hạn | Tác vụ idempotent, hậu quả sai nhỏ (vd dedup cache) |
+| Redis + fencing token, storage tự kiểm tra | An toàn hơn nhiều, vẫn nhanh | Phải sửa MỌI nơi nhận ghi để kiểm tra token — dễ bỏ sót một đường ghi tắt | Tác vụ có hậu quả thật nếu ghi trùng/sai (đơn hàng, số dư) |
+| etcd/ZooKeeper lock (lease + revision làm token sẵn) | Có consensus thật đứng sau, revision tăng đơn điệu tự nhiên | Thêm dependency, latency cao hơn Redis | Hệ thống đã dùng etcd/ZooKeeper cho mục đích khác |
+| Redlock (khoá trên nhiều Redis instance độc lập) | Chịu được 1 Redis instance chết | Vẫn KHÔNG giải quyết vấn đề GC pause — Kleppmann chỉ ra Redlock vẫn cần fencing token để an toàn thật sự | Khi cần "khoá tạm thời" hơn là đúng đắn tuyệt đối |
+
+**Khi nào đổi ý:** nếu thao tác được bảo vệ bởi lock là **idempotent** (chạy lại nhiều lần không đổi kết quả, vd gửi lại đúng một email dedup theo id), hậu quả của việc "lock bị vi phạm" thường chấp nhận được và không cần fencing token — nhưng bất kỳ thao tác nào có hiệu ứng cộng dồn hoặc không đảo ngược (trừ tiền, ghi đè trạng thái) đều nên có fencing token.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Tái hiện lỗi mất update, rồi vá bằng fencing token"
+  prompt="$"
+  commands={[
+    { comment: "Chạy storage service giả lập (không kiểm tra gì)", command: "npx tsx sd10/storage-service.ts", output: "storage-service listening on :4000" },
+    { comment: "A giành lock TTL 5s, giả lập GC pause 8s TRƯỚC khi ghi", command: "docker compose exec redis redis-cli SET lock:doc1 A NX PX 5000", output: "OK" },
+    { comment: "Trong lúc A pause, B giành lock (TTL A đã hết) rồi ghi luôn", command: "docker compose exec redis redis-cli SET lock:doc1 B NX PX 5000 && curl -s -X POST localhost:4000/write -d '{\"value\":\"B\"}'", output: "OK\n{\"accepted\":true}" },
+    { comment: "A tỉnh dậy, vẫn ghi dữ liệu cũ — KHÔNG có kiểm tra gì chặn lại", command: "curl -s -X POST localhost:4000/write -d '{\"value\":\"A\"}' && curl -s localhost:4000/read", output: "{\"accepted\":true}\n{\"value\":\"A\"}" },
+    { comment: "Sửa: thêm fencing token, chạy lại đúng kịch bản", command: "curl -s -X POST localhost:4000/write -d '{\"value\":\"A\",\"token\":33}'", output: "{\"accepted\":false,\"reason\":\"token 33 <= lastToken 34\"}" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Chỉ thêm fencing token ở TẦNG XIN LOCK mà quên kiểm tra ở TẦNG GHI DỮ LIỆU THẬT. Nếu code ghi trực tiếp vào database/API khác mà quên gửi kèm token (hoặc storage đó không kiểm tra), toàn bộ cơ chế fencing vô nghĩa — client cũ vẫn ghi được bình thường.
+
+</Callout>
+
+<Callout type="warning">
+
+Redlock (khoá trên nhiều Redis độc lập để chịu lỗi 1 node) giải quyết vấn đề AVAILABILITY của lock service, nhưng KHÔNG giải quyết vấn đề GC pause đã nêu ở trên — Kleppmann chỉ ra rõ điều này. Đừng nhầm "khoá chịu lỗi cao" với "khoá an toàn tuyệt đối".
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu hỏi "Redis lock có an toàn không" gần như luôn là bẫy để kiểm tra bạn có biết GC-pause/fencing token hay không. Câu trả lời mạnh: "an toàn để tránh 2 client CÙNG LÚC nghĩ mình giữ lock, nhưng KHÔNG đủ để tránh 2 client GHI ĐÈ NHAU nếu một client bị delay lâu hơn TTL — cần fencing token kiểm tra ở tầng storage để đóng lỗ hổng đó."
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "distributed lock", meaning: "Cơ chế đảm bảo chỉ một client được coi là 'đang giữ quyền' thao tác một tài nguyên tại một thời điểm, thường có TTL/lease." },
+    { term: "GC pause", meaning: "Khoảng thời gian runtime dừng thực thi code để dọn bộ nhớ — có thể kéo dài bất ngờ, khiến client 'trễ' hơn TTL đã tính." },
+    { term: "fencing token", meaning: "Số tăng dần đơn điệu cấp kèm mỗi lần giành lock; storage dùng nó để từ chối ghi từ client có token cũ hơn." },
+    { term: "lastToken", meaning: "Token lớn nhất mà storage đã chấp nhận — mọi ghi có token nhỏ hơn hoặc bằng đều bị từ chối." },
+    { term: "Redlock", meaning: "Thuật toán khoá phân tán trên nhiều Redis instance độc lập để chịu lỗi 1 node — không thay thế được fencing token." },
+    { term: "idempotent", meaning: "Thao tác cho kết quả giống nhau dù chạy lại bao nhiêu lần — giảm mức độ nghiêm trọng nếu lock bị vi phạm." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một team sửa lock bằng cách: khi lock hết hạn, client CŨ (A) sẽ nhận exception ngay lập tức từ thư viện Redis lock, nên họ tin rằng A sẽ dừng lại trước khi kịp ghi. Cách nghĩ này có vấn đề gì?"
+  options={[
+    "Không có vấn đề gì, đây chính là cách fencing token hoạt động",
+    "Vấn đề: A đang bị GC pause NGHĨA LÀ CODE CỦA A KHÔNG CHẠY — không có cách nào 'nhận exception ngay lập tức' trong lúc pause; exception (nếu có) chỉ được xử lý SAU khi A tỉnh dậy, có thể đã quá muộn nếu A đã kịp gửi request ghi trước khi kiểm tra lại trạng thái lock",
+    "Vấn đề chỉ xảy ra nếu dùng Redis, không xảy ra với etcd",
+    "Vấn đề chỉ xảy ra nếu TTL ngắn hơn 1 giây",
+  ]}
+  answerIndex={1}
+  explanation="Đây đúng là ngộ nhận phổ biến: GC pause (hay bất kỳ dạng 'đứng hình' nào) làm TOÀN BỘ thread của client dừng lại, bao gồm cả code kiểm tra lock. Không thể giả định client sẽ 'phát hiện kịp thời' rằng nó đã mất lock — đó chính là lý do cần một bên THỨ BA (storage) độc lập với đồng hồ và trạng thái nội bộ của client để chặn ghi trễ, thay vì trông chờ client tự giác."
+/>

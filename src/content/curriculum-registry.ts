@@ -25,6 +25,7 @@ import { sd06ScalingDatabasesModule } from "./modules/sd06-scaling-databases/mod
 import { sd07AsyncMessagingModule } from "./modules/sd07-async-messaging/module-meta";
 import { sd08StorageSearchModule } from "./modules/sd08-storage-search/module-meta";
 import { sd09ConsistencyReplicationModule } from "./modules/sd09-consistency-replication/module-meta";
+import { sd10ConsensusCoordinationModule } from "./modules/sd10-consensus-coordination/module-meta";
 import { sd11ReliabilityPatternsModule } from "./modules/sd11-reliability-patterns/module-meta";
 import { sd12MicroservicesApiDesignModule } from "./modules/sd12-microservices-api-design/module-meta";
 import { sd13SloCapacityMultiRegionModule } from "./modules/sd13-slo-capacity-multi-region/module-meta";
@@ -57,6 +58,7 @@ export const curriculumModules: ModuleDefinition[] = [
   sd07AsyncMessagingModule,
   sd08StorageSearchModule,
   sd09ConsistencyReplicationModule,
+  sd10ConsensusCoordinationModule,
   sd11ReliabilityPatternsModule,
   sd12MicroservicesApiDesignModule,
   sd13SloCapacityMultiRegionModule,

@@ -1,0 +1,111 @@
+import { RaftLeaderElectionDiagram } from "../diagrams/raft-leader-election-diagram";
+import { RaftLogReplicationDiagram } from "../diagrams/raft-log-replication-diagram";
+
+<Eli5 title="Nhóm lính gác không có chỉ huy cố định, tự bầu chỉ huy nhiệm kỳ bằng hô to xin phiếu" emoji="🪖">
+
+Một nhóm lính gác đứng quanh trại, không ai là chỉ huy cố định. Luật của nhóm: mỗi lính tự đếm thầm một khoảng thời gian NGẪU NHIÊN (mỗi người một con số khác nhau) kể từ lần cuối nghe lệnh chỉ huy. Ai đếm hết trước mà vẫn chưa nghe lệnh gì thì tự hô to "tôi xin làm chỉ huy nhiệm kỳ tiếp theo!", tăng số nhiệm kỳ (term) thêm 1, rồi hỏi xin phiếu từng người.
+
+Vì mỗi người đếm ngẫu nhiên khác nhau, gần như luôn có MỘT người hô trước. Những người còn lại, nếu chưa bỏ phiếu cho ai ở nhiệm kỳ này, sẽ gật đầu. Đủ quá nửa gật đầu → người đó thành chỉ huy nhiệm kỳ mới, bắt đầu hô "vẫn còn tôi đây" đều đặn để không ai khác tự ứng cử.
+
+Nếu chỉ huy đột nhiên biến mất (bị bắt, ngất xỉu), lính gác không nghe "vẫn còn tôi đây" nữa, lại tiếp tục đếm ngẫu nhiên và bầu chỉ huy MỚI với số nhiệm kỳ CAO HƠN — nhiệm kỳ không bao giờ quay lại số cũ.
+
+Chỗ ví von hụt: việc ra lệnh thật (ghi log) trong Raft phức tạp hơn "hô lệnh miệng" — chỉ huy phải đảm bảo lệnh được CHÉP LẠI ở đủ số lính trước khi coi là lệnh chính thức, và nếu có lính chép sai lệnh cũ chưa xác nhận, lệnh đó có thể bị xoá và ghi đè.
+
+</Eli5>
+
+Raft là thuật toán consensus được thiết kế để DỄ HIỂU (so với Paxos) mà vẫn đúng đắn — nó đứng sau etcd, Consul, CockroachDB, TiKV và nhiều hệ thống production khác. Hiểu đúng 3 khái niệm — term, leader election, commit theo majority — là đủ để trả lời phần lớn câu hỏi phỏng vấn về Raft.
+
+<RaftLeaderElectionDiagram />
+
+<Technical>
+
+### Term — đồng hồ logic của cả cụm
+
+`term` là một số nguyên tăng dần, đóng vai trò "số nhiệm kỳ". Mỗi khi có bầu cử mới (dù thành công hay thất bại), term tăng thêm 1. Luật bất biến: **term chỉ tăng, không bao giờ giảm**, và mọi node luôn cập nhật theo term LỚN NHẤT nó từng thấy — nếu một node thấy message có term cao hơn term của nó, nó lập tức cập nhật và (nếu đang là leader/candidate) step down về follower. Đây là cách các node "thiểu số cũ" tự nhận ra mình đã lỗi thời sau khi mạng nối lại.
+
+### Bầu leader: randomized election timeout
+
+- Mỗi node là **follower** mặc định, tự đặt một `election timeout` ngẫu nhiên (thường 150–300ms).
+- Hết timeout mà không nghe `AppendEntries` (kể cả rỗng — heartbeat) từ leader → node tự tăng term, chuyển thành **candidate**, bỏ phiếu cho chính mình, gửi `RequestVote` cho các node khác.
+- Một node CHỈ bỏ phiếu MỘT lần mỗi term, và chỉ gật nếu log của candidate không cũ hơn log của chính nó (điều kiện an toàn: không bầu ai có dữ liệu cũ hơn làm leader).
+- Đủ phiếu từ **majority** (kể cả phiếu tự bầu) → candidate thành **leader** của term đó, ngay lập tức gửi heartbeat để giữ ghế.
+
+Random hoá timeout là chi tiết dễ bị bỏ qua nhưng QUAN TRỌNG: nếu mọi node cùng timeout giống hệt nhau, chúng có xu hướng cùng ứng cử một lúc, chia phiếu đều, không ai đủ majority — phải bầu lại nhiều vòng liên tiếp (rất tốn thời gian). Random hoá làm gần như luôn có một node ứng cử trước, giảm mạnh khả năng chia phiếu.
+
+<RaftLogReplicationDiagram />
+
+### Log replication & commit — chỉ cần majority, không cần tất cả
+
+- Leader nhận ghi từ client, **thêm entry vào cuối log của chính mình trước** (chưa committed).
+- Leader gửi `AppendEntries` song song cho mọi follower, kèm `prevLogIndex`/`prevLogTerm` để follower kiểm tra log của mình có khớp tới điểm đó không.
+- Follower khớp → ghi entry mới, ACK. Follower KHÔNG khớp (có entry khác ở cùng vị trí, do từng là leader cũ ghi nhưng chưa kịp replicate) → từ chối; leader giảm dần `nextIndex` cho follower đó và thử lại, cuối cùng follower phải **xoá** entry xung đột (an toàn vì entry đó CHƯA committed) và nhận entry của leader hiện tại.
+- Ngay khi leader nhận đủ ACK từ **majority** (kể cả chính nó) — **không cần đợi follower chậm nhất** — entry được coi là **committed**, `commit index` tiến lên, leader trả lời client thành công.
+
+### Log matching property
+
+Đây là bất biến giữ log các node nhất quán: nếu hai log có cùng entry ở cùng index và cùng term, thì mọi entry TRƯỚC đó cũng giống hệt nhau. Hệ quả thực tế: một entry **đã committed** thì không bao giờ bị mất hay ghi đè (nó đã có mặt trên majority, bất kỳ leader tương lai nào cũng phải chứa nó để thắng bầu cử); một entry **chưa committed** hoàn toàn có thể bị leader mới ghi đè — đây chính là điều xảy ra ở bước "N1 bị ghi đè" trong diagram trên.
+
+### Trade-off: Raft tự cài vs dùng lại dịch vụ có sẵn
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Tự implement Raft | Kiểm soát hoàn toàn, tối ưu riêng cho hệ thống | Rất dễ sai ở các case khó (snapshot, membership change, log compaction) | Xây database/hệ thống phân tán lõi (hiếm khi cần) |
+| Dùng thư viện Raft có sẵn (`hashicorp/raft`, `etcd/raft`) | Đỡ tự viết phần lõi, vẫn nhúng trực tiếp vào service | Vẫn phải tự vận hành state machine, snapshot | Cần Raft nhúng trong chính service, không muốn thêm service ngoài |
+| Dùng etcd/ZooKeeper qua API | Không cần hiểu sâu Raft để dùng, đã kiểm chứng ở scale lớn | Thêm dependency mạng, thêm latency | Đa số bài toán leader election/lock/config (bài tiếp theo) |
+
+**Khi nào đổi ý:** nếu latency gọi qua etcd/ZooKeeper (round-trip mạng) trở thành bottleneck thật sự đo được, cân nhắc nhúng thư viện Raft trực tiếp — nhưng đây là tối ưu hiếm khi cần tới trước khi có số đo cụ thể.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Ghi lại term qua các sự kiện trên raft.github.io (xem chi tiết ở lab)"
+  prompt="$"
+  commands={[
+    { comment: "Bắt đầu ghi lại quan sát vào file cục bộ", command: "mkdir -p sd10 && echo 't=0 term=1 leader=S1' >> sd10/raft-observations.md" },
+    { comment: "Sau khi kill leader S1 trên UI và đợi bầu lại", command: "echo 't=1 term=2 leader=S3' >> sd10/raft-observations.md" },
+    { comment: "Xem lại toàn bộ chuỗi term đã quan sát — phải tăng đơn điệu", command: "cat sd10/raft-observations.md", output: "t=0 term=1 leader=S1\nt=1 term=2 leader=S3" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Nghĩ rằng leader phải đợi TẤT CẢ follower ACK mới commit một entry. Sai — Raft chỉ cần **majority**. Đây là điểm hay bị hỏi ngược trong phỏng vấn: "nếu 2/5 node rất chậm, hệ thống có bị treo không?" — không, vì 3/5 đã đủ commit.
+
+</Callout>
+
+<Callout type="warning">
+
+Term tăng không có nghĩa là "mọi bầu cử đều thành công". Khi network partition chia cụm thành 2 nhóm không nhóm nào đủ majority, nhóm thiểu số có thể liên tục tăng term (candidate → hết timeout → candidate term mới → ...) mà KHÔNG BAO GIỜ bầu được leader — đây là hiện tượng "term inflation" vô hại nhưng gây nhiễu nếu không biết nguyên nhân.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu hỏi kinh điển: "giải thích Raft commit một entry như thế nào". Câu trả lời mạnh đi đúng thứ tự: leader ghi log cục bộ trước → gửi AppendEntries song song → nhận đủ ACK từ majority (không cần tất cả) → commit index tiến lên → trả lời client → (heartbeat sau đó mới báo commit index mới cho follower còn lại áp dụng). Bỏ sót bước "không cần tất cả" là lỗi hay gặp nhất.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "term", meaning: "Số nhiệm kỳ, tăng đơn điệu mỗi lần có bầu cử mới; node luôn cập nhật theo term lớn nhất nó thấy được." },
+    { term: "election timeout", meaning: "Khoảng thời gian ngẫu nhiên một follower chờ trước khi tự ứng cử làm candidate nếu không nghe leader." },
+    { term: "RequestVote / AppendEntries", meaning: "Hai loại RPC của Raft: xin phiếu bầu, và gửi log entry (hoặc heartbeat rỗng)." },
+    { term: "commit index", meaning: "Chỉ số log entry mới nhất đã được replicate tới majority, coi là chính thức và không thể mất." },
+    { term: "log matching property", meaning: "Bất biến: nếu hai log khớp nhau ở một entry, mọi entry trước đó cũng khớp — entry chưa committed có thể bị ghi đè." },
+    { term: "nextIndex", meaning: "Chỉ số leader dùng để theo dõi entry tiếp theo cần gửi cho từng follower, giảm dần khi follower từ chối do log không khớp." },
+  ]}
+/>
+
+<QuickCheck
+  question="Cụm Raft 7 node đang ở `term = 5` với N2 là leader. N2 bị cô lập khỏi 4 node còn lại (network partition), trong khi N2 vẫn liên lạc được với N1. 5 node còn lại (không có N2) bầu ra N4 làm leader mới ở `term = 6`. Sau khi mạng nối lại, điều gì xảy ra với N2?"
+  options={[
+    "N2 vẫn là leader vì nó chưa từng bị 'kill' — hai leader cùng tồn tại song song vĩnh viễn",
+    "N2 nhận được message (heartbeat hoặc RequestVote) mang `term = 6` từ N4, thấy lớn hơn `term = 5` nó đang giữ, lập tức cập nhật term và step down thành follower — không có split brain vĩnh viễn",
+    "N2 sẽ ép toàn cụm quay lại `term = 5` vì nó là leader cũ",
+    "Không thể xác định nếu không biết địa chỉ IP của N2",
+  ]}
+  answerIndex={1}
+  explanation="Đúng luật bất biến: mọi node cập nhật theo term lớn nhất nó từng thấy. N2 chỉ 'không biết mình đã bị thay' chừng nào chưa nhận được thông tin từ term mới — ngay khi mạng nối lại và N2 thấy term=6, nó buộc phải step down. Đây khác với ví dụ split brain ở bài trước vì Raft LUÔN có cơ chế phát hiện và tự sửa qua so sánh term, không dựa vào 'ai nói to hơn'."
+/>

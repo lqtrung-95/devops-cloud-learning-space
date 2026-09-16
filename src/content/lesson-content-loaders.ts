@@ -37,4 +37,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "sd11-reliability-patterns": (lessonSlug) => import(`./modules/sd11-reliability-patterns/lessons/${lessonSlug}.mdx`),
   "sd12-microservices-api-design": (lessonSlug) => import(`./modules/sd12-microservices-api-design/lessons/${lessonSlug}.mdx`),
   "sd13-slo-capacity-multi-region": (lessonSlug) => import(`./modules/sd13-slo-capacity-multi-region/lessons/${lessonSlug}.mdx`),
+  "sd10-consensus-coordination": (lessonSlug) => import(`./modules/sd10-consensus-coordination/lessons/${lessonSlug}.mdx`),
 };
