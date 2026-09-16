@@ -1,0 +1,134 @@
+import { ResolverServiceLayerAndOrgScopingDiagram } from "../diagrams/resolver-service-layer-and-org-scoping-diagram";
+
+<Eli5 title="Hai quầy thu ngân khác cửa, nhưng phải soát cùng một cuốn sổ" emoji="🧾">
+  Cửa hàng có 2 quầy thu ngân: quầy REST (cửa chính) và quầy GraphQL (cửa bên, vừa mở thêm). Cả hai đều bán đúng những món hàng trong kho — không quầy nào được tự ý viết giá hay tự lấy hàng theo cách riêng.
+
+  Quan trọng hơn: cả hai quầy đều PHẢI soát cùng một cuốn sổ "ai được mua hàng của chi nhánh nào" trước khi giao hàng. Nếu quầy mới mở (GraphQL) quên soát sổ vì nghĩ "chắc quầy chính đã soát rồi", khách hàng chi nhánh A có thể mua được hàng của chi nhánh B chỉ bằng cách đi qua cửa bên.
+</Eli5>
+
+Đây là 2 nguyên tắc dễ bị bỏ qua nhất khi thêm GraphQL vào một API REST đã có sẵn auth/RBAC: (1) resolver không được viết lại logic truy vấn, phải gọi đúng hàm REST đang dùng; (2) `/graphql` là một route Fastify hoàn toàn mới — nó KHÔNG tự động thừa hưởng `preHandler` (`app.authenticate`, `requireRole`) đã gắn cho từng route REST cụ thể.
+
+<ResolverServiceLayerAndOrgScopingDiagram />
+
+<Technical>
+
+### Resolver gọi lại service layer — không viết logic riêng
+
+Từ B12, ta tách phần truy vấn đang nằm rải rác trong route handler REST thành các hàm dùng chung trong `src/services/`. Đây không phải kiến trúc mới — chỉ là đặt tên rõ ràng cho các hàm Drizzle vốn đã tồn tại từ B04, để cả REST route và GraphQL resolver cùng gọi một nguồn:
+
+```ts title="src/services/project.service.ts"
+import { eq } from "drizzle-orm";
+import { db } from "../db/client.js";
+import { projects } from "../db/schema.js";
+
+export async function getProjectById(id: string) {
+  const [row] = await db.select().from(projects).where(eq(projects.id, id));
+  return row ?? null;
+}
+```
+
+```ts title="src/services/membership.service.ts"
+import { eq, and } from "drizzle-orm";
+import { db } from "../db/client.js";
+import { memberships } from "../db/schema.js";
+
+// Tách ra từ attachMembershipOrReject (B06) — REST và GraphQL giờ gọi chung hàm này
+export async function getMembershipRole(userId: string, organizationId: string) {
+  const [row] = await db
+    .select({ role: memberships.role })
+    .from(memberships)
+    .where(and(eq(memberships.userId, userId), eq(memberships.organizationId, organizationId)));
+  return row?.role ?? null;
+}
+```
+
+Route REST `resolveOrganizationFromProjectId` (B06) giờ gọi lại `getMembershipRole` thay vì tự viết query, và resolver GraphQL cũng gọi đúng hàm đó — sửa logic org-scoping một lần, cả hai nơi cùng cập nhật.
+
+### Context của mercurius: nơi verify JWT cho GraphQL
+
+Fastify chạy `preHandler` theo TỪNG route cụ thể — `app.authenticate`, `requireRole(...)` (B05, B06) chỉ gắn cho route REST nào khai báo chúng. `/graphql` là 1 route Fastify khác, KHÔNG tự có các preHandler đó. Việc xác thực phải làm lại, đúng 1 lần, trong hàm `context` của mercurius:
+
+```ts title="src/plugins/graphql.ts"
+import mercurius from "mercurius";
+import { schema } from "../graphql/schema.js";
+import { resolvers } from "../graphql/resolvers.js";
+
+app.register(mercurius, {
+  schema,
+  resolvers,
+  context: async (request, _reply) => {
+    await request.jwtVerify(); // cùng @fastify/jwt plugin đã đăng ký từ B05
+    return { userId: request.user.sub };
+  },
+});
+```
+
+`context` chạy đúng 1 lần cho mỗi request GraphQL (dù query có lồng bao nhiêu cấp), và object nó trả về được truyền làm tham số thứ 3 vào MỌI resolver — đây là cách chuẩn để đưa `userId` đã xác thực xuống tới resolver mà không cần verify lại JWT nhiều lần.
+
+### Org-scoping trong resolver: entry point nào cũng phải tự kiểm tra
+
+Khác với REST (mỗi route validate đúng 1 lần theo path param), GraphQL cho phép nhiều "điểm vào" (`Query.project`, và về sau có thể có `Query.task`, `Query.comment`...). Nguyên tắc đúng: **field nào nhận ID trực tiếp từ client đều là một entry point độc lập, phải tự org-scope, không được kế thừa miễn phí từ field khác**:
+
+```ts title="src/graphql/resolvers.ts"
+import { GraphQLError } from "graphql";
+import { getProjectById } from "../services/project.service.js";
+import { getMembershipRole } from "../services/membership.service.js";
+
+export const resolvers = {
+  Query: {
+    project: async (_parent, { id }, context) => {
+      const project = await getProjectById(id);
+      if (!project) throw new GraphQLError("Không tìm thấy project");
+
+      const role = await getMembershipRole(context.userId, project.organizationId);
+      if (!role) throw new GraphQLError("Không tìm thấy project"); // KHÔNG tiết lộ project có tồn tại hay không
+
+      return project;
+    },
+  },
+  Project: {
+    // Chỉ điều hướng từ 1 project ĐÃ qua kiểm tra ở Query.project — không cần check lại
+    tasks: async (parent) => listTasksByProjectId(parent.id),
+  },
+};
+```
+
+`Project.tasks` không cần tự kiểm tra quyền lần nữa vì nó CHỈ đọc `parent.id` — tức chỉ chạy sau khi `Query.project` đã xác nhận user có quyền với đúng project đó. Đây là điểm khác GraphQL cần hiểu rõ: an toàn của field lồng phụ thuộc vào việc nó có nhận ID trực tiếp từ client hay không, chứ không phải "đọc dữ liệu thì không cần check quyền".
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "User org A gọi project của org A — hợp lệ", command: "curl -s -X POST localhost:3000/graphql -H 'Authorization: Bearer <jwt-org-A>' -d '{\"query\":\"{ project(id: \\\"proj-A\\\") { name } }\"}'", output: '{"data":{"project":{"name":"Website Redesign"}}}' },
+    { comment: "Cùng user org A, đổi id sang project của org B — phải bị chặn", command: "curl -s -X POST localhost:3000/graphql -H 'Authorization: Bearer <jwt-org-A>' -d '{\"query\":\"{ project(id: \\\"proj-B\\\") { name } }\"}'", output: '{"errors":[{"message":"Không tìm thấy project"}]}' },
+    { comment: "Không kèm JWT — context.jwtVerify() phải reject trước khi chạm resolver", command: "curl -s -X POST localhost:3000/graphql -d '{\"query\":\"{ project(id: \\\"proj-A\\\") { name } }\"}'", output: '{"statusCode":401,"error":"Unauthorized","message":"No Authorization was found in request.headers"}' },
+  ]}
+/>
+
+<Callout type="warning" title="'Chỉ là một query' không có nghĩa là an toàn">
+  Lỗi thật hay gặp nhất khi team mới thêm GraphQL: coi Query khác Mutation về mức độ rủi ro, kiểu "Mutation mới cần check quyền kỹ, Query chỉ đọc nên chắc ổn". Sai — Query.project ở trên đọc dữ liệu (không side effect) nhưng vẫn có thể làm rò rỉ toàn bộ project của tổ chức khác nếu thiếu `getMembershipRole`. Authorization áp dụng cho MỌI field trả dữ liệu nhạy cảm, bất kể đó là Query hay Mutation.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "service layer", meaning: "Các hàm truy vấn/logic dùng chung, được cả REST route và GraphQL resolver gọi lại — tránh viết trùng logic ở 2 nơi." },
+    { term: "context (mercurius)", meaning: "Object được tạo 1 lần mỗi request GraphQL, truyền vào mọi resolver — nơi hợp lý để đặt kết quả verify JWT." },
+    { term: "entry point", meaning: "Field GraphQL nhận ID trực tiếp từ client (không phải điều hướng từ parent) — phải tự org-scope từ đầu." },
+    { term: "GraphQLError", meaning: "Lỗi chuẩn của thư viện graphql để trả message lỗi có cấu trúc trong response GraphQL." },
+    { term: "request.jwtVerify()", meaning: "Hàm của @fastify/jwt (B05) kiểm tra chữ ký + hạn JWT, gắn payload vào request.user." },
+  ]}
+/>
+
+<QuickCheck
+  question="Team thêm field mới `Query.comment(id: ID!): Comment` để phục vụ một tính năng link trực tiếp tới 1 comment. Điều gì BẮT BUỘC phải có trong resolver này để không lặp lại lỗi rò rỉ dữ liệu?"
+  options={[
+    "Không cần gì thêm, vì Comment chỉ chứa text, không nhạy cảm bằng Project",
+    "Tự tra ra organizationId của comment đó (qua task → project) rồi gọi getMembershipRole kiểm tra trước khi trả kết quả — vì đây là entry point mới, nhận ID trực tiếp từ client",
+    "Chỉ cần đặt tên field bắt đầu bằng chữ thường để GraphQL tự áp policy",
+    "Chỉ cần thêm field này vào Mutation thay vì Query",
+  ]}
+  answerIndex={1}
+  explanation="Bất kỳ field Query/Mutation nào nhận ID trực tiếp từ client đều là một entry point độc lập — nó không thừa hưởng quyền từ field nào khác, nên phải tự org-scope, đúng nguyên tắc đã học ở Query.project."
+/>

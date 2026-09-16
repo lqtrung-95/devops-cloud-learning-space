@@ -58,4 +58,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "b13-grpc-internal-services": (lessonSlug) => import(`./modules/b13-grpc-internal-services/lessons/${lessonSlug}.mdx`),
   "b15-security-for-backend": (lessonSlug) => import(`./modules/b15-security-for-backend/lessons/${lessonSlug}.mdx`),
   "b11-realtime-websocket-sse": (lessonSlug) => import(`./modules/b11-realtime-websocket-sse/lessons/${lessonSlug}.mdx`),
+  "b12-graphql-api": (lessonSlug) => import(`./modules/b12-graphql-api/lessons/${lessonSlug}.mdx`),
 };

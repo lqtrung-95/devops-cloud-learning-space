@@ -10,6 +10,7 @@ import { b08FileUploadObjectStorageModule } from "./modules/b08-file-upload-obje
 import { b09BackgroundJobsSchedulingModule } from "./modules/b09-background-jobs-scheduling/module-meta";
 import { b10CachingForBackendModule } from "./modules/b10-caching-for-backend/module-meta";
 import { b11RealtimeWebsocketSseModule } from "./modules/b11-realtime-websocket-sse/module-meta";
+import { b12GraphqlApiModule } from "./modules/b12-graphql-api/module-meta";
 import { b13GrpcInternalServicesModule } from "./modules/b13-grpc-internal-services/module-meta";
 import { b14MicroserviceSplitEventDrivenModule } from "./modules/b14-microservice-split-event-driven/module-meta";
 import { b15SecurityForBackendModule } from "./modules/b15-security-for-backend/module-meta";
@@ -63,6 +64,7 @@ export const curriculumModules: ModuleDefinition[] = [
   b09BackgroundJobsSchedulingModule,
   b10CachingForBackendModule,
   b11RealtimeWebsocketSseModule,
+  b12GraphqlApiModule,
   b13GrpcInternalServicesModule,
   b14MicroserviceSplitEventDrivenModule,
   b15SecurityForBackendModule,

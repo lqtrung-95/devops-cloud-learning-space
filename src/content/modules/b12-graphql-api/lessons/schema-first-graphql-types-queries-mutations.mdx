@@ -1,0 +1,150 @@
+import { RestVsGraphqlNestedDataRoundTripsDiagram } from "../diagrams/rest-vs-graphql-nested-data-round-trips-diagram";
+
+<Eli5 title="REST giống set menu cố định, GraphQL giống gọi món theo yêu cầu" emoji="🍽️">
+  Quán ăn kiểu REST có thực đơn cố định: món "project", món "tasks", món "comments" — mỗi món một đĩa riêng, muốn ăn đủ 3 món phải gọi 3 lần. Nếu khách chỉ muốn ăn thử vài miếng trong mỗi đĩa (chỉ cần `title` và `status` của task, không cần `description`), quán vẫn bắt buộc bưng nguyên đĩa đầy đủ.
+
+  Quán kiểu GraphQL cho khách tự viết ra đúng thứ mình muốn ăn trong một tờ order duy nhất: "cho tôi project, kèm tất cả task của nó, mỗi task kèm comment, mỗi comment kèm tên tác giả" — bếp tự lo phần còn lại, khách chỉ nhận đúng 1 khay đúng như đã order, không thừa không thiếu.
+</Eli5>
+
+`taskflow-api` đã có REST API đầy đủ từ B02–B11: `/api/v1/projects`, `/api/v1/tasks`, `/api/v1/tasks/:id/comments`. Module này KHÔNG thay REST — nó thêm một cách gọi khác, song song, cho những màn hình cần dữ liệu lồng sâu (dashboard hiển thị project kèm task kèm comment kèm tên người viết trong một lần load).
+
+<RestVsGraphqlNestedDataRoundTripsDiagram />
+
+<Technical>
+
+### Schema-first: vẽ bản thiết kế trước khi viết resolver
+
+GraphQL bắt client và server thống nhất trước một **schema** — bản mô tả chính xác có những `type` gì, mỗi type có field gì, field đó trả kiểu gì. Không giống REST (route + response tuỳ ý do server quyết), schema GraphQL là hợp đồng tường minh mà cả hai phía đều đọc được.
+
+`taskflow-api` đã có domain model từ B04–B06 (`projects`, `tasks`, `comments`, `users` — tên bảng/cột đã khoá, không đổi). Việc của B12 là **mô tả lại đúng model đó** bằng GraphQL SDL (Schema Definition Language), không phát minh dữ liệu mới:
+
+```graphql title="src/graphql/schema.ts (nội dung SDL)"
+type User {
+  id: ID!
+  name: String!
+  email: String!
+}
+
+type Comment {
+  id: ID!
+  body: String!
+  author: User!
+  createdAt: String!
+}
+
+type Task {
+  id: ID!
+  title: String!
+  status: String!
+  comments: [Comment!]!
+  createdAt: String!
+}
+
+type Project {
+  id: ID!
+  name: String!
+  tasks: [Task!]!
+  createdAt: String!
+}
+
+type Query {
+  project(id: ID!): Project
+}
+
+type Mutation {
+  createComment(taskId: ID!, body: String!): Comment!
+}
+```
+
+Vài điểm cần nhớ khi đọc SDL:
+
+- `String!`, `ID!` (dấu `!`) nghĩa là field KHÔNG được `null` — nếu resolver trả `null` cho field này, GraphQL coi là lỗi.
+- `[Comment!]!` là "một mảng không null, chứa các phần tử không null" — không cho phép mảng `null` lẫn phần tử `null` bên trong.
+- `Query` là type đặc biệt: mỗi field trong đó là một "điểm vào" để đọc dữ liệu — tương đương một route `GET` bên REST.
+- `Mutation` là type đặc biệt cho các thao tác **có side effect** (tạo/sửa/xoá) — tương đương `POST`/`PATCH`/`DELETE` bên REST. Đọc dữ liệu không bao giờ nên nằm trong `Mutation`.
+
+### Đăng ký mercurius vào Fastify app
+
+`mercurius` là plugin GraphQL chính thức cho Fastify (khác Apollo Server — không cần cài thêm HTTP framework riêng, dùng lại đúng `app` Fastify đã có từ B01). Cấu hình cơ bản:
+
+```ts title="src/app.ts"
+import mercurius from "mercurius";
+import { schema } from "./graphql/schema.js";
+import { resolvers } from "./graphql/resolvers.js";
+
+// ... các plugin REST đã đăng ký từ B01-B11 giữ nguyên, không đổi
+
+app.register(mercurius, {
+  schema,
+  resolvers,
+  graphiql: process.env.NODE_ENV !== "production", // UI thử query — chỉ bật ở dev
+});
+```
+
+Mặc định, mercurius mount tại `/graphql` (nhận `POST`, body `{ query, variables }`). Đối chiếu chính xác từng option của `mercurius` (tên field, giá trị mặc định) với README chính thức trước khi build production — khung trên đúng theo API cơ bản của mercurius nhưng bản thân thư viện có thể thêm option mới ở các phiên bản sau.
+
+### Resolver: hàm khớp đúng tên field trong schema
+
+Mỗi field trong schema cần một hàm resolver tương ứng — GraphQL gọi resolver này khi client hỏi tới field đó:
+
+```ts title="src/graphql/resolvers.ts"
+export const resolvers = {
+  Query: {
+    project: async (_parent, { id }) => getProjectById(id), // hàm service layer, xem bài sau
+  },
+  Project: {
+    tasks: async (parent) => listTasksByProjectId(parent.id),
+  },
+  Task: {
+    comments: async (parent) => listCommentsByTaskId(parent.id),
+  },
+  Comment: {
+    author: async (parent) => getUserById(parent.authorId),
+  },
+};
+```
+
+`parent` là kết quả trả về từ resolver CHA. Ví dụ resolver `Task.comments` nhận `parent` chính là object `Task` mà resolver `Project.tasks` vừa trả — đây là cơ chế GraphQL tự đi từng bước xuống các cấp lồng nhau, và cũng chính là lý do bài sau xuất hiện vấn đề N+1: mỗi cấp lồng gọi lại resolver riêng cho TỪNG phần tử cha.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Thêm mercurius và graphql vào taskflow-api", command: "pnpm add mercurius graphql" },
+    { comment: "Chạy dev server sau khi đăng ký plugin", command: "pnpm dev", output: "Server listening at http://0.0.0.0:3000" },
+    {
+      comment: "Gọi thử query lồng 2 cấp bằng curl",
+      command: "curl -s -X POST localhost:3000/graphql -H 'Content-Type: application/json' -d '{\"query\":\"{ project(id: \\\"8f14e2a0-...\\\") { name tasks { title status } } }\"}'",
+      output: '{"data":{"project":{"name":"Website Redesign","tasks":[{"title":"Thiết kế wireframe","status":"done"},{"title":"Viết API","status":"in_progress"}]}}}',
+    },
+  ]}
+/>
+
+<Callout type="mistake" title="Đừng để field trong schema và cột trong DB lệch tên ngầm">
+  Schema GraphQL dùng `createdAt` (camelCase, quy ước GraphQL) trong khi cột Postgres là `created_at` (snake_case, quy ước SQL — B04). Đây không phải lỗi, nhưng NẾU resolver quên map (`createdAt: parent.createdAt` thay vì `parent.created_at`), field sẽ luôn trả `null` một cách âm thầm — không có exception nào cả vì `String` cho phép field optional nếu không đánh dấu `!`. Luôn kiểm tra map tên field ngay khi thêm field mới, đừng đợi tới khi bị hỏi "sao createdAt lúc nào cũng null".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "schema-first", meaning: "Định nghĩa type/Query/Mutation bằng SDL trước, viết resolver khớp theo sau — ngược với 'code-first' (sinh schema từ code)." },
+    { term: "SDL (Schema Definition Language)", meaning: "Cú pháp mô tả type GraphQL, ví dụ `type Task { title: String! }`." },
+    { term: "resolver", meaning: "Hàm trả dữ liệu cho đúng 1 field trong schema, nhận `parent` là kết quả resolver cha." },
+    { term: "Query / Mutation", meaning: "Hai type đặc biệt: Query cho đọc (không side effect), Mutation cho ghi (có side effect)." },
+    { term: "mercurius", meaning: "Plugin GraphQL chính thức cho Fastify, mount route xử lý GraphQL (mặc định /graphql)." },
+    { term: "non-null (!)", meaning: "Dấu `!` sau kiểu field nghĩa là field đó không được trả `null`, nếu không GraphQL báo lỗi." },
+  ]}
+/>
+
+<QuickCheck
+  question="taskflow-api cần thêm hành động 'đổi status của 1 task' qua GraphQL. Hành động này nên khai báo ở type nào trong schema?"
+  options={[
+    "Query, vì vẫn đang thao tác trên type Task đã có",
+    "Mutation, vì đây là hành động làm thay đổi dữ liệu (side effect ghi DB)",
+    "Cả Query và Mutation đều được, không quan trọng",
+    "Không cần khai báo type nào, chỉ cần thêm resolver",
+  ]}
+  answerIndex={1}
+  explanation="Bất kỳ hành động nào có side effect (tạo/sửa/xoá dữ liệu) đều thuộc Mutation, dù nó thao tác trên type nào. Query chỉ dành cho đọc dữ liệu không side effect."
+/>

@@ -1,0 +1,73 @@
+import { GraphqlVsRestFitByUseCaseDiagram } from "../diagrams/graphql-vs-rest-fit-by-use-case-diagram";
+
+<Eli5 title="Không phải cửa hàng nào cũng nên đổi sang gọi món tự chọn" emoji="⚖️">
+  Gọi món tự chọn (GraphQL) rất hợp cho khách muốn ăn lồng nhiều món phức tạp, mỗi khách cần khác nhau. Nhưng quán bán đồ mang đi đơn giản (mua 1 lon nước, không cần tuỳ chọn gì) sẽ RẮC RỐI HƠN nếu bắt khách phải "viết order" GraphQL — cứ đưa thẳng qua quầy set-menu (REST) là nhanh nhất.
+
+  Và có những việc gọi món tự chọn không làm được: giao hàng cồng kềnh (upload file lớn) hay đóng gói sẵn để giao hàng loạt (cache theo URL) — những việc đó vẫn cần quy trình kiểu REST.
+</Eli5>
+
+`taskflow-api` giờ có CẢ HAI: REST `/api/v1` cho phần lớn CRUD, GraphQL `/graphql` cho những màn hình cần dữ liệu lồng linh hoạt. Bài này chốt lại tiêu chí chọn, để không rơi vào tư duy "có GraphQL rồi thì dùng cho mọi thứ".
+
+<GraphqlVsRestFitByUseCaseDiagram />
+
+<Technical>
+
+### Bảng đánh đổi
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| REST (`/api/v1`) | Đơn giản, cache HTTP theo URL (CDN/browser) hoạt động ngay, dễ debug bằng `curl`/DevTools Network, phù hợp upload file | Dữ liệu lồng sâu cần nhiều round-trip hoặc endpoint over-fetch riêng cho từng màn hình | CRUD phẳng, endpoint đọc nhiều ít đổi cần cache URL, upload file, tích hợp với hệ thống ngoài quen REST |
+| GraphQL (`/graphql`) | Client tự chọn field cần, 1 request cho dữ liệu lồng nhiều cấp, schema là hợp đồng tường minh | Luôn POST tới 1 URL cố định (mất cache theo URL), cần tự lo N+1 (DataLoader) và tự lo lại auth/org-scoping, thêm 1 tầng phải học (schema, resolver) | Dashboard/màn hình cần dữ liệu lồng đa dạng theo nhiều client khác nhau (web, mobile, đối tác thứ 3) |
+
+### File upload: một lý do cụ thể GraphQL không phù hợp
+
+B08 đã dùng presigned URL: client `PUT` trực tiếp file lên MinIO, server chỉ ký URL, không đi qua Node.js. GraphQL không có cách chuẩn hoá cho luồng multipart/binary — mọi "giải pháp" upload qua GraphQL đều là hack thêm vào bên trên spec, không mang lại lợi ích tương xứng với độ phức tạp thêm. Với `taskflow-api`, attachment vẫn nên đi qua REST + presigned URL như cũ.
+
+### Cache theo URL: lợi thế REST không có ở GraphQL
+
+REST `GET /api/v1/projects/:id` là 1 URL cố định — CDN hoặc browser cache theo chuẩn HTTP (`Cache-Control`, `ETag`) hoạt động ngay không cần code gì thêm. GraphQL gộp mọi truy vấn vào 1 endpoint `POST /graphql` với body khác nhau mỗi lần — không có URL riêng để cache theo cách đó. (Có kỹ thuật persisted queries để một phần khắc phục, nhưng đó là công cụ riêng, không phải hành vi mặc định — không nên dùng để phản bác nhược điểm này.)
+
+### CRUD đơn giản: thêm GraphQL là thêm chi phí không cần thiết
+
+Một endpoint như "lấy danh sách webhook của 1 organization" (phẳng, không lồng, không cần client tuỳ biến field) không có lý do để đi qua GraphQL. Thêm type, thêm resolver, thêm chỗ phải nhớ org-scope lại — chỉ để thay thế một `SELECT` đơn giản REST đã làm tốt — là phức tạp hoá không cần thiết, đi ngược nguyên tắc YAGNI.
+
+### Chi phí vận hành thêm: client tự chọn độ sâu query
+
+REST giới hạn độ phức tạp một request tự nhiên — mỗi route làm đúng 1 việc, không thể tự "lồng thêm" ngoài ý server. GraphQL thì ngược lại: schema ở bài 1 cho phép client viết `project { tasks { comments { author { ... } } } }`, và về lý thuyết không có gì ngăn một client (vô tình hay cố ý) viết query lồng sâu hơn nữa hoặc lặp lại field nhiều lần trong cùng request, khiến 1 request GraphQL tốn tài nguyên hơn nhiều một request REST tương đương. Production thật thường cần thêm rào chắn: giới hạn độ sâu (depth limit), giới hạn "độ phức tạp" tính theo trọng số từng field (cost analysis), hoặc giới hạn kích thước response — đây là chi phí vận hành REST không có, vì mỗi route REST vốn đã cố định độ phức tạp ngay từ lúc viết code. `taskflow-api` ở quy mô bài học chưa cần các rào chắn này, nhưng cần biết chúng tồn tại trước khi mở `/graphql` công khai cho đối tác thứ 3.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "REST vẫn phục vụ upload — không đổi từ B08", command: "curl -X PUT \"$PRESIGNED_URL\" --upload-file ./bao-cao.pdf", output: "HTTP/1.1 200 OK" },
+    { comment: "REST vẫn phục vụ endpoint đơn giản, cache được theo URL", command: "curl -sI localhost:3000/api/v1/health", output: "HTTP/1.1 200 OK\\nCache-Control: public, max-age=30" },
+    { comment: "GraphQL phục vụ đúng ca cần dữ liệu lồng đa dạng theo client", command: "curl -s -X POST localhost:3000/graphql -d '{\"query\":\"{ project(id: \\\"proj-A\\\") { name tasks { title } } }\"}'", output: '{"data":{"project":{"name":"Website Redesign","tasks":[{"title":"Viết API"}]}}}' },
+  ]}
+/>
+
+<Callout type="tip" title="Không cần chọn 1, có thể dùng cả 2 xuyên suốt vòng đời sản phẩm">
+  `taskflow-api` không "di cư" từ REST sang GraphQL — cả hai chạy song song, mỗi bên phục vụ đúng loại nhu cầu của nó. Nhiều hệ thống production thật (không chỉ bài học) cũng giữ cấu trúc lai này lâu dài, không coi GraphQL là bản nâng cấp bắt buộc thay thế REST.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "over-fetching / under-fetching", meaning: "REST trả thừa field không cần (over) hoặc thiếu field phải gọi thêm request (under) — GraphQL giải quyết bằng cách cho client tự chọn field." },
+    { term: "cache theo URL", meaning: "CDN/browser cache dựa vào GET + URL cố định — hoạt động tự nhiên với REST, không áp dụng được với GraphQL POST tới 1 URL." },
+    { term: "persisted queries", meaning: "Kỹ thuật GraphQL gửi hash thay vì toàn bộ query text để một phần lấy lại lợi ích cache — công cụ riêng, không phải hành vi mặc định." },
+    { term: "presigned URL", meaning: "URL có chữ ký tạm cho phép client PUT file trực tiếp lên object storage (B08) — REST vẫn là lựa chọn phù hợp cho luồng này." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một dev đề xuất: 'Từ giờ mọi endpoint mới của taskflow-api, kể cả GET /api/v1/organizations/:id/webhooks (danh sách phẳng, không lồng), nên viết bằng GraphQL để đồng bộ kiến trúc'. Nhận xét hợp lý nhất là gì?"
+  options={[
+    "Đồng ý hoàn toàn — đồng bộ kiến trúc luôn quan trọng hơn mọi yếu tố khác",
+    "Không hợp lý — endpoint phẳng, không lồng, không cần client tuỳ biến field thì REST đơn giản hơn và tận dụng được cache theo URL; thêm GraphQL ở đây chỉ tăng chi phí không cần thiết",
+    "Đồng ý, vì GraphQL luôn nhanh hơn REST bất kể loại dữ liệu",
+    "Không hợp lý, vì GraphQL không hỗ trợ trả về danh sách (array)",
+  ]}
+  answerIndex={1}
+  explanation="Chọn GraphQL hay REST nên dựa vào đặc điểm dữ liệu (lồng sâu, đa dạng theo client) và nhu cầu cache/upload, không phải 'đồng bộ cho đẹp'. Webhook list là ca điển hình REST vẫn thắng."
+/>
