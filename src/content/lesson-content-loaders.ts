@@ -47,4 +47,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "b01-nodejs-runtime-project-architecture": (lessonSlug) => import(`./modules/b01-nodejs-runtime-project-architecture/lessons/${lessonSlug}.mdx`),
   "b02-http-rest-api-fastify": (lessonSlug) => import(`./modules/b02-http-rest-api-fastify/lessons/${lessonSlug}.mdx`),
   "b05-authentication-jwt-refresh-token": (lessonSlug) => import(`./modules/b05-authentication-jwt-refresh-token/lessons/${lessonSlug}.mdx`),
+  "b03-validation-error-handling-api-design": (lessonSlug) => import(`./modules/b03-validation-error-handling-api-design/lessons/${lessonSlug}.mdx`),
 };

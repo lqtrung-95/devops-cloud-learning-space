@@ -1,0 +1,164 @@
+import { ErrorHandlerMappingDiagram } from "../diagrams/error-handler-mapping-diagram";
+
+<Eli5 title="setErrorHandler giống như một tổng đài duy nhất của cả toà nhà" emoji="☎️">
+  Thay vì mỗi phòng ban (route) tự đặt một cái loa riêng để thông báo sự cố — phòng thì hét "lỗi!", phòng thì dán giấy A4, phòng thì im lặng luôn — cả toà nhà chỉ có **một tổng đài** nhận mọi sự cố và trả lời bằng đúng một mẫu câu chuẩn.
+
+  Tổng đài đó phân loại sự cố: cháy nhỏ (input sai) trả lời khác, đồ đạc bị mất (không tìm thấy resource) trả lời khác, sự cố lạ chưa từng gặp (bug thật) trả lời khác — nhưng **luôn theo cùng một mẫu**, để ai gọi tới cũng hiểu ngay cách đọc câu trả lời.
+</Eli5>
+
+Lesson trước, Zod đã chặn được input xấu — nhưng response lỗi vẫn là format mặc định của Fastify (`FST_ERR_VALIDATION`, `statusCode`), không phải format chuẩn `{ error: { code, message, details } }` mà `docs/backend-curriculum.md` đã chốt cho toàn bộ 19 module. Module này lắp `setErrorHandler` — nơi DUY NHẤT quyết định response lỗi trông như thế nào, dù lỗi đến từ Zod, từ logic nghiệp vụ, hay từ một bug không ai lường trước.
+
+<ErrorHandlerMappingDiagram />
+
+<Technical>
+
+### Định nghĩa lỗi nghiệp vụ bằng class riêng
+
+```typescript title="src/errors/app-error.ts"
+export class AppError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly code: string,
+    message: string,
+    public readonly details?: unknown[],
+  ) {
+    super(message);
+    this.name = "AppError";
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(message = "Resource not found") {
+    super(404, "NOT_FOUND", message);
+  }
+}
+
+export class ConflictError extends AppError {
+  constructor(message = "Resource conflict") {
+    super(409, "CONFLICT", message);
+  }
+}
+```
+
+Handler giờ chỉ cần `throw new NotFoundError()` — không tự viết `reply.code(404).send(...)` ở từng nơi.
+
+```typescript title="src/routes/projects.route.ts"
+fastify.get("/api/v1/projects/:id", { schema: { params: projectParamsSchema } }, async (request) => {
+  const project = findProjectById(request.params.id);
+  if (!project) throw new NotFoundError(`Project ${request.params.id} not found`);
+  return project;
+});
+```
+
+### `setErrorHandler` — bộ não phân loại
+
+```typescript title="src/app.ts"
+import { ZodError } from "zod";
+import { hasZodFastifySchemaValidationErrors } from "fastify-type-provider-zod";
+import { AppError } from "./errors/app-error";
+
+fastify.setErrorHandler((error, request, reply) => {
+  // 1. Lỗi validation từ Zod schema gắn ở route
+  if (hasZodFastifySchemaValidationErrors(error)) {
+    return reply.code(422).send({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "Request không hợp lệ",
+        details: error.validation.map((item) => ({
+          path: item.instancePath || item.params?.["missingProperty"],
+          message: item.message,
+        })),
+      },
+    });
+  }
+
+  // 2. Lỗi nghiệp vụ tự định nghĩa — đã biết chính xác statusCode + code
+  if (error instanceof AppError) {
+    return reply.code(error.statusCode).send({
+      error: { code: error.code, message: error.message, details: error.details ?? [] },
+    });
+  }
+
+  // 3. Lỗi Zod ném trực tiếp (vd .parse() gọi tay ngoài route schema)
+  if (error instanceof ZodError) {
+    return reply.code(422).send({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "Request không hợp lệ",
+        details: error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
+      },
+    });
+  }
+
+  // 4. Mọi thứ còn lại — log đầy đủ, KHÔNG lộ chi tiết ra ngoài
+  request.log.error({ err: error }, "Unhandled error");
+  return reply.code(500).send({
+    error: { code: "INTERNAL_ERROR", message: "Đã có lỗi xảy ra, vui lòng thử lại sau", details: [] },
+  });
+});
+```
+
+Thứ tự kiểm tra quan trọng: `AppError` cụ thể phải được bắt trước nhánh "mọi thứ còn lại", nếu không mọi lỗi nghiệp vụ sẽ rơi vào nhánh `500` chung chung.
+
+### Vì sao không trả `error.message` gốc ở nhánh 500
+
+| Cách làm | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Trả nguyên `error.message`/`stack` | Debug nhanh lúc dev | Rò tên bảng, câu SQL, đường dẫn nội bộ cho client | Không bao giờ ở production |
+| Trả message chung + log server-side | An toàn, vẫn debug được qua log + `requestId` | Cần hạ tầng log tốt (nối tới B16 Observability) | Luôn dùng cách này |
+
+`request.log.error` (pino, có sẵn từ B01) ghi đầy đủ error xuống log server — nơi chỉ người có quyền truy cập mới đọc được, khác hẳn response trả thẳng ra Internet.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Input thiếu field — giờ đã đúng format chuẩn 422",
+      command: "curl -s -X POST localhost:3000/api/v1/tasks -H 'Content-Type: application/json' -d '{}' -w '\\n%{http_code}\\n'",
+      output: '{"error":{"code":"VALIDATION_ERROR","message":"Request không hợp lệ","details":[{"path":"","message":"must have required property \'title\'"}]}}\n422',
+    },
+    {
+      comment: "Xin project không tồn tại — NotFoundError qua setErrorHandler",
+      command: "curl -s localhost:3000/api/v1/projects/00000000-0000-0000-0000-000000000000 -w '\\n%{http_code}\\n'",
+      output: '{"error":{"code":"NOT_FOUND","message":"Project 00000000-0000-0000-0000-000000000000 not found","details":[]}}\n404',
+    },
+    {
+      comment: "Xem log server khi có lỗi 500 (đã ẩn khỏi response)",
+      command: "docker compose logs api --tail 5",
+      output: '{"level":50,"time":1714550000000,"msg":"Unhandled error","err":{"type":"Error","message":"connect ECONNREFUSED 127.0.0.1:5434"}}',
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Quên đặt nhánh `AppError` TRƯỚC nhánh "còn lại" (`else`) — kết quả là `NotFoundError` (nên trả `404`) lại rơi vào nhánh `500` chung chung. Luôn kiểm tra `instanceof` từ cụ thể tới chung chung.
+</Callout>
+
+<Callout type="warning">
+  Đừng bao giờ nội suy trực tiếp input người dùng vào `message` mà không escape khi message đó có thể chứa dữ liệu nhạy cảm (vd token, password field value) — dù chỉ để debug. Log cũng là nơi có thể bị đọc trộm.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "setErrorHandler", meaning: "Hook Fastify chạy khi bất kỳ lỗi nào (throw hoặc validation) xảy ra trong vòng đời request." },
+    { term: "AppError", meaning: "Class lỗi nghiệp vụ tự định nghĩa, mang sẵn statusCode + code để error handler map thẳng." },
+    { term: "VALIDATION_ERROR / NOT_FOUND / INTERNAL_ERROR", meaning: "Các mã lỗi (`code`) chuẩn dùng xuyên suốt course, khớp response format đã chốt." },
+    { term: "request.log", meaning: "Logger pino gắn sẵn theo từng request, dùng để log lỗi server-side an toàn." },
+    { term: "instanceof", meaning: "Kiểm tra một object có phải instance của một class cụ thể — cách phân loại lỗi trong error handler." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một endpoint ném `throw new ConflictError('Slug đã tồn tại')`. `setErrorHandler` nên trả response nào?"
+  options={[
+    "500 với code INTERNAL_ERROR",
+    "422 với code VALIDATION_ERROR",
+    "409 với code CONFLICT và message \"Slug đã tồn tại\"",
+    "200 với data: null"
+  ]}
+  answerIndex={2}
+  explanation="ConflictError kế thừa AppError với statusCode=409, code=CONFLICT sẵn trong constructor — nhánh `error instanceof AppError` trả đúng statusCode và code đã gắn sẵn, không phải 500 hay 422."
+/>

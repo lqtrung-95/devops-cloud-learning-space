@@ -1,0 +1,161 @@
+import { OpenapiSingleSourceDiagram } from "../diagrams/openapi-single-source-diagram";
+
+<Eli5 title="OpenAPI tự sinh giống như bản đồ toà nhà tự vẽ lại mỗi khi có phòng mới" emoji="🗺️">
+  Nếu bạn tự vẽ tay một tấm bản đồ toà nhà, mỗi lần thêm phòng mới bạn phải nhớ sửa CẢ toà nhà thật LẪN tấm bản đồ. Quên sửa bản đồ — khách đến sẽ đi lạc.
+
+  `@fastify/swagger` là một cái máy quét: nó đọc CHÍNH cấu trúc phòng ốc thật (schema Zod bạn đã viết để validate) và tự vẽ bản đồ (`/docs`) từ đó. Sửa phòng thật, bản đồ tự cập nhật theo — không còn hai nơi phải nhớ sửa.
+</Eli5>
+
+Còn hai việc cuối để hoàn thiện API design của `taskflow-api`: đảm bảo request `POST` quan trọng không bị lặp khi client retry (idempotency), và cho client bên ngoài một tấm bản đồ đáng tin cậy để tự khám phá API mà không cần đọc code.
+
+<Technical title="Idempotency cho POST quan trọng">
+
+### Vấn đề: client retry khi mất mạng
+
+Client gọi `POST /api/v1/tasks`, mạng chập chờn, client không nhận được response nên **tự động gửi lại** cùng request. Nếu request đầu tiên thực ra đã thành công (chỉ là response bị mất trên đường về), server sẽ tạo **hai** task giống hệt nhau.
+
+### Idempotency key — kiểm tra TRƯỚC khi thực thi
+
+Giải pháp: client gửi kèm header `Idempotency-Key` (một UUID tự sinh ở phía client cho MỖI thao tác logic, không phải mỗi HTTP request). Server lưu lại key này cùng kết quả của lần xử lý đầu tiên. Điểm bắt buộc: **server phải tra key này TRƯỚC khi chạy side effect** (tạo task), không phải sau.
+
+```typescript title="src/plugins/idempotency.ts"
+import type { FastifyRequest, FastifyReply } from "fastify";
+
+// Map tạm thời — thực tế nên dùng Redis (có TTL) khi taskflow-api có Redis từ B09
+const idempotencyStore = new Map<string, { statusCode: number; body: unknown }>();
+
+export async function checkIdempotencyKey(request: FastifyRequest, reply: FastifyReply) {
+  const key = request.headers["idempotency-key"];
+  if (!key || typeof key !== "string") return; // header optional — route tự quyết định có bắt buộc hay không
+
+  const cached = idempotencyStore.get(key);
+  if (cached) {
+    // Đã xử lý key này trước đó — trả lại CHÍNH XÁC kết quả cũ, không chạy lại side effect
+    reply.code(cached.statusCode).send(cached.body);
+    return reply; // báo Fastify dừng lifecycle tại đây, không vào handler
+  }
+}
+
+export function saveIdempotencyResult(key: string | undefined, statusCode: number, body: unknown) {
+  if (key) idempotencyStore.set(key, { statusCode, body });
+}
+```
+
+```typescript title="src/routes/tasks.route.ts"
+fastify.post(
+  "/api/v1/tasks",
+  { schema: { body: createTaskBodySchema }, preHandler: checkIdempotencyKey },
+  async (request, reply) => {
+    const task = createTask(request.body); // side effect thật sự
+    saveIdempotencyResult(request.headers["idempotency-key"] as string | undefined, 201, task);
+    return reply.code(201).send(task);
+  },
+);
+```
+
+`preHandler` chạy TRƯỚC handler chính — đây chính là "kiểm tra trước khi thực thi side effect". Nếu đặt logic kiểm tra key BÊN TRONG handler, sau dòng `createTask(...)`, thì side effect đã lỡ chạy — mất hết ý nghĩa chống trùng, dù code trông có vẻ tương tự.
+
+<Callout type="warning">
+  Idempotency key chỉ có tác dụng nếu được tra và lưu ở đúng nơi (trước side effect, trong cùng transaction về mặt logic). Kiểm tra key SAU khi đã `createTask` chỉ giúp client thứ hai nhận response nhanh hơn — task trùng đã được tạo trước đó rồi.
+</Callout>
+
+</Technical>
+
+<OpenapiSingleSourceDiagram />
+
+<Technical title="Tự sinh OpenAPI từ schema Zod đang dùng để validate">
+
+### Cài đặt và đăng ký plugin
+
+```typescript title="src/app.ts"
+import fastifySwagger from "@fastify/swagger";
+import fastifySwaggerUi from "@fastify/swagger-ui";
+import { jsonSchemaTransform } from "fastify-type-provider-zod";
+
+await fastify.register(fastifySwagger, {
+  openapi: {
+    info: { title: "taskflow-api", version: "1.0.0" },
+    servers: [{ url: "http://localhost:3000" }],
+  },
+  transform: jsonSchemaTransform, // chuyển Zod schema đã gắn ở route sang JSON Schema cho OpenAPI
+});
+
+await fastify.register(fastifySwaggerUi, {
+  routePrefix: "/docs",
+});
+```
+
+`jsonSchemaTransform` là mấu chốt: nó đọc ĐÚNG object schema Zod bạn đã truyền vào `{ schema: { body: createTaskBodySchema } }` ở mỗi route — không phải một định nghĩa OpenAPI viết tay riêng trong file `.yaml`.
+
+### Một nguồn sự thật — không phải trùng hợp
+
+| Cách làm | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Viết OpenAPI `.yaml`/`.json` tay, tách biệt code validate | Kiểm soát format tài liệu chi tiết hơn | Rất dễ lệch: sửa schema code quên sửa doc (hoặc ngược lại) | API cực kỳ ổn định, có team docs riêng |
+| Sinh OpenAPI từ CHÍNH schema validate (Zod → `jsonSchemaTransform`) | Doc luôn khớp 100% với validate thật đang chạy | Format OpenAPI phụ thuộc cách Zod schema được viết | Mặc định cho hầu hết team — đúng cách `taskflow-api` chọn |
+
+Đây là nguyên tắc chung "một nguồn sự thật" (single source of truth) — cùng nguyên lý với việc dùng `z.infer` để suy type thay vì viết interface trùng lặp ở lesson đầu module này.
+
+### Thêm mô tả cho response (tuỳ chọn nhưng nên làm)
+
+```typescript title="src/routes/tasks.route.ts"
+fastify.post(
+  "/api/v1/tasks",
+  {
+    schema: {
+      body: createTaskBodySchema,
+      response: { 201: taskResponseSchema },
+      tags: ["tasks"],
+      summary: "Tạo task mới trong project",
+    },
+  },
+  async (request, reply) => {
+    /* ... */
+  },
+);
+```
+
+`response` schema vừa validate output (bắt lỗi nếu handler trả thiếu field) vừa xuất hiện trong `/docs` như một ví dụ response mẫu.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài 2 plugin", command: "pnpm add @fastify/swagger @fastify/swagger-ui" },
+    { comment: "Gọi POST 2 lần với cùng Idempotency-Key", command: "curl -s -X POST localhost:3000/api/v1/tasks -H 'Idempotency-Key: abc-123' -H 'Content-Type: application/json' -d '{\"title\":\"Deploy prod\"}' -o first.json -w '%{http_code}\\n'", output: "201" },
+    { comment: "Gọi lại lần 2 — nhận ĐÚNG response cũ, không tạo task mới", command: "curl -s -X POST localhost:3000/api/v1/tasks -H 'Idempotency-Key: abc-123' -H 'Content-Type: application/json' -d '{\"title\":\"Deploy prod\"}' -o second.json -w '%{http_code}\\n' && diff first.json second.json && echo 'IDENTICAL'", output: "201\nIDENTICAL" },
+    { comment: "Mở Swagger UI xem toàn bộ route", command: "open http://localhost:3000/docs" },
+  ]}
+/>
+
+<Callout type="tip">
+  Kiểm chứng "một nguồn sự thật" bằng cách cố tình đổi một ràng buộc trong `createTaskBodySchema` (vd `.min(1)` thành `.min(3)`), reload `/docs`, và xác nhận trang docs cũng đổi theo NGAY LẬP TỨC — không cần sửa thêm chỗ nào khác.
+</Callout>
+
+<Callout type="mistake">
+  Đặt `checkIdempotencyKey` là bắt buộc (`required`) cho MỌI route `POST`, kể cả những route không có side effect nguy hiểm khi lặp (vd endpoint chỉ đọc + ghi log không quan trọng) — làm tăng độ phức tạp không cần thiết. Chỉ bắt buộc cho POST có side effect thật sự tốn kém khi trùng (tạo task, tạo thanh toán...).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Idempotency key", meaning: "Định danh do client sinh cho một thao tác logic, giúp server nhận ra và bỏ qua các lần retry trùng." },
+    { term: "preHandler", meaning: "Hook Fastify chạy trước handler chính — đúng chỗ để kiểm tra idempotency key trước khi thực thi side effect." },
+    { term: "OpenAPI", meaning: "Chuẩn mô tả REST API (endpoint, schema request/response) mà công cụ như Swagger UI có thể đọc và hiển thị." },
+    { term: "jsonSchemaTransform", meaning: "Hàm chuyển schema Zod đã gắn ở route sang JSON Schema để @fastify/swagger sinh OpenAPI." },
+    { term: "Single source of truth", meaning: "Nguyên tắc chỉ định nghĩa một cấu trúc dữ liệu ở đúng một nơi, mọi chỗ khác (validate, doc, type) đều suy ra từ đó." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao đặt logic kiểm tra `Idempotency-Key` bên trong `preHandler` thay vì ở đầu route handler (sau khi đã gọi `createTask`)?"
+  options={[
+    "Vì preHandler chạy nhanh hơn về mặt kỹ thuật",
+    "Vì preHandler chạy TRƯỚC side effect — chặn được request trùng trước khi task thứ hai kịp được tạo",
+    "Vì Fastify không cho phép gọi service layer bên trong handler chính",
+    "Không có khác biệt, chỉ là quy ước code style"
+  ]}
+  answerIndex={1}
+  explanation="Mục đích của idempotency key là ngăn side effect chạy lần thứ hai. Kiểm tra ở preHandler đảm bảo request trùng bị chặn TRƯỚC khi createTask() có cơ hội chạy; kiểm tra sau đó thì đã quá muộn."
+/>

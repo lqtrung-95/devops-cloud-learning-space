@@ -1,0 +1,117 @@
+import { CursorVsOffsetPaginationDiagram } from "../diagrams/cursor-vs-offset-pagination-diagram";
+
+<Eli5 title="Cursor giống như nhớ tên khách cuối cùng đã phục vụ, offset giống như đếm số ghế" emoji="🎫">
+  Tưởng tượng một quầy phát số ở bệnh viện. Cách **offset**: "phát tiếp cho người thứ 21 đến 30" — đếm theo vị trí tuyệt đối trong hàng. Nếu có người chen ngang lên đầu hàng, mọi số thứ tự phía sau đều lệch — người thứ 21 giờ là một người khác, có thể là người vừa được gọi rồi.
+
+  Cách **cursor**: "phát tiếp cho những người đến SAU anh Ba" (người cuối cùng vừa được gọi). Dù ai đó chen ngang lên đầu hàng, "sau anh Ba" vẫn luôn đúng là nhóm người đó — không đếm số, chỉ neo vào một mốc cụ thể.
+</Eli5>
+
+`GET /api/v1/tasks` hiện trả toàn bộ task cùng lúc (từ B02). Khi dữ liệu lớn dần, client cần phân trang — và curriculum của course đã chốt **cursor pagination**, không phải offset/`page`, cho toàn bộ 19 module. Lesson này giải thích tại sao, bằng một ví dụ cụ thể có dữ liệu thay đổi giữa hai lần gọi trang.
+
+<CursorVsOffsetPaginationDiagram />
+
+<Technical>
+
+### Offset pagination lệch khi nào
+
+Offset (`?offset=20&limit=10`, hay tương đương `?page=3&pageSize=10`) đếm theo **vị trí tuyệt đối** trong tập kết quả tại THỜI ĐIỂM gọi. Vấn đề: giữa lúc client gọi trang 1 và trang 2, dữ liệu backend có thể đã đổi:
+
+- **Insert ở đầu danh sách** (task mới nhất, nếu sort theo mới nhất trước) → mọi vị trí phía sau bị đẩy lùi 1 → trang 2 **trả trùng** bản ghi cuối trang 1.
+- **Delete một bản ghi đã ở phía trước offset** → mọi vị trí phía sau bị kéo lên 1 → trang 2 **bỏ sót** một bản ghi lẽ ra phải thấy.
+
+Cả hai lỗi đều âm thầm — client không nhận được lỗi nào, chỉ là dữ liệu sai mà không biết.
+
+### Cursor pagination: neo vào một bản ghi, không đếm số
+
+Cursor là thông tin đủ để nói: "cho tôi các bản ghi SAU bản ghi này, theo đúng thứ tự sort đang dùng". Với `tasks` sort theo `createdAt` giảm dần, cursor hợp lý là `createdAt` (hoặc `id`, hoặc kết hợp cả hai nếu `createdAt` có thể trùng) của bản ghi cuối cùng đã trả.
+
+```typescript title="src/schemas/task.schema.ts"
+import { z } from "zod";
+
+export const listTasksQuerySchema = z.object({
+  cursor: z.string().optional(), // base64 của createdAt bản ghi cuối trang trước
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+```
+
+```typescript title="src/routes/tasks.route.ts"
+import { listTasksQuerySchema } from "../schemas/task.schema";
+
+function encodeCursor(createdAt: Date): string {
+  return Buffer.from(createdAt.toISOString()).toString("base64url");
+}
+
+function decodeCursor(cursor: string): Date {
+  return new Date(Buffer.from(cursor, "base64url").toString("utf8"));
+}
+
+fastify.get("/api/v1/tasks", { schema: { querystring: listTasksQuerySchema } }, async (request) => {
+  const { cursor, limit } = request.query;
+
+  let filtered = [...allTasks].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  if (cursor) {
+    const cursorDate = decodeCursor(cursor);
+    filtered = filtered.filter((task) => task.createdAt.getTime() < cursorDate.getTime());
+  }
+
+  const page = filtered.slice(0, limit);
+  const lastTask = page.at(-1);
+
+  return {
+    data: page,
+    meta: { cursor: lastTask ? encodeCursor(lastTask.createdAt) : null },
+  };
+});
+```
+
+Điểm mấu chốt: điều kiện lọc là `createdAt < cursor đã giải mã` — **tương đối** với một bản ghi cụ thể, không phải "bỏ qua N bản ghi đầu tiên". Dù có insert/delete ở bất kỳ đâu KHÔNG liên quan tới vùng đã duyệt qua, điều kiện này vẫn đúng.
+
+### So sánh nhanh
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Offset (`page`/`pageSize`) | Nhảy thẳng tới trang bất kỳ (`page=5`); dễ hiểu, dễ hiển thị số trang | Lệch dữ liệu khi có insert/delete giữa các lần gọi; chậm dần với `OFFSET` lớn trên DB thật | Dữ liệu gần như tĩnh, cần UI phân trang có số trang |
+| Cursor (`cursor`/`limit`) | Ổn định dù dữ liệu đổi liên tục; hiệu năng ổn định với DB lớn (`WHERE created_at < ?` dùng index tốt) | Không nhảy thẳng tới "trang 5" được, chỉ đi tuần tự | Feed dữ liệu thay đổi liên tục (task list, activity log, timeline) — đúng trường hợp `taskflow-api` |
+
+`taskflow-api` chọn cursor cho MỌI danh sách vì dữ liệu (task, notification, activity log) thay đổi liên tục trong lúc người dùng đang xem — đúng kịch bản offset dễ lệch nhất.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Trang đầu, limit 2", command: "curl -s 'localhost:3000/api/v1/tasks?limit=2'", output: '{"data":[{"id":"...","title":"T6","createdAt":"2024-05-03T10:00:00Z"},{"id":"...","title":"T5","createdAt":"2024-05-02T09:00:00Z"}],"meta":{"cursor":"MjAyNC0wNS0wMlQwOTowMDowMFo"}}' },
+    { comment: "Trang tiếp theo, dùng cursor vừa nhận", command: "curl -s 'localhost:3000/api/v1/tasks?limit=2&cursor=MjAyNC0wNS0wMlQwOTowMDowMFo'", output: '{"data":[{"id":"...","title":"T4","createdAt":"2024-05-01T08:00:00Z"},{"id":"...","title":"T3","createdAt":"2024-04-30T08:00:00Z"}],"meta":{"cursor":"MjAyNC0wNC0zMFQwODowMDowMFo"}}' },
+    { comment: "Hết dữ liệu — cursor trả về null", command: "curl -s 'localhost:3000/api/v1/tasks?limit=20&cursor=<cursor-cuoi>'", output: '{"data":[],"meta":{"cursor":null}}' },
+  ]}
+/>
+
+<Callout type="tip">
+  Test tính đúng đắn của cursor bằng chính kịch bản gây lỗi cho offset: gọi trang 1, TẠO một task mới, rồi gọi trang 2 bằng cursor vừa nhận — xác nhận không trùng, không thiếu so với trước khi tạo task mới.
+</Callout>
+
+<Callout type="mistake">
+  Dùng `id` (uuid) làm cursor mà KHÔNG sort theo `id` — uuid không có thứ tự thời gian, `WHERE id > cursor` không đảm bảo trả đúng "các bản ghi tiếp theo" nếu list đang sort theo `createdAt`. Cursor phải khớp đúng cột đang dùng để `ORDER BY`.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Offset pagination", meaning: "Phân trang bằng đếm vị trí tuyệt đối (`offset`/`page`) — lệch khi dữ liệu thay đổi giữa các lần gọi." },
+    { term: "Cursor pagination", meaning: "Phân trang bằng neo vào một bản ghi cụ thể (`createdAt`/`id` cuối trang trước) — ổn định dù dữ liệu đổi." },
+    { term: "meta.cursor", meaning: "Field chuẩn của course chứa cursor cho trang tiếp theo, `null` khi đã hết dữ liệu." },
+    { term: "base64url", meaning: "Encoding an toàn để nhúng giá trị (như timestamp) vào query string mà không cần escape ký tự đặc biệt." },
+  ]}
+/>
+
+<QuickCheck
+  question="Đang xem trang 1 của `GET /tasks` (offset-based, offset=0 limit=5). Trong lúc đó một task ở VỊ TRÍ thứ 2 (đã nằm trong trang 1) bị XOÁ. Gọi trang 2 (offset=5) tiếp theo có khả năng gặp lỗi gì?"
+  options={[
+    "Không ảnh hưởng vì task bị xoá đã ở trang 1 rồi",
+    "Trang 2 bỏ sót 1 bản ghi lẽ ra phải xuất hiện, vì mọi vị trí phía sau bị kéo lên 1 bậc",
+    "Server trả lỗi 409 Conflict",
+    "Trang 2 tự động tăng limit lên 6 để bù lại"
+  ]}
+  answerIndex={1}
+  explanation="Xoá 1 bản ghi ở vị trí trước offset kéo mọi bản ghi phía sau lên 1 bậc. offset=5 giờ trỏ vào bản ghi lẽ ra ở vị trí thứ 6 — bản ghi đáng lẽ nằm ở vị trí 5 (mà client chưa từng thấy) bị bỏ qua hoàn toàn."
+/>

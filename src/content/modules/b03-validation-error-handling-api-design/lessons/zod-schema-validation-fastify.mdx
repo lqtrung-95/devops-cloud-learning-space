@@ -1,0 +1,155 @@
+import { ZodValidationFlowDiagram } from "../diagrams/zod-validation-flow-diagram";
+
+<Eli5 title="Zod giống như trạm kiểm tra hộ chiếu ở sân bay" emoji="🛂">
+  B02 dựng xong cửa vào (route) nhưng chưa ai đứng gác — ai đưa hành lý gì vào cũng được nhận vào máy bay (handler).
+
+  **Zod** là nhân viên kiểm tra hộ chiếu đứng trước cửa: kiểm tra đúng loại giấy tờ (kiểu dữ liệu), đúng thông tin bắt buộc (field required), trước khi bạn được bước qua cửa. Nếu thiếu giấy tờ, bạn bị chặn lại ngay tại quầy — không cần đợi đến khi ngồi vào ghế máy bay rồi mới phát hiện ra vé sai.
+
+  Cái hay của việc để Fastify gọi Zod: nhân viên gác cửa này chạy **trước** khi handler (phi hành đoàn) phải xử lý bất kỳ điều gì.
+</Eli5>
+
+Đến giờ, mọi route CRUD của `projects`/`tasks` (từ B02) đều tin tưởng mù quáng vào `request.body`. Gửi `{}` rỗng, gửi `title: 123` (số thay vì chuỗi), hay gửi thiếu field — code vẫn chạy tiếp và có thể crash ở một dòng xa tít bên trong, rất khó debug. Từ module này, mọi input xấu bị chặn ngay tại cửa, với thông báo rõ ràng field nào sai.
+
+<ZodValidationFlowDiagram />
+
+<Technical>
+
+### Vì sao không tự viết `if` kiểm tra tay
+
+```typescript
+// Cách cũ — dễ quên, dễ lệch giữa các route
+fastify.post("/api/v1/tasks", async (request, reply) => {
+  const body = request.body as { title?: string };
+  if (!body.title || typeof body.title !== "string" || body.title.length === 0) {
+    return reply.code(400).send({ message: "title is required" }); // sai format, sai status code
+  }
+  // ...
+});
+```
+
+Vấn đề: mỗi route viết một kiểu, dễ quên field, và format lỗi trả về không đồng nhất giữa các endpoint. Zod giải quyết cả ba: khai báo schema một lần, TypeScript tự suy ra type, và (ở lesson sau) mọi lỗi validate đi qua đúng một `setErrorHandler`.
+
+### Khai báo schema với Zod
+
+```typescript title="src/schemas/task.schema.ts"
+import { z } from "zod";
+
+export const taskStatusSchema = z.enum(["todo", "in_progress", "done"]);
+
+export const createTaskBodySchema = z.object({
+  title: z.string().min(1, "title không được để trống"),
+  description: z.string().optional(),
+  status: taskStatusSchema.default("todo"),
+});
+
+export const taskParamsSchema = z.object({
+  id: z.string().uuid("id phải là UUID hợp lệ"),
+});
+
+// z.infer suy ra type TypeScript trực tiếp từ schema — không viết interface trùng lặp
+export type CreateTaskBody = z.infer<typeof createTaskBodySchema>;
+```
+
+`z.infer<typeof schema>` là lý do bạn không cần viết `interface CreateTaskBody { ... }` song song — schema chính là nguồn sự thật cho cả validate lẫn type.
+
+### Gắn schema vào Fastify bằng type provider
+
+Fastify 5 hỗ trợ "type provider" — một adapter dịch schema của thư viện khác (Zod, TypeBox…) sang format Fastify hiểu, và cho TypeScript biết `request.body` đã có type gì sau khi validate.
+
+```typescript title="src/app.ts"
+import Fastify from "fastify";
+import { validatorCompiler, serializerCompiler, type ZodTypeProvider } from "fastify-type-provider-zod";
+
+const fastify = Fastify({ logger: true })
+  .setValidatorCompiler(validatorCompiler)
+  .setSerializerCompiler(serializerCompiler)
+  .withTypeProvider<ZodTypeProvider>();
+```
+
+```typescript title="src/routes/tasks.route.ts"
+import { createTaskBodySchema, taskParamsSchema } from "../schemas/task.schema";
+
+fastify.post(
+  "/api/v1/tasks",
+  { schema: { body: createTaskBodySchema } },
+  async (request, reply) => {
+    // request.body đã có type CreateTaskBody, không cần "as" ép kiểu
+    const task = createTask(request.body);
+    return reply.code(201).send(task);
+  },
+);
+
+fastify.patch(
+  "/api/v1/tasks/:id",
+  { schema: { params: taskParamsSchema, body: createTaskBodySchema.partial() } },
+  async (request, reply) => {
+    const task = updateTask(request.params.id, request.body);
+    return reply.send(task);
+  },
+);
+```
+
+`.partial()` biến mọi field thành optional — đúng ngữ nghĩa `PATCH` (chỉ sửa field được gửi lên), khác với `POST` cần đủ field bắt buộc.
+
+### `body` vs `querystring` vs `params`
+
+| Vị trí | Dùng cho | Ví dụ trong `taskflow-api` |
+|---|---|---|
+| `body` | Dữ liệu tạo/sửa resource | `title`, `status` khi tạo task |
+| `querystring` | Lọc, phân trang, sort | `?status=done`, `?cursor=...&limit=20` |
+| `params` | Định danh resource trong URL | `:id` trong `/tasks/:id` |
+
+Ba vị trí này validate độc lập — sai ở `params` (id không phải UUID) vẫn bị chặn dù `body` hoàn toàn đúng.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài Zod và type provider cho Fastify", command: "pnpm add zod fastify-type-provider-zod" },
+    {
+      comment: "Body hợp lệ — 201 như bình thường",
+      command: "curl -s -X POST localhost:3000/api/v1/tasks -H 'Content-Type: application/json' -d '{\"title\":\"Viết báo cáo\"}' -w '\\n%{http_code}\\n'",
+      output: '{"id":"a1b2...","title":"Viết báo cáo","status":"todo","createdAt":"2024-05-01T08:00:00.000Z"}\n201',
+    },
+    {
+      comment: "Thiếu title — Fastify chặn trước khi vào handler",
+      command: "curl -s -X POST localhost:3000/api/v1/tasks -H 'Content-Type: application/json' -d '{}' -w '\\n%{http_code}\\n'",
+      output: '{"statusCode":400,"code":"FST_ERR_VALIDATION","error":"Bad Request","message":"body must have required property \'title\'"}\n400',
+    },
+    {
+      comment: "id không phải UUID — params schema chặn",
+      command: "curl -s localhost:3000/api/v1/tasks/khong-phai-uuid -w '\\n%{http_code}\\n'",
+      output: '{"statusCode":400,"code":"FST_ERR_VALIDATION","error":"Bad Request","message":"params/id must match format \\"uuid\\""}\n400',
+    },
+  ]}
+/>
+
+Format lỗi ở trên (`FST_ERR_VALIDATION`, `statusCode`) là format mặc định của Fastify — **chưa** phải format chuẩn `{ error: { code, message, details } }` mà course quy định. Lesson tiếp theo sẽ bắt chính lỗi này ở `setErrorHandler` và chuyển thành đúng shape `422`.
+
+<Callout type="mistake">
+  Đừng gắn schema kiểu `body: z.any()` "cho chắc rồi tính sau" — làm vậy Zod không chặn được gì cả, và mọi lợi ích type-safety cũng biến mất. Viết schema chặt ngay từ đầu, dù chỉ 2-3 field.
+</Callout>
+
+<Callout type="warning">
+  `z.string()` không tự động loại bỏ khoảng trắng thừa hay chuỗi chỉ toàn dấu cách. Nếu cần, dùng `.trim().min(1)` — `"   ".length` là 3, không phải 0, nên `.min(1)` một mình không bắt được chuỗi toàn khoảng trắng.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Zod schema", meaning: "Khai báo cấu trúc dữ liệu mong đợi (kiểu, bắt buộc/optional, ràng buộc) bằng code, dùng để validate lúc runtime." },
+    { term: "z.infer<typeof schema>", meaning: "Suy ra type TypeScript trực tiếp từ schema Zod — schema là nguồn sự thật duy nhất." },
+    { term: "Type provider", meaning: "Adapter cho Fastify biết cách đọc schema của một thư viện validate cụ thể (ở đây là Zod)." },
+    { term: "validatorCompiler", meaning: "Hàm Fastify gọi để validate request theo schema đã gắn, trước khi handler chạy." },
+    { term: "body / querystring / params", meaning: "Ba vị trí độc lập trong request mà Fastify validate riêng biệt." },
+    { term: ".partial()", meaning: "Biến mọi field trong schema Zod thành optional — dùng cho PATCH." },
+  ]}
+/>
+
+<QuickCheck
+  question="Route `PATCH /api/v1/tasks/:id` chỉ nhận `{ status: 'done' }` (không có `title`). Schema nào đúng cho `body` nếu `createTaskBodySchema` yêu cầu `title` bắt buộc?"
+  options={["createTaskBodySchema", "createTaskBodySchema.optional()", "createTaskBodySchema.partial()", "z.any()"]}
+  answerIndex={2}
+  explanation="`.partial()` biến toàn bộ field (kể cả title) thành optional, đúng ngữ nghĩa PATCH — chỉ gửi field muốn sửa. `.optional()` chỉ áp cho toàn bộ object (có hoặc không gửi body), không giúp từng field bên trong optional."
+/>
