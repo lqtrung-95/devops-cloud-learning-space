@@ -1,0 +1,124 @@
+import { OrganizationScopedQueryDiagram } from "../diagrams/organization-scoped-query-diagram";
+
+<Eli5 title="Kho hàng chung cư: mỗi hộ có ngăn riêng, nhân viên kho phải nhìn đúng nhãn ngăn" emoji="📦">
+  Một nhà kho chứa đồ cho CẢ chung cư — mỗi căn hộ có một dãy kệ riêng, đánh số theo mã căn hộ. Khi ai đó tới lấy thùng đồ số `47`, nhân viên kho không được chỉ nhìn số `47` rồi đưa luôn — phải kiểm tra thêm: "thùng số `47` này có đúng nằm trong dãy kệ của căn hộ bạn không?".
+
+  Nếu kho chỉ có MỘT nhãn duy nhất (số thùng) mà không gắn kèm mã căn hộ trên chính giá để đồ, nhân viên rất dễ đưa nhầm thùng của căn khác — nhất là khi số thùng trùng lặp giữa các căn hộ hoặc khi thùng được chuyển qua nhiều tầng trung gian.
+</Eli5>
+
+`taskflow-api` là kho hàng đó: `organizations` là các căn hộ, `projects`/`tasks` là các thùng đồ. Vấn đề là không phải route nào cũng có sẵn "mã căn hộ" (`organizationId`) ngay trong URL — bài này giải quyết câu hỏi: **tổ chức hiện tại được xác định từ đâu, và câu query phải lọc thế nào để không bao giờ đưa nhầm**.
+
+<OrganizationScopedQueryDiagram />
+
+<Technical>
+
+### Hai kiểu route, hai cách biết organization
+
+`taskflow-api` từ B02–B04 đã có route CRUD phẳng cho `projects`/`tasks` (`/api/v1/projects/:id`, `/api/v1/tasks/:id`) — những route này **không đổi tên, không đổi shape** ở module này. B06 chỉ thêm:
+
+1. **Route mới, có `organizationId` ngay trong path** — dùng cho hành động luôn cần biết "tạo/liệt kê CHO tổ chức nào": `POST /api/v1/organizations/:organizationId/projects`, `GET /api/v1/organizations/:organizationId/projects`.
+2. **Route cũ, không có `organizationId` trong path** — `GET/PATCH/DELETE /api/v1/projects/:id`, `GET/PATCH/DELETE /api/v1/tasks/:id`. Với nhóm này, middleware phải tự tra ra tổ chức từ chính resource:
+   - `projects` có sẵn cột `organization_id` → tra thẳng: `SELECT organization_id FROM projects WHERE id = $1`.
+   - `tasks` KHÔNG có cột `organization_id` → phải JOIN qua `projects`: `tasks.project_id = projects.id` rồi lấy `projects.organization_id`.
+
+```ts title="src/db/queries/organization-lookup.ts"
+import { eq } from "drizzle-orm";
+import { db } from "../client.js";
+import { projects, tasks } from "../schema.js";
+
+// Project: organization_id nằm ngay trên bảng, không cần JOIN.
+export async function findOrganizationIdForProject(projectId: string) {
+  const [row] = await db
+    .select({ organizationId: projects.organizationId })
+    .from(projects)
+    .where(eq(projects.id, projectId));
+  return row?.organizationId ?? null;
+}
+
+// Task: phải JOIN qua projects để lấy organization_id.
+export async function findOrganizationIdForTask(taskId: string) {
+  const [row] = await db
+    .select({ organizationId: projects.organizationId })
+    .from(tasks)
+    .innerJoin(projects, eq(projects.id, tasks.projectId))
+    .where(eq(tasks.id, taskId));
+  return row?.organizationId ?? null;
+}
+```
+
+### Lọc trong WHERE mạnh hơn kiểm tra sau khi fetch
+
+Có hai cách viết route xoá project nghe có vẻ tương đương:
+
+```ts title="Cách A — fetch rồi kiểm tra bằng code (yếu hơn)"
+const project = await db.select().from(projects).where(eq(projects.id, id));
+if (project.organizationId !== request.organizationId) {
+  return reply.code(404).send(/* ... */); // dễ QUÊN dòng if này ở một route khác
+}
+await db.delete(projects).where(eq(projects.id, id));
+```
+
+```ts title="Cách B — lọc ngay trong câu lệnh xoá (khuyến nghị mặc định)"
+const result = await db
+  .delete(projects)
+  .where(and(eq(projects.id, id), eq(projects.organizationId, request.organizationId)));
+if (result.rowCount === 0) {
+  return reply.code(404).send(/* ... */); // đơn giản: không xoá được gì nghĩa là không có quyền/không tồn tại
+}
+```
+
+Cách A **vẫn đúng nếu làm cẩn thận** — nhưng độ an toàn của nó phụ thuộc vào việc lập trình viên nhớ viết đúng điều kiện `if` ở MỌI route đụng tới resource theo id, và nhớ mãi mãi kể cả khi có người khác thêm route mới sau này. Cách B đặt điều kiện ngay trong câu lệnh ghi/xoá — quên đưa `organizationId` vào hàm thì query gần như chắc chắn lỗi kiểu ngay khi test (thiếu biến), thay vì âm thầm chạy đúng cú pháp nhưng sai logic.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Fetch rồi so sánh trong code (Cách A) | Dễ đọc, tách bạch "lấy dữ liệu" và "kiểm tra quyền" | Phải nhớ viết đúng `if` ở MỌI nơi — một chỗ quên là một lỗ hổng IDOR | Prototype nhanh, hoặc khi logic kiểm tra phức tạp hơn một điều kiện bằng nhau |
+| Lọc trong WHERE (Cách B) | An toàn theo mặc định — quên đưa tham số thì query đơn giản là không match | Cần biết `organizationId` TRƯỚC khi chạy câu lệnh (đôi khi cần một query tra cứu phụ) | Mặc định cho mọi thao tác ghi/xoá theo id trong `taskflow-api` |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "So sánh: query thiếu organization_id có thể trả nhầm dữ liệu tổ chức khác",
+      command: "docker compose exec postgres psql -U taskflow -c \"SELECT id, organization_id FROM projects WHERE id = 'aaaa-bbbb-...';\"",
+      output: " id                | organization_id\n-------------------+--------------------\n aaaa-bbbb-...      | 22222222-bbbb-...  -- có thể KHÔNG PHẢI tổ chức của người gọi!",
+    },
+    {
+      comment: "Query đúng: thêm organization_id vào WHERE, so khớp với tổ chức của người gọi",
+      command: "docker compose exec postgres psql -U taskflow -c \"SELECT id FROM projects WHERE id = 'aaaa-bbbb-...' AND organization_id = '11111111-aaaa-...';\"",
+      output: " id\n----\n(0 rows)  -- đúng: project không thuộc tổ chức 11111111, trả về rỗng",
+    },
+  ]}
+/>
+
+<Callout type="warning" title="UUID khó đoán không phải là lớp bảo mật">
+  Nhiều dev nghĩ "id là UUID ngẫu nhiên, không ai đoán ra được nên không cần lọc thêm organization_id". Sai: UUID chỉ chống việc DÒ id (enumeration), không chống việc dùng ĐÚNG id có thật nhưng SAI tổ chức — điều này xảy ra khi id bị lộ qua log, response cache, hay đơn giản là một request hợp pháp khác đã trả về id đó cho ai đó không nên thấy nó.
+</Callout>
+
+<Callout type="mistake">
+  Chỉ lọc `organization_id` ở câu `SELECT` (đọc dữ liệu) mà quên áp dụng y hệt cho `UPDATE`/`DELETE` (ghi dữ liệu). Đọc nhầm thì lộ thông tin; ghi/xoá nhầm thì MẤT dữ liệu của tổ chức khác — nghiêm trọng hơn nhiều.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "application-level multi-tenancy", meaning: "Cách ly dữ liệu giữa các tổ chức bằng điều kiện lọc trong code/query ứng dụng, không phải bằng cơ chế riêng của database." },
+    { term: "row-level security (RLS)", meaning: "Cơ chế của Postgres tự động lọc theo policy ở TẦNG DATABASE cho mọi câu query — lớp phòng thủ bổ sung, chưa bắt buộc ở module này." },
+    { term: "JOIN ngược", meaning: "Truy vấn qua bảng trung gian để lấy thông tin không có sẵn trực tiếp — ví dụ tasks JOIN projects để lấy organization_id." },
+    { term: "rowCount", meaning: "Số dòng bị ảnh hưởng bởi một câu UPDATE/DELETE — bằng 0 nghĩa là điều kiện WHERE không khớp dòng nào." },
+    { term: "IDOR", meaning: "Insecure Direct Object Reference — dùng trực tiếp một id để truy cập resource mà không xác minh quyền sở hữu/thành viên tương ứng." },
+  ]}
+/>
+
+<QuickCheck
+  question="Route `DELETE /api/v1/tasks/:id` không có `organizationId` trong URL và bảng `tasks` cũng không có cột đó. Cách nào đúng để biết task thuộc tổ chức nào trước khi xoá?"
+  options={[
+    "Tin vào organizationId mà client tự gửi trong body request",
+    "JOIN tasks với projects qua project_id để lấy organization_id, rồi mới xác nhận membership và lọc WHERE khi xoá",
+    "Không cần biết — chỉ cần kiểm tra user đã đăng nhập",
+    "Lưu organization_id vào JWT rồi tin luôn giá trị đó cho mọi request",
+  ]}
+  answerIndex={1}
+  explanation="Vì tasks không có organization_id trực tiếp, cách đáng tin cậy duy nhất là JOIN qua projects để lấy giá trị thật từ database — không tin dữ liệu do client tự khai (body hay JWT), vì JWT không tự cập nhật khi membership thay đổi và client có thể gửi bất kỳ giá trị nào."
+/>

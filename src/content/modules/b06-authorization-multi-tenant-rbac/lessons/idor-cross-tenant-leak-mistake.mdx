@@ -1,0 +1,96 @@
+import { IdorAttackScenarioDiagram } from "../diagrams/idor-attack-scenario-diagram";
+
+<Eli5 title="Chìa khoá thật, nhưng cửa sai phòng — bảo vệ vẫn phải kiểm tra lại" emoji="🔓">
+  Bạn có chìa khoá thật, đúng của khách sạn này — không phải chìa giả. Nhưng chìa khoá phòng 501 tầng 5 không nên mở được cửa phòng 501 tầng 3 chỉ vì trùng số phòng. Nếu lễ tân chỉ kiểm tra "chìa khoá có thật không" mà không kiểm tra "đúng chìa của phòng này không", khách ở tầng 5 có thể vô tình (hoặc cố ý) mở được phòng của khách khác ở tầng 3.
+
+  IDOR (Insecure Direct Object Reference) chính là lỗi đó trong API: token thật, chữ ký đúng, chưa hết hạn — nhưng thiếu một bước kiểm tra "đúng đối tượng của đúng người" là đủ để mở nhầm cửa.
+</Eli5>
+
+<IdorAttackScenarioDiagram />
+
+<Technical>
+
+### IDOR không phải lỗi authentication — là lỗi authorization
+
+Dễ nhầm lẫn: nếu attacker cần token thật để tấn công, vậy có phải authentication (B05) đã thất bại? Không. Authentication đã làm đúng việc của nó — xác nhận "người này đúng là ai họ khai". IDOR xảy ra ở bước SAU đó: hệ thống quên xác nhận "người này CÓ ĐƯỢC PHÉP đụng vào đúng resource cụ thể này không". Đây là lý do B06 tồn tại như một module riêng, tách khỏi B05.
+
+```ts title="Route thiếu authorization — chỉ có authentication (SAI)"
+app.delete("/api/v1/projects/:id", { preHandler: [app.authenticate] }, async (request, reply) => {
+  // authenticate xác nhận token thật — nhưng KHÔNG kiểm tra project này thuộc tổ chức nào của user
+  await db.delete(projects).where(eq(projects.id, request.params.id));
+  return reply.code(204).send();
+});
+```
+
+Route trên hoàn toàn "hoạt động đúng" theo nghĩa không crash, không lỗi cú pháp — nhưng bất kỳ user đã đăng nhập nào (bất kể tổ chức nào) đều xoá được BẤT KỲ project nào nếu biết id.
+
+### Chọn 403 hay 404 — một quyết định thiết kế, không phải mặc định ngẫu nhiên
+
+Sau khi thêm `resolveOrganizationContext` + `requireRole` (bài trước), có hai tình huống KHÁC NHAU khi một request bị chặn, và `taskflow-api` trả mã lỗi khác nhau cho từng tình huống thay vì luôn dùng một mã cố định:
+
+| Tình huống | User có membership trong org của resource? | Mã trả về | Lý do |
+|---|---|---|---|
+| Attacker hoàn toàn ngoài tổ chức | Không | `404 Not Found` | Không xác nhận resource có tồn tại — coi như không tồn tại với người này |
+| User là `member` thật của tổ chức đó, nhưng thao tác cần `admin` | Có | `403 Forbidden` | Đã xác nhận có mặt hợp lệ trong tổ chức (họ thấy resource này qua `GET` bình thường) — chỉ là role không đủ cho hành động cụ thể |
+
+Đây KHÔNG phải là "API nào cũng phải làm giống hệt nhau" — nhiều API công khai chọn luôn trả `404` cho mọi trường hợp thiếu quyền để tối đa hoá việc không lộ thông tin, đánh đổi lấy trải nghiệm debug khó hơn cho chính người phát triển ("tại sao tôi có tài khoản mà vẫn 404?"). `taskflow-api` chọn phân biệt hai mã vì nó phục vụ nội bộ một tổ chức đã biết nhau (không phải API công khai ẩn danh) — trải nghiệm rõ ràng hơn quan trọng hơn việc giấu tuyệt đối.
+
+<Callout type="info" title="Đây là một trade-off, không phải quy tắc tuyệt đối">
+  Nếu `taskflow-api` sau này mở API công khai cho bên thứ ba tích hợp, cân nhắc lại: có thể MUỐN luôn trả `404` kể cả khi có membership, để không tiết lộ bất kỳ thông tin nào về cấu trúc quyền nội bộ cho một client không đáng tin cậy hoàn toàn.
+</Callout>
+
+### Checklist tự rà lỗi IDOR trước khi merge một route mới
+
+1. Route có nhận một `:id` (hoặc bất kỳ tham số định danh resource nào) không?
+2. Nếu có, câu query CHÍNH (đọc/ghi/xoá) có điều kiện `organization_id` (trực tiếp hoặc qua JOIN) trong WHERE không?
+3. `organization_id` đó có được LẤY TỪ context đã xác thực (membership đã tra) hay đang tin vào giá trị client tự gửi (body, query string, JWT không đáng tin)?
+4. Có test nào cố tình dùng token của tổ chức khác gọi route này chưa?
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Route thiếu organization_id (mô phỏng lỗi) — member org A xoá được project org B",
+      command: "curl -i -X DELETE http://localhost:3000/api/v1/projects/PROJECT_ID_ORG_B -H 'Authorization: Bearer <token org A>'",
+      output: "HTTP/1.1 204 No Content   -- SAI: lẽ ra phải bị chặn, không phải xoá thành công",
+    },
+    {
+      comment: "Sau khi thêm resolveOrganizationContext — cùng request, đã sửa",
+      command: "curl -i -X DELETE http://localhost:3000/api/v1/projects/PROJECT_ID_ORG_B -H 'Authorization: Bearer <token org A>'",
+      output: "HTTP/1.1 404 Not Found\n\n{\"error\":{\"code\":\"NOT_FOUND\",\"message\":\"Không tìm thấy tài nguyên\"}}",
+    },
+  ]}
+/>
+
+<Callout type="warning" title="Lỗi kinh điển nhất của multi-tenant API">
+  OWASP xếp Broken Access Control là hạng mục #1 trong Top 10 (2021) — và IDOR xuyên-tổ-chức là một trong những biến thể phổ biến nhất của nó. Đây không phải lỗi hiếm gặp hay chỉ xảy ra ở code cẩu thả: nó xảy ra khi một route MỚI được thêm sau này mà quên áp dụng đúng pattern đã có ở các route cũ — càng nhiều route, càng dễ quên một chỗ.
+</Callout>
+
+<Callout type="mistake">
+  Chỉ test IDOR bằng cách "gọi API mà không có token" (kỳ vọng `401`). Đó là test authentication, không phải test authorization. Test IDOR đúng nghĩa phải dùng một token THẬT, HỢP LỆ — chỉ khác tổ chức hoặc khác role — như lab của bài này yêu cầu.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "IDOR", meaning: "Insecure Direct Object Reference — lỗi dùng trực tiếp một tham chiếu (thường là id) mà không xác minh quyền tương ứng." },
+    { term: "Broken Access Control", meaning: "Hạng mục #1 OWASP Top 10 (2021) — nhóm lỗi liên quan tới việc kiểm soát ai được làm gì bị thiếu hoặc sai." },
+    { term: "cross-tenant leak", meaning: "Rò rỉ dữ liệu giữa các tổ chức khác nhau trong cùng một hệ thống multi-tenant." },
+    { term: "403 Forbidden", meaning: "Đã xác thực (biết bạn là ai) nhưng không đủ quyền cho hành động/resource cụ thể." },
+    { term: "404 Not Found", meaning: "Resource không tồn tại — hoặc được cố tình trả về để không xác nhận sự tồn tại của resource với người không có quyền." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một route mới `PATCH /api/v1/tasks/:id/assignee` được thêm sau module này, nhưng dev quên áp dụng `resolveOrganizationFromTaskId`. Hậu quả thực tế nào đúng nhất?"
+  options={[
+    "Không sao vì Fastify tự áp dụng middleware cho mọi route cùng prefix",
+    "User bất kỳ tổ chức nào (miễn đã đăng nhập) có thể đổi assignee của task thuộc tổ chức khác — đúng dạng lỗi IDOR/cross-tenant leak mà bài học mô tả",
+    "Route sẽ tự động trả 500 vì thiếu middleware bắt buộc",
+    "Chỉ owner của tổ chức mình mới gọi được route, do JWT tự giới hạn phạm vi",
+  ]}
+  answerIndex={1}
+  explanation="Middleware KHÔNG tự áp dụng cho route mới — mỗi route phải khai báo preHandler tường minh. Quên áp dụng đúng pattern (như checklist trong bài) tạo ra chính xác lỗ hổng IDOR: authentication vẫn đúng, nhưng thiếu authorization theo organization_id."
+/>

@@ -4,6 +4,7 @@ import { b02HttpRestApiFastifyModule } from "./modules/b02-http-rest-api-fastify
 import { b03ValidationErrorHandlingApiDesignModule } from "./modules/b03-validation-error-handling-api-design/module-meta";
 import { b04DatabaseOrmDrizzlePostgresqlModule } from "./modules/b04-database-orm-drizzle-postgresql/module-meta";
 import { b05AuthenticationJwtRefreshTokenModule } from "./modules/b05-authentication-jwt-refresh-token/module-meta";
+import { b06AuthorizationMultiTenantRbacModule } from "./modules/b06-authorization-multi-tenant-rbac/module-meta";
 import { m01LinuxShellModule } from "./modules/m01-linux-shell/module-meta";
 import { m02NetworkingModule } from "./modules/m02-networking/module-meta";
 import { m03DevopsMindsetGitModule } from "./modules/m03-devops-mindset-git/module-meta";
@@ -48,6 +49,7 @@ export const curriculumModules: ModuleDefinition[] = [
   b03ValidationErrorHandlingApiDesignModule,
   b04DatabaseOrmDrizzlePostgresqlModule,
   b05AuthenticationJwtRefreshTokenModule,
+  b06AuthorizationMultiTenantRbacModule,
   m01LinuxShellModule,
   m02NetworkingModule,
   m03DevopsMindsetGitModule,

@@ -49,4 +49,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "b05-authentication-jwt-refresh-token": (lessonSlug) => import(`./modules/b05-authentication-jwt-refresh-token/lessons/${lessonSlug}.mdx`),
   "b03-validation-error-handling-api-design": (lessonSlug) => import(`./modules/b03-validation-error-handling-api-design/lessons/${lessonSlug}.mdx`),
   "b04-database-orm-drizzle-postgresql": (lessonSlug) => import(`./modules/b04-database-orm-drizzle-postgresql/lessons/${lessonSlug}.mdx`),
+  "b06-authorization-multi-tenant-rbac": (lessonSlug) => import(`./modules/b06-authorization-multi-tenant-rbac/lessons/${lessonSlug}.mdx`),
 };

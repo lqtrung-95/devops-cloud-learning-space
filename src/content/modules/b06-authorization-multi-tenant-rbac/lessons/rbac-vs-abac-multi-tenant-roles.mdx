@@ -1,0 +1,91 @@
+import { RbacPermissionMatrixDiagram } from "../diagrams/rbac-permission-matrix-diagram";
+
+<Eli5 title="RBAC là bảng chức danh treo ở cửa, ABAC là bảo vệ tự suy luận từng ca" emoji="🪪">
+  Một toà nhà văn phòng có hai cách gác cửa. Cách 1: mỗi người đeo thẻ ghi rõ chức danh — "Giám đốc", "Trưởng phòng", "Nhân viên" — bảo vệ chỉ cần nhìn thẻ, so với danh sách "chức danh nào được vào phòng nào" là xong. Đó là **RBAC** (Role-Based Access Control).
+
+  Cách 2: không có thẻ chức danh cố định, mà bảo vệ phải tự suy luận từng lúc — "giờ này có phải giờ hành chính không?", "người này có đang cầm chìa khoá phòng đó không?", "thiết bị quẹt thẻ có đáng tin không?". Đó là **ABAC** (Attribute-Based Access Control) — linh hoạt hơn nhiều, nhưng bảo vệ phải suy luận nhiều hơn mỗi lần có người đi qua.
+
+  `taskflow-api` chọn cách 1 cho module này: một cột `role` cố định trong bảng `memberships`, tra một phát là biết ngay.
+</Eli5>
+
+Từ B04 và B05, `taskflow-api` đã có bảng `memberships (user_id, organization_id, role)` với `role` giới hạn trong `owner | admin | member` — nhưng chưa có route nào ĐỌC cột này để quyết định cho phép hay chặn. Bài học này xây phần còn thiếu: quyết định RBAC vs ABAC, và role thực sự nghĩa là gì trong một hệ thống multi-tenant (nhiều tổ chức dùng chung một `taskflow-api`).
+
+<RbacPermissionMatrixDiagram />
+
+<Technical>
+
+### RBAC: quyền gắn với vai trò, không gắn với người
+
+Trong RBAC, bạn không hỏi "user X được làm gì" trực tiếp — bạn hỏi hai bước: "user X có role gì?" rồi "role đó được làm gì?". Với `taskflow-api`:
+
+```ts title="src/db/schema.ts (đã có từ B05, không đổi)"
+export const memberships = pgTable(
+  "memberships",
+  {
+    userId: uuid("user_id").notNull().references(() => users.id),
+    organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+    role: text("role", { enum: ["owner", "admin", "member"] }).notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.userId, table.organizationId] }),
+  }),
+);
+```
+
+Điểm quan trọng dễ hiểu sai: **role không phải thuộc tính toàn cục của user**. Cùng một user có thể là `owner` ở tổ chức A và `member` ở tổ chức B — vì khoá chính là `(user_id, organization_id)`, không phải `user_id` một mình. Middleware ở bài sau phải luôn tra role theo ĐÚNG tổ chức đang thao tác, không được cache "role của user này" như một giá trị duy nhất.
+
+### Vì sao chưa cần ABAC ở module này
+
+ABAC đánh giá nhiều thuộc tính cùng lúc (role, thời gian, thiết bị, thậm chí nội dung resource) qua một policy engine — mạnh nhưng phức tạp hơn nhiều để viết đúng và để debug khi bị chặn nhầm. Ví dụ quy tắc kiểu ABAC: "chỉ được sửa task do chính mình tạo, và chỉ trong giờ hành chính". `taskflow-api` chưa có yêu cầu nghiệp vụ nào cần tới mức đó — ba role cố định là đủ diễn tả toàn bộ curriculum tới B06.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| RBAC (role cố định) | Đơn giản, tra một câu `SELECT`, dễ audit ai có quyền gì | Không diễn tả được luật phức tạp ("chỉ sửa task của mình") | Số lượng vai trò ít, luật phân quyền ổn định — đúng với `taskflow-api` hiện tại |
+| ABAC (thuộc tính linh hoạt) | Diễn tả được luật phức tạp, thay đổi theo ngữ cảnh | Cần policy engine, khó test toàn bộ tổ hợp thuộc tính, dễ có lỗ hổng logic tinh vi | Hệ thống lớn, nhiều luật ngoại lệ, hoặc yêu cầu compliance chi tiết |
+| ACL (danh sách quyền theo từng resource) | Rất chi tiết, kiểm soát tới từng resource | Bùng nổ số dòng khi có nhiều user × nhiều resource, khó bảo trì | Chia sẻ file kiểu Google Drive — quyền khác nhau cho từng file |
+
+Nếu về sau `taskflow-api` cần luật kiểu "chỉ tác giả comment mới được sửa comment đó", đó vẫn là RBAC + một điều kiện sở hữu đơn giản (`WHERE author_id = $userId`) — chưa cần nhảy sang ABAC đầy đủ.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Xem role của một user trong từng tổ chức — đúng cặp (user_id, organization_id)",
+      command: "docker compose exec postgres psql -U taskflow -c \"SELECT organization_id, role FROM memberships WHERE user_id = '3f9e2b1a-...';\"",
+      output: " organization_id                      | role\n--------------------------------------+--------\n 11111111-aaaa-...                    | owner\n 22222222-bbbb-...                    | member",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Lưu `role` như một cột trên bảng `users` thay vì trên `memberships`. Nếu làm vậy, user chỉ có MỘT role duy nhất cho toàn hệ thống — không thể là `owner` ở tổ chức mình lập và `member` ở tổ chức được mời vào. Role luôn phải gắn với cặp `(user, organization)`.
+</Callout>
+
+<Callout type="tip" title="Kiểm tra nhanh trước khi code">
+  Trước khi viết middleware ở bài 3, tự hỏi: "role này đang được tra cho tổ chức nào?" — nếu câu trả lời không rõ ràng (ví dụ route không cho biết organization nào), đó là dấu hiệu cần bài học tiếp theo về multi-tenant scoping.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "RBAC", meaning: "Role-Based Access Control — quyền gắn với một vai trò cố định (owner/admin/member), vai trò gắn với user." },
+    { term: "ABAC", meaning: "Attribute-Based Access Control — quyền tính toán từ nhiều thuộc tính (role, thời gian, thiết bị...) mỗi lần kiểm tra." },
+    { term: "multi-tenant", meaning: "Một hệ thống phục vụ nhiều 'tổ chức' (tenant) độc lập trên cùng một codebase và database." },
+    { term: "membership", meaning: "Bản ghi nối một user với một organization kèm role của họ trong TỔ CHỨC ĐÓ." },
+    { term: "khoá chính gộp (composite primary key)", meaning: "Khoá chính gồm nhiều cột — ở đây là (user_id, organization_id), đảm bảo mỗi user chỉ có một role cho mỗi tổ chức." },
+  ]}
+/>
+
+<QuickCheck
+  question="User Lan là `owner` ở tổ chức Acme và `member` ở tổ chức Beta. Nếu bảng `memberships` sai thiết kế và role được lưu trên bảng `users` (một cột `role` duy nhất), điều gì xảy ra?"
+  options={[
+    "Không có vấn đề gì, vì Lan chỉ cần một role",
+    "Lan chỉ có thể có MỘT role áp dụng cho mọi tổ chức — không thể vừa là owner ở Acme vừa là member ở Beta cùng lúc",
+    "Hệ thống sẽ tự động chọn role cao nhất cho mọi tổ chức",
+    "Postgres sẽ báo lỗi ngay khi insert",
+  ]}
+  answerIndex={1}
+  explanation="Role phải gắn với ĐÚNG cặp (user, organization) qua bảng memberships có khoá chính gộp. Nếu để trên bảng users, hệ thống mất khả năng phân biệt vai trò khác nhau của cùng một người ở các tổ chức khác nhau — đúng vấn đề cốt lõi của multi-tenant RBAC."
+/>

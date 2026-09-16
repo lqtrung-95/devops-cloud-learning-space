@@ -1,0 +1,157 @@
+import { RequireRoleMiddlewarePipelineDiagram } from "../diagrams/require-role-middleware-pipeline-diagram";
+
+<Eli5 title="Hai vọng gác nối tiếp: một hỏi 'bạn ở toà nào', một hỏi 'chức vụ bạn có đủ không'" emoji="🚧">
+  Vào một khu công nghiệp có nhiều công ty thuê chung, bạn phải qua HAI vọng gác liên tiếp. Vọng gác 1 hỏi: "bạn thuộc công ty nào, và ở công ty đó bạn là ai?" — tra sổ xong mới cho qua. Vọng gác 2 mới hỏi tiếp: "khu vực này chỉ cho quản lý vào, bạn có phải quản lý không?".
+
+  Hai vọng gác không thể đổi chỗ cho nhau: vọng gác 2 không biết bạn thuộc công ty nào nếu vọng gác 1 chưa tra sổ trước. Đây đúng là thứ tự hai preHandler hook trong Fastify của bài này.
+</Eli5>
+
+<RequireRoleMiddlewarePipelineDiagram />
+
+<Technical>
+
+### Hook 1: resolveOrganizationContext — decorate request
+
+Fastify chạy các `preHandler` hook theo ĐÚNG thứ tự đăng ký. Hook đầu tiên tra ra tổ chức + role, gắn vào `request` để hook sau và handler dùng lại — không truy vấn lặp lại.
+
+```ts title="src/plugins/authorization.ts"
+import fp from "fastify-plugin";
+import { eq, and } from "drizzle-orm";
+import { db } from "../db/client.js";
+import { memberships, projects, tasks } from "../db/schema.js";
+
+declare module "fastify" {
+  interface FastifyRequest {
+    organizationId: string;
+    membershipRole: "owner" | "admin" | "member";
+  }
+}
+
+async function attachMembershipOrReject(request, reply, userId: string, organizationId: string) {
+  const [membership] = await db
+    .select({ role: memberships.role })
+    .from(memberships)
+    .where(and(eq(memberships.userId, userId), eq(memberships.organizationId, organizationId)));
+
+  if (!membership) {
+    // Không tiết lộ việc organizationId/resource này có tồn tại hay không.
+    return reply.code(404).send({ error: { code: "NOT_FOUND", message: "Không tìm thấy tài nguyên" } });
+  }
+
+  request.organizationId = organizationId;
+  request.membershipRole = membership.role;
+}
+
+export default fp(async (app) => {
+  // Route có :organizationId sẵn trong path — vd POST /organizations/:organizationId/projects
+  app.decorate("resolveOrganizationFromParam", async (request, reply) => {
+    await attachMembershipOrReject(request, reply, request.userId, request.params.organizationId);
+  });
+
+  // Route cũ /projects/:id — organization_id nằm ngay trên bảng projects
+  app.decorate("resolveOrganizationFromProjectId", async (request, reply) => {
+    const [row] = await db
+      .select({ organizationId: projects.organizationId })
+      .from(projects)
+      .where(eq(projects.id, request.params.id));
+    if (!row) return reply.code(404).send({ error: { code: "NOT_FOUND", message: "Không tìm thấy project" } });
+    await attachMembershipOrReject(request, reply, request.userId, row.organizationId);
+  });
+
+  // Route /tasks/:id — phải JOIN qua projects để lấy organization_id
+  app.decorate("resolveOrganizationFromTaskId", async (request, reply) => {
+    const [row] = await db
+      .select({ organizationId: projects.organizationId })
+      .from(tasks)
+      .innerJoin(projects, eq(projects.id, tasks.projectId))
+      .where(eq(tasks.id, request.params.id));
+    if (!row) return reply.code(404).send({ error: { code: "NOT_FOUND", message: "Không tìm thấy task" } });
+    await attachMembershipOrReject(request, reply, request.userId, row.organizationId);
+  });
+});
+```
+
+### Hook 2: requireRole — chỉ kiểm tra, không tự tra DB
+
+`requireRole` KHÔNG tự query gì cả — nó chỉ đọc `request.membershipRole` mà hook trước đã gắn. Đây là lý do thứ tự đăng ký bắt buộc phải đúng.
+
+```ts title="src/plugins/require-role.ts"
+type MembershipRole = "owner" | "admin" | "member";
+
+export function requireRole(...allowed: MembershipRole[]) {
+  return async (request, reply) => {
+    if (!allowed.includes(request.membershipRole)) {
+      return reply.code(403).send({
+        error: { code: "FORBIDDEN", message: `Cần role ${allowed.join(" hoặc ")} để thực hiện hành động này` },
+      });
+    }
+  };
+}
+```
+
+```ts title="src/routes/projects.ts — đăng ký chain đúng thứ tự"
+app.delete(
+  "/api/v1/projects/:id",
+  { preHandler: [app.authenticate, app.resolveOrganizationFromProjectId, requireRole("owner", "admin")] },
+  async (request, reply) => {
+    const result = await db
+      .delete(projects)
+      .where(and(eq(projects.id, request.params.id), eq(projects.organizationId, request.organizationId)));
+    if (result.rowCount === 0) {
+      return reply.code(404).send({ error: { code: "NOT_FOUND", message: "Không tìm thấy project" } });
+    }
+    return reply.code(204).send();
+  },
+);
+```
+
+Ba hook `authenticate` (B05) → `resolveOrganizationFromProjectId` → `requireRole("owner", "admin")` chạy tuần tự; bất kỳ hook nào gọi `reply.send()` sẽ dừng chain ngay, các hook sau và cả handler chính đều KHÔNG chạy.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Member cố xoá project — bị chặn ở hook requireRole",
+      command: "curl -i -X DELETE http://localhost:3000/api/v1/projects/PROJECT_ID -H 'Authorization: Bearer <token của member>'",
+      output: "HTTP/1.1 403 Forbidden\n\n{\"error\":{\"code\":\"FORBIDDEN\",\"message\":\"Cần role owner hoặc admin để thực hiện hành động này\"}}",
+    },
+    {
+      comment: "Admin xoá project — qua được cả hai hook",
+      command: "curl -i -X DELETE http://localhost:3000/api/v1/projects/PROJECT_ID -H 'Authorization: Bearer <token của admin>'",
+      output: "HTTP/1.1 204 No Content",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Đăng ký `requireRole` TRƯỚC `resolveOrganizationFromProjectId` trong mảng `preHandler`. `request.membershipRole` lúc đó vẫn là `undefined` — tuỳ cách viết điều kiện, điều này có thể chặn NHẦM mọi request (an toàn nhưng vô dụng) hoặc tệ hơn là cho qua nhầm nếu logic kiểm tra viết kiểu `if (allowed.includes(role))` mà quên xử lý `undefined`.
+</Callout>
+
+<Callout type="tip" title="Test-backed claim">
+  Từ B07 trở đi mọi thay đổi hành vi cần có test đi kèm — nhưng ngay ở B06 này, cách kiểm chứng nhanh nhất một chain hook đúng thứ tự là: xoá thử một hook giữa chừng, chạy lại request thủ công bằng `curl`, xem lỗi có đổi đúng như dự đoán không (ví dụ mất `resolveOrganizationFromProjectId` phải làm `requireRole` lỗi vì thiếu `membershipRole`).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "preHandler hook", meaning: "Hook Fastify chạy sau khi route được khớp nhưng trước handler chính — nơi đặt authenticate, resolve context, requireRole." },
+    { term: "decorate", meaning: "Gắn thêm thuộc tính/hàm vào instance Fastify hoặc request object, dùng lại được ở nhiều route." },
+    { term: "chain hook", meaning: "Mảng nhiều preHandler chạy tuần tự theo thứ tự khai báo — hook sau phụ thuộc dữ liệu hook trước gắn vào request." },
+    { term: "factory function", meaning: "Hàm trả về một hàm khác đã 'đóng gói' tham số — requireRole('owner','admin') trả về một preHandler cụ thể." },
+    { term: "FORBIDDEN vs NOT_FOUND", meaning: "Hai mã lỗi khác nhau cho hai tình huống: đủ điều kiện xác thực nhưng sai role (403/FORBIDDEN) và không có membership/resource (404/NOT_FOUND)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao `requireRole` không tự truy vấn `memberships` mà chỉ đọc `request.membershipRole`?"
+  options={[
+    "Vì Fastify không cho phép hook truy vấn database",
+    "Vì hook trước (resolveOrganizationContext) đã tra và gắn sẵn dữ liệu đó — tách trách nhiệm rõ ràng và tránh query trùng lặp cùng một thông tin trong cùng một request",
+    "Vì requireRole chạy trước khi có kết nối database",
+    "Vì memberships là bảng không cho phép SELECT nhiều lần trong một request",
+  ]}
+  answerIndex={1}
+  explanation="Tách hai trách nhiệm: một hook lo việc TRA CỨU (tốn một round-trip DB), một hook lo việc SO SÁNH (thuần logic, không cần DB). Nếu để requireRole tự query lại, mỗi route cần requireRole sẽ tốn thêm một câu SELECT không cần thiết vì dữ liệu đã có sẵn trên request."
+/>
