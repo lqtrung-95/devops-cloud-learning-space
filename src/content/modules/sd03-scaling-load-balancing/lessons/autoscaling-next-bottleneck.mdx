@@ -1,0 +1,120 @@
+import { AutoscalingBottleneckSliderDiagram } from "../diagrams/autoscaling-bottleneck-slider-diagram";
+
+<Eli5 title="Tự gọi thêm nhân viên — cho tới khi bếp chung hết lửa" emoji="🔥">
+  Quán phở có quản lý ca **tự gọi thêm nhân viên** khi khách xếp hàng dài, và cho bớt người về khi vắng — đó là **autoscaling**. Nhưng nhân viên mới phải mất 10 phút thay đồng phục, rửa tay mới đứng quầy được, nên quản lý giỏi gọi người **trước** giờ cao điểm chứ không đợi hàng dài ra tận đường.
+
+  Rồi tới lúc thêm quầy cũng không bán nhanh hơn: mọi quầy đều nấu trên **cùng một dãy bếp lửa chung** (database). Bếp chỉ có 100 họng lửa, quầy thứ 11 đứng chờ lửa, còn thêm quầy chỉ làm bếp đông nghịt hơn.
+
+  Bài học: sau khi scale tầng app, **nút cổ chai không biến mất — nó chuyển chỗ**. Việc của bạn là đo để biết nó đang ở đâu.
+</Eli5>
+
+Đây chính là tiêu chí đạt của module: nhìn số đo k6 và nói được *"thêm instance không giúp nữa vì…"*. Ở công việc thật, câu này tiết kiệm hàng tuần tối ưu sai chỗ; trong phỏng vấn, nó là phần "bottleneck & trade-off" mà ứng viên mid–senior được kỳ vọng tự nêu ra.
+
+<AutoscalingBottleneckSliderDiagram />
+
+<Technical>
+
+### Autoscaling theo metric nào?
+
+| Metric | Ví dụ | Ghi chú |
+|---|---|---|
+| CPU trung bình | AWS target tracking `ASGAverageCPUUtilization` = 50%; Kubernetes HPA `--cpu-percent=60` | Dễ nhất; sai khi app nghẽn I/O chứ không nghẽn CPU |
+| Request mỗi instance | ALB `ALBRequestCountPerTarget` | Hợp web/API khi đã benchmark được RPS/instance |
+| Độ dài hàng đợi | Số message chờ trong queue ÷ tốc độ xử lý | Hợp worker xử lý async (SD07) |
+| Theo lịch | Scale trước 20h tối, trước flash sale | Cho đỉnh biết trước; kết hợp với metric |
+
+```bash title="Kubernetes HPA (tham khảo từ course DevOps)"
+kubectl autoscale deployment app --cpu-percent=60 --min=3 --max=20
+```
+
+### Autoscaling có độ trễ
+
+Thời gian từ lúc tải tăng tới lúc instance mới *thật sự* nhận request = **phát hiện** (metric gom theo chu kỳ, cần vượt ngưỡng một khoảng) + **khởi động** (VM/container, pull image) + **warm-up** (JIT, pool kết nối, cache local) + **qua health check**. Tổng cộng thường là **vài phút** với VM, nhanh hơn với container có sẵn node — cần đo trên hệ thống của bạn.
+
+Hệ quả thiết kế:
+
+- Giữ **headroom**: target CPU 50–60% chứ không 90%, để phần đang chạy gánh được trong lúc chờ instance mới.
+- Scale-out nhanh, scale-in chậm (HPA mặc định có cửa sổ ổn định khi scale down) và luôn kèm **connection draining**.
+- Luôn đặt `max` — autoscaling không giới hạn trước một đợt bot tấn công là hoá đơn không giới hạn.
+
+### Tìm bottleneck tiếp theo
+
+Đọc theo thứ tự, mỗi thành phần hỏi 3 câu **USE**: Utilization (bận bao nhiêu %), Saturation (có hàng đợi không), Errors (có lỗi không).
+
+1. **k6:** throughput (`http_reqs/s`) ngừng tăng khi tăng VU, p95 tăng, `http_req_failed` bắt đầu khác 0 ⇒ đã chạm trần ở đâu đó.
+2. **App:** `docker stats` — CPU mỗi container gần 100% (Node một luồng ⇒ ~1 core) ⇒ thêm instance còn giúp.
+3. **Postgres:** CPU cao, `pg_stat_activity` nhiều `active`, lỗi `too many clients already` ⇒ thêm app **vô ích**, thậm chí hại.
+4. **Máy chạy lab:** tổng CPU của Docker VM đã hết ⇒ đang đo giới hạn laptop chứ không phải hệ thống.
+
+### Ước lượng: bao nhiêu kết nối DB là đủ?
+
+Giả định: đỉnh **5.000 RPS**, mỗi request giữ một kết nối DB cỡ **5 ms** (1–2 query đơn giản).
+
+- Kết nối đang *bận* cùng lúc ≈ 5.000 × 0,005 = **25** (định luật Little)
+- Nhưng 12 instance × pool 10 = **120** kết nối *mở* — vượt `max_connections` mặc định **100** của Postgres, trong khi phần lớn thời gian chúng rảnh
+- Mỗi kết nối Postgres là một process riêng, tốn RAM ⇒ nhiều kết nối rảnh vẫn tốn tài nguyên và làm tranh chấp tăng khi tất cả cùng bận
+
+Hướng xử lý: **PgBouncer** (transaction pooling) để nhiều client dùng chung vài chục kết nối thật; giảm `max` của pool mỗi instance; rồi mới tới cache (SD04), read replica và sharding (SD06).
+
+### Trade-off: khi Postgres là bottleneck
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Scale dọc Postgres | Không đổi code, hiệu quả ngay | Đắt dần, có trần, thường cần restart/failover | Còn room phần cứng, cần mua thời gian |
+| PgBouncer / pool nhỏ lại | Hết lỗi `too many clients`, ít RAM hơn | Transaction pooling hạn chế một số tính năng theo session (prepared statement, `SET`…) — kiểm tra tài liệu | Nhiều instance app, query ngắn |
+| Cache (Redis) | Cắt phần lớn query đọc | Dữ liệu cũ, thêm invalidation (SD04) | Đọc nhiều, chấp nhận trễ vài giây |
+| Read replica | Tăng năng lực đọc | Replication lag, read-your-writes (SD06) | Đọc nhiều, cache khó áp dụng |
+| Thêm instance app | Dễ | Không giúp, còn tăng kết nối và tranh chấp | Chỉ khi CPU app mới là bottleneck |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Lần lượt đo với 1, 2, 4, 6 instance (ví dụ 4)", command: "docker compose up -d --scale app=4 && docker compose exec nginx nginx -s reload" },
+    { comment: "Chạy tải lên endpoint có query Postgres", command: "k6 run -e PATH_UNDER_TEST=/api/orders k6/lb-test.js" },
+    { comment: "Trong lúc chạy: CPU từng container (số minh hoạ)", command: "docker stats --no-stream --format 'table {{.Name}}\\t{{.CPUPerc}}'", output: "NAME                   CPU %\nsd-playground-app-1    41.3%\nsd-playground-app-2    39.8%\nsd-playground-app-3    43.1%\nsd-playground-app-4    40.6%\nsd-playground-postgres-1 187.5%\nsd-playground-nginx-1  22.4%" },
+    { comment: "Postgres đang có bao nhiêu kết nối, bao nhiêu thật sự bận?", command: "docker compose exec postgres psql -U postgres -c \"SELECT state, count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' GROUP BY state;\"", output: " state  | count\n--------+-------\n active |    18\n idle   |    22\n(2 rows)" },
+    { command: "docker compose exec postgres psql -U postgres -c 'SHOW max_connections;'", output: " max_connections\n-----------------\n 100\n(1 row)" },
+    { comment: "Scale lên 12 → 120 kết nối muốn mở: xem lỗi trong log app", command: "docker compose up -d --scale app=12 && docker compose logs app | grep -m1 'too many clients'", output: "app-11  | error: sorry, too many clients already" },
+  ]}
+/>
+
+Đọc kết quả ví dụ trên: app mỗi instance chỉ ~40% CPU trong khi Postgres dùng gần 2 core và p95 tăng ⇒ bottleneck đã chuyển sang database. Ghi kết luận này kèm bảng số vào design doc của lab.
+
+<Callout type="mistake" title="Scale app để chữa database chậm">
+  Thấy p95 tăng là thêm instance app. Nếu Postgres đã bão hoà, mỗi instance mới mang thêm 10 kết nối tới đúng chỗ đang nghẽn — latency còn tệ hơn. Luôn xem CPU app **và** CPU/kết nối DB trước khi quyết định.
+</Callout>
+
+<Callout type="cost">
+  Autoscaling không có `max` hoặc scale theo metric dễ bị bot đẩy lên (RPS thô) có thể nhân hoá đơn EC2/Fargate lên nhiều lần sau một đêm. Đặt `max`, cảnh báo chi phí và rate limit ở rìa (SD11).
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Sau khi vẽ xong high-level design, chủ động nói: *"Scale ngang tầng app xong thì bottleneck kế tiếp là database — kết nối và CPU. Tôi sẽ thêm connection pooler, cache cho đường đọc nóng, rồi read replica; nếu ghi vẫn nghẽn mới tính sharding."* Kèm một phép tính kết nối như trên cho thấy bạn không nói suông.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "autoscaling", meaning: "Tự thêm/bớt instance theo metric như CPU, RPS, độ dài hàng đợi." },
+    { term: "target tracking", meaning: "Chính sách giữ một metric quanh giá trị mục tiêu (ví dụ CPU 50%)." },
+    { term: "headroom", meaning: "Phần năng lực dư để chịu tải trong lúc chờ scale." },
+    { term: "bottleneck", meaning: "Thành phần giới hạn throughput của cả hệ thống lúc này." },
+    { term: "USE method", meaning: "Xem Utilization, Saturation, Errors của từng tài nguyên." },
+    { term: "max_connections", meaning: "Giới hạn kết nối đồng thời của Postgres, mặc định 100." },
+    { term: "PgBouncer", meaning: "Connection pooler cho Postgres, nhiều client dùng chung ít kết nối thật." },
+  ]}
+/>
+
+<QuickCheck
+  question="k6 cho thấy: từ 4 lên 8 instance, throughput tăng từ 1.600 lên 3.100 RPS; từ 8 lên 12 instance chỉ tăng lên 3.200 RPS. CPU app ở 12 instance khoảng 30%, CPU Postgres gần 100%. Kết luận nào đúng?"
+  options={[
+    "Cần thêm 12 instance nữa",
+    "Load balancer là bottleneck",
+    "Bottleneck đã chuyển sang Postgres; hướng tiếp theo là giảm tải DB (cache, pooler, replica) thay vì thêm app",
+    "k6 bị lỗi vì throughput phải tăng tuyến tính",
+  ]}
+  answerIndex={2}
+  explanation="Quầy rảnh (CPU app 30%) mà bếp chung đỏ lửa (Postgres ~100%) — thêm quầy không bán nhanh hơn. Throughput đi ngang cùng DB bão hoà chỉ thẳng vào database."
+/>

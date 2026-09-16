@@ -1,0 +1,153 @@
+import { L4VsL7RoutingDiagram } from "../diagrams/l4-vs-l7-routing-diagram";
+
+<Eli5 title="Người dẫn khách chỉ nhìn số bàn, hay đọc cả tờ order?" emoji="🧾">
+  Quán phở có nhiều quầy, cần người đứng cửa dẫn khách. Người dẫn kiểu **L4** chỉ nhìn **số bàn trên vé** rồi chỉ tay "quầy 2 nhé" — rất nhanh, nhưng không biết khách gọi phở hay trà sữa, vì tờ order nằm trong phong bì dán kín.
+
+  Người dẫn kiểu **L7** **mở phong bì, đọc tờ order**: gọi đồ uống thì dẫn sang quầy nước, gọi phở thì sang quầy phở, tiện ghi thêm "khách quen, bàn 5" lên order. Thông minh hơn nhưng mỗi khách tốn thêm chút thời gian.
+
+  **Reverse proxy** là lễ tân đứng trước cả quán: khách chỉ nói chuyện với lễ tân, không bao giờ thấy bếp. **API gateway** là lễ tân kiêm bảo vệ: kiểm vé (xác thực), giới hạn mỗi người vào bao nhiêu lần (rate limit) rồi mới dẫn vào.
+</Eli5>
+
+Chọn sai tầng load balancer là lỗi thiết kế tốn kém: dùng L4 rồi mới phát hiện cần định tuyến theo path, hoặc dùng L7 cho một giao thức TCP riêng và trả thêm latency vô ích. Trong phỏng vấn, "LB" là hộp đầu tiên bạn vẽ — nói rõ nó là L4 hay L7 và TLS kết thúc ở đâu là điểm cộng rõ ràng.
+
+<L4VsL7RoutingDiagram />
+
+<Technical>
+
+### L4 load balancer
+
+- Làm việc ở tầng transport: nhìn **IP, port, giao thức (TCP/UDP)**. Chọn backend **một lần cho mỗi kết nối**, sau đó mọi byte trên kết nối đó đi tới cùng backend.
+- Không đọc HTTP ⇒ không định tuyến theo path/header, không thêm header, không retry theo mã lỗi HTTP.
+- Ví dụ: **AWS NLB** (chuyển tiếp flow, giữ được IP client), **Nginx `stream` module** và **HAProxy `mode tcp`** (proxy TCP: mở kết nối riêng tới backend nhưng không parse payload).
+- Dùng khi: giao thức không phải HTTP (database, MQTT, game), cần TLS passthrough tới tận app, hoặc cần overhead tối thiểu.
+
+### L7 load balancer
+
+- Hiểu **HTTP**: kết thúc TLS (TLS termination), đọc method, Host, path, header, cookie.
+- Chọn backend **cho từng request** — nhiều request trên cùng một kết nối keep-alive có thể tới các backend khác nhau.
+- Làm được: định tuyến theo host/path, thêm `X-Forwarded-For`, nén gzip, retry sang backend khác khi gặp `502/503`, cache, WAF.
+- Ví dụ: **AWS ALB**, **Nginx `http`**, **HAProxy `mode http`**, Envoy.
+
+### Reverse proxy & API gateway
+
+**Reverse proxy** đứng trước app: client chỉ thấy proxy. Ngoài cân bằng tải, Nginx còn **buffer response cho client chậm** (app Node trả xong và rảnh tay, Nginx lo gửi dần cho điện thoại 3G), phục vụ file tĩnh, nén và cache.
+
+**API gateway** là reverse proxy có thêm logic "nghiệp vụ hạ tầng": xác thực JWT/API key, rate limiting, biến đổi request, gom nhiều service sau một domain. Đào sâu ở SD12 — ở đây chỉ cần biết nó là một L7 proxy "biết nhiều hơn".
+
+### Cấu hình Nginx: L7 tách pool theo path
+
+```nginx title="nginx/default.conf"
+upstream api_pool    { server app:3000; keepalive 32; }
+upstream static_pool { server static:80; }
+
+server {
+    listen 8080;
+    add_header X-Upstream $upstream_addr always;
+
+    location /static/ {
+        proxy_pass http://static_pool;
+    }
+
+    location /api/ {
+        proxy_pass http://api_pool;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+- `keepalive 32` + `proxy_http_version 1.1` + xoá header `Connection`: Nginx giữ sẵn kết nối tới app, khỏi bắt tay TCP mỗi request.
+- App đứng sau proxy phải tin header forwarded một cách có kiểm soát: Fastify dùng `Fastify({ trustProxy: true })` (hoặc chỉ tin IP của proxy) để `req.ip` là IP thật của client.
+- `static` là service ví dụ; nếu playground chưa có, bỏ block `/static/`.
+
+### Cấu hình Nginx: L4 bằng `stream`
+
+```nginx title="nginx/nginx.conf (cấp cao nhất, ngoài block http)"
+stream {
+    upstream pg_pool {
+        server postgres-1:5432;
+        server postgres-2:5432;
+    }
+    server {
+        listen 6432;
+        proxy_pass pg_pool;
+    }
+}
+```
+
+### Ước lượng: số kết nối trên LB
+
+Giả định: **20.000 client** giữ kết nối đồng thời (keep-alive/WebSocket) qua một Nginx L7.
+
+- Mỗi client proxy qua Nginx dùng **2 kết nối** (client ↔ Nginx, Nginx ↔ app) ⇒ cỡ **40.000** kết nối
+- `worker_connections` tính *mọi* kết nối của một worker, kể cả tới upstream ⇒ với 4 worker cần cỡ 10.000 mỗi worker, cộng dư, và `ulimit -n` (file descriptor) đủ lớn
+- Còn CPU cho TLS termination: phụ thuộc cipher, phần cứng, tỉ lệ kết nối mới — **cần benchmark**, đừng đọc thuộc một con số
+
+### Load balancer không được là điểm chết duy nhất
+
+- Managed LB (ALB/NLB) tự chạy trên nhiều AZ.
+- Tự vận hành: 2 Nginx + **keepalived (VRRP)** giữ một IP ảo nhảy sang máy còn sống, hoặc DNS trỏ tới nhiều LB.
+
+### Trade-off: đặt loại "người dẫn khách" nào?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| L4 (NLB, nginx `stream`) | Overhead thấp, mọi giao thức TCP/UDP, TLS passthrough | Không routing theo path/header, không retry theo HTTP status | Database, MQTT, gRPC cần TLS tới app, throughput rất cao |
+| L7 (ALB, nginx `http`) | Routing theo host/path, header, retry, nén, cache | Tốn CPU hơn, phải giữ cert TLS, thêm latency nhỏ | Mặc định cho web/API HTTP |
+| API gateway | Auth, rate limit, API key, gom nhiều service | Thêm một hop phức tạp, dễ thành nút cổ chai/SPOF logic | Nhiều service/đối tác bên ngoài (SD12) |
+| DNS round robin | Không cần hộp nào | Client cache DNS theo TTL, không biết server chết | Phân tải thô giữa region/LB, không thay LB |
+
+Đổi ý khi: bắt đầu với L7 cho HTTP; chỉ xuống L4 khi đo được overhead L7 là vấn đề thật hoặc giao thức không phải HTTP.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Kiểm tra cú pháp cấu hình trước khi reload", command: "docker compose exec nginx nginx -t", output: "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok\nnginx: configuration file /etc/nginx/nginx.conf test is successful" },
+    { command: "docker compose exec nginx nginx -s reload" },
+    { comment: "Header X-Upstream cho biết instance nào trả lời", command: "curl -s -D - -o /dev/null localhost:8080/api/work", output: "HTTP/1.1 200 OK\nServer: nginx/1.27.5\nContent-Type: application/json; charset=utf-8\nConnection: keep-alive\nX-Upstream: 172.18.0.6:3000" },
+    { comment: "Gọi 6 lần liên tiếp để thấy vòng quay qua 3 replica", command: "for i in $(seq 6); do curl -s -D - -o /dev/null localhost:8080/api/work | grep -i x-upstream; done", output: "X-Upstream: 172.18.0.6:3000\nX-Upstream: 172.18.0.7:3000\nX-Upstream: 172.18.0.8:3000\nX-Upstream: 172.18.0.6:3000\nX-Upstream: 172.18.0.7:3000\nX-Upstream: 172.18.0.8:3000" },
+    { comment: "App thấy IP client nhờ X-Forwarded-For + trustProxy (IP cụ thể tuỳ mạng Docker của bạn)", command: "curl -s localhost:8080/api/whoami", output: "{\"ip\":\"172.18.0.1\",\"forwardedFor\":\"172.18.0.1\"}" },
+  ]}
+/>
+
+<Callout type="mistake" title="Đặt block stream vào conf.d">
+  Image `nginx` chính thức `include /etc/nginx/conf.d/*.conf` **bên trong** block `http`. Đặt `stream` vào đó sẽ báo lỗi `"stream" directive is not allowed here`. Block `stream` phải ở cấp cao nhất của `nginx.conf`.
+</Callout>
+
+<Callout type="warning">
+  Tin `X-Forwarded-For` từ bất kỳ ai là lỗ hổng: client tự gửi header giả để lách rate limit theo IP. Chỉ tin header này khi request đến từ proxy của bạn.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi vẽ LB, nói ngắn gọn: *"L7 load balancer, kết thúc TLS ở đây, định tuyến `/api` và `/static`, chạy multi-AZ nên không phải SPOF"*. Nếu đề là chat/game dùng kết nối dài, nhắc L4 hoặc L7 hỗ trợ WebSocket và việc kết nối dài làm cân bằng tải lệch (SD16). Người phỏng vấn đánh giá cao việc bạn biết LB cũng cần dự phòng.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "L4 load balancer", meaning: "Cân bằng theo kết nối TCP/UDP, chỉ nhìn IP và port." },
+    { term: "L7 load balancer", meaning: "Hiểu HTTP, chọn backend cho từng request theo host/path/header." },
+    { term: "TLS termination", meaning: "LB giải mã HTTPS rồi chuyển tiếp vào trong (HTTP hoặc mã hoá lại)." },
+    { term: "reverse proxy", meaning: "Máy đứng trước app, client chỉ nói chuyện với nó." },
+    { term: "API gateway", meaning: "Reverse proxy có thêm auth, rate limit, routing nhiều service." },
+    { term: "X-Forwarded-For", meaning: "Header proxy thêm vào để app biết IP client gốc." },
+    { term: "keepalived / VRRP", meaning: "Cơ chế giữ IP ảo chuyển sang LB dự phòng khi LB chính chết." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn muốn chuyển `/v2/*` sang cụm app mới cho 10% user có cookie `beta=1`. Cần gì?"
+  options={[
+    "L4 load balancer với thuật toán weighted",
+    "L7 load balancer đọc path và cookie",
+    "DNS round robin với TTL 60 giây",
+    "Tăng số instance cụm cũ",
+  ]}
+  answerIndex={1}
+  explanation="Path và cookie nằm trong 'tờ order' — chỉ người dẫn khách L7 mở phong bì mới đọc được. L4 chỉ thấy IP:port."
+/>

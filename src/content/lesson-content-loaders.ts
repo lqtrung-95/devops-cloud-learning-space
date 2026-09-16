@@ -30,4 +30,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "sd06-scaling-databases": (lessonSlug) => import(`./modules/sd06-scaling-databases/lessons/${lessonSlug}.mdx`),
   "sd01-system-design-mindset": (lessonSlug) => import(`./modules/sd01-system-design-mindset/lessons/${lessonSlug}.mdx`),
   "sd02-networking-communication": (lessonSlug) => import(`./modules/sd02-networking-communication/lessons/${lessonSlug}.mdx`),
+  "sd03-scaling-load-balancing": (lessonSlug) => import(`./modules/sd03-scaling-load-balancing/lessons/${lessonSlug}.mdx`),
 };

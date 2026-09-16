@@ -1,0 +1,156 @@
+import { LoadBalancingAlgorithmSimulatorDiagram } from "../diagrams/load-balancing-algorithm-simulator-diagram";
+
+<Eli5 title="Người dẫn khách có 4 cách chia quầy" emoji="🎟️">
+  **Round robin** giống phát số lần lượt: khách 1 quầy A, khách 2 quầy B, khách 3 quầy C, rồi lại A. Công bằng về *lượt*, nhưng không để ý quầy A đang có ba bàn tiệc ngồi mãi không xong.
+
+  **Least connections** thì người dẫn liếc xem **quầy nào đang ít khách ngồi nhất** rồi dẫn tới đó. **Weighted** là quầy to có 4 đầu bếp thì nhận nhiều khách hơn quầy 1 đầu bếp.
+
+  **IP hash** là "khách ở ngõ nào thì luôn về quầy đó": tiện cho khách quen, nhưng nếu cả một khu tập thể (cùng công ty, cùng NAT) kéo tới thì một quầy bị ngập, và khi một quầy đóng cửa, nhiều khách bị đổi quầy.
+</Eli5>
+
+Thuật toán cân bằng tải hiếm khi là thứ đầu tiên làm hệ thống sập, nhưng chọn sai sẽ thấy rõ ở **p95/p99**: vài instance bị dồn request chậm trong khi instance khác rảnh. Biết khi nào round robin là đủ và khi nào không là kiểu hiểu biết giúp bạn đọc đúng biểu đồ latency lúc sự cố.
+
+<LoadBalancingAlgorithmSimulatorDiagram />
+
+<Technical>
+
+### Các thuật toán trong Nginx open source
+
+| Thuật toán | Directive trong `upstream` | Cách chọn |
+|---|---|---|
+| Round robin (có weight) | mặc định, `server ... weight=N` | Xoay vòng theo trọng số (smooth weighted round robin) |
+| Least connections | `least_conn;` | Server có ít kết nối đang hoạt động nhất, có tính weight |
+| IP hash | `ip_hash;` | Hash IP client; IPv4 chỉ dùng **3 octet đầu** ⇒ cả dải /24 về cùng server |
+| Hash theo key | `hash $request_uri consistent;` | Hash một key tuỳ ý; `consistent` dùng consistent hashing (ketama) — SD06 |
+| Random | `random two least_conn;` | Chọn ngẫu nhiên 2 server, lấy cái ít kết nối hơn ("power of two choices") |
+
+`least_time` (chọn theo latency trung bình) và `slow_start` là tính năng của **NGINX Plus** — kiểm tra tài liệu mới nhất nếu bạn dùng bản khác.
+
+```nginx title="nginx/default.conf (trích)"
+upstream app_backend {
+    least_conn;
+    server 10.0.1.11:3000 weight=4;   # máy 8 vCPU
+    server 10.0.1.12:3000 weight=4;
+    server 10.0.1.13:3000 weight=1;   # máy 2 vCPU đang chờ thay
+    server 10.0.1.14:3000 backup;     # chỉ nhận tải khi mọi server chính không khả dụng
+    keepalive 32;
+}
+```
+
+### Vì sao round robin hỏng khi request không đều?
+
+Round robin chia đều **số request**, không chia đều **khối lượng việc**. Dùng định luật Little (`L = λ × W`: số request đang xử lý = tốc độ đến × thời gian xử lý) để ước lượng.
+
+Giả định: mỗi instance nhận **500 RPS**; 99% request mất 20 ms, 1% là export mất 5 s.
+
+- Thời gian trung bình `W` ≈ 0,99 × 0,02 + 0,01 × 5 ≈ 0,02 + 0,05 = **0,07 s**
+- Số request đang xử lý trung bình `L` ≈ 500 × 0,07 ≈ **35**, trong đó cỡ **25** là request chậm
+- 1% nghe nhỏ nhưng chiếm phần lớn "chỗ ngồi". Khi vài request chậm dồn vào cùng một instance (round robin không né được), request nhanh xếp hàng sau chúng ⇒ p99 tăng vọt dù CPU trung bình vẫn thấp
+
+`least_conn` nhìn số kết nối đang mở nên tự né instance đang bận. Nhưng nó chỉ biết *số kết nối của chính LB đó*: có 3 Nginx chạy song song thì mỗi con chỉ thấy một phần bức tranh — `random two least_conn` giảm hiện tượng nhiều LB cùng dồn vào một server "trông có vẻ rảnh".
+
+### Kết nối dài làm mọi thuật toán lệch
+
+WebSocket, gRPC (HTTP/2) hay pool kết nối DB giữ kết nối hàng giờ. L4 chỉ chọn server lúc mở kết nối ⇒ scale thêm instance mới thì instance mới gần như không nhận tải cho tới khi client kết nối lại. Với gRPC, dùng L7 cân bằng theo **từng request** (Envoy, ALB hỗ trợ gRPC) hoặc client-side load balancing.
+
+### Trade-off: chọn thuật toán nào?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Round robin | Đơn giản, dễ đoán, không cần trạng thái | Không biết server nào đang bận | Request ngắn và đều, server giống nhau |
+| Weighted round robin | Tận dụng máy khác cấu hình | Weight tĩnh, phải tự chỉnh khi đổi máy | Pool lẫn máy to/nhỏ, canary 5% tải |
+| least_conn | Né server bận, hợp request dài/không đều | Mỗi LB chỉ thấy kết nối của mình; server mới có thể bị dồn tải | API có endpoint chậm, upload, report |
+| ip_hash / hash key | Cùng client/key về cùng server (cache local, affinity) | Tải lệch theo NAT/key nóng; đổi pool làm xáo trộn mapping | Cache cục bộ theo key (dùng `consistent`), không nên dùng thay session store |
+
+Đổi ý khi: số đo cho thấy p99 của từng instance chênh nhau nhiều trong khi RPS như nhau ⇒ bỏ round robin, thử `least_conn`.
+
+</Technical>
+
+## Thực hành
+
+Thêm endpoint có thời gian xử lý không đều. Request chậm **đốt CPU** (không phải `await` ngủ) để instance thật sự bận — nếu chỉ `await setTimeout`, Node vẫn nhận request khác và khác biệt giữa hai thuật toán nhỏ hơn nhiều. Chính điều đó cũng là một bài học: thuật toán chỉ quan trọng khi instance có giới hạn đồng thời (CPU, pool DB).
+
+```ts title="app/src/slow-route.ts"
+import type { FastifyInstance } from "fastify";
+
+function burnCpu(ms: number) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) Math.sqrt(Math.random());
+}
+
+export async function slowRoute(app: FastifyInstance) {
+  app.get("/api/slow", async () => {
+    const ms = Math.random() < 0.05 ? 300 : 5; // 5% request nặng
+    burnCpu(ms);
+    return { ms, servedBy: process.env.HOSTNAME };
+  });
+}
+```
+
+```js title="k6/lb-test.js"
+import http from "k6/http";
+import { check, sleep } from "k6";
+
+const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
+const PATH_UNDER_TEST = __ENV.PATH_UNDER_TEST || "/api/slow";
+
+export const options = {
+  stages: [
+    { duration: "30s", target: 50 },
+    { duration: "1m", target: 500 },
+    { duration: "30s", target: 0 },
+  ],
+  thresholds: { http_req_failed: ["rate<0.01"] },
+};
+
+export default function () {
+  const res = http.get(`${BASE_URL}${PATH_UNDER_TEST}`);
+  check(res, { "status 200": (r) => r.status === 200 });
+  sleep(0.1);
+}
+```
+
+<Terminal
+  commands={[
+    { comment: "Lần 1: round robin (upstream chưa có least_conn) — trích summary, số minh hoạ, máy bạn sẽ khác", command: "k6 run k6/lb-test.js", output: "http_req_duration..: avg=96ms   med=21ms p(90)=240ms p(95)=610ms\nhttp_req_failed....: 0.00%  0 out of 71904\nhttp_reqs..........: 71904  599.2/s" },
+    { comment: "Lần 2: thêm least_conn; vào upstream rồi reload", command: "docker compose exec nginx nginx -s reload" },
+    { command: "k6 run k6/lb-test.js", output: "http_req_duration..: avg=71ms   med=19ms p(90)=180ms p(95)=390ms\nhttp_req_failed....: 0.00%  0 out of 75310\nhttp_reqs..........: 75310  627.6/s" },
+    { comment: "Chạy k6 bằng Docker: localhost trong container không phải máy bạn", command: "docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run - < k6/lb-test.js" },
+  ]}
+/>
+
+<Callout type="mistake" title="Dùng ip_hash để 'giữ session'">
+  `ip_hash` không thay được session store: user đổi từ Wi-Fi sang 4G là đổi IP, cả văn phòng sau một NAT dồn về một server, và thêm/bớt server làm nhiều client bị đổi chỗ. Đưa session ra Redis (bài 1).
+</Callout>
+
+<Callout type="tip">
+  So sánh thuật toán thì chỉ đổi **một** biến mỗi lần, chạy k6 ít nhất 2 lần mỗi cấu hình và ghi lại số CPU của Docker VM. Chênh lệch nhỏ hơn độ dao động giữa hai lần chạy thì chưa kết luận được gì.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Ít khi bị hỏi "liệt kê thuật toán". Câu hỏi thật thường là: *"Một số request rất chậm làm p99 tăng, bạn làm gì?"* Câu trả lời mạnh: least connections (hoặc power of two choices khi có nhiều LB), tách endpoint chậm sang pool riêng bằng L7 routing hoặc chuyển sang xử lý async (SD07), và đo p99 theo từng instance để xác nhận.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "round robin", meaning: "Chia request lần lượt cho từng server." },
+    { term: "weighted", meaning: "Server có trọng số lớn nhận tỉ lệ request lớn hơn." },
+    { term: "least connections", meaning: "Gửi tới server có ít kết nối đang hoạt động nhất." },
+    { term: "ip_hash", meaning: "Hash IP client để luôn chọn cùng một server." },
+    { term: "power of two choices", meaning: "Chọn ngẫu nhiên 2 server, lấy cái ít tải hơn — đơn giản mà cân bằng tốt." },
+    { term: "Little's law", meaning: "Số việc đang xử lý = tốc độ đến × thời gian xử lý trung bình." },
+    { term: "backup server", meaning: "Server chỉ nhận tải khi mọi server chính không khả dụng." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn thêm 2 instance gRPC mới vào pool sau một L4 load balancer, nhưng sau 30 phút chúng gần như không nhận request. Nguyên nhân khả dĩ nhất?"
+  options={[
+    "Weight của instance mới đang là 0",
+    "Round robin bị lỗi",
+    "Client giữ kết nối HTTP/2 lâu dài; L4 chỉ chọn server lúc mở kết nối nên kết nối cũ vẫn dính vào instance cũ",
+    "Instance mới chưa có cache",
+  ]}
+  answerIndex={2}
+  explanation="Người dẫn khách L4 chỉ chia 'bàn' lúc khách mới vào; khách ngồi lì cả buổi (kết nối dài) thì quầy mới vẫn vắng. Cần L7 cân bằng theo từng request hoặc client-side load balancing."
+/>

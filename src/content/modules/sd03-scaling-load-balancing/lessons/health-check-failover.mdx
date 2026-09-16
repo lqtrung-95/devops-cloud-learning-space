@@ -1,0 +1,146 @@
+import { HealthCheckFailoverDiagram } from "../diagrams/health-check-failover-diagram";
+
+<Eli5 title="Quầy đóng cửa thì người dẫn khách làm gì?" emoji="🚧">
+  Có hai kiểu người dẫn khách. Kiểu **thụ động** không đi kiểm tra ai cả: cứ dẫn khách vào, thấy **ba khách liên tiếp bị quầy B từ chối** thì mới thôi dẫn tới B một lúc. Rẻ, nhưng ba khách đầu tiên là "chuột bạch".
+
+  Kiểu **chủ động** cứ vài giây lại **đi ngang gõ cửa từng quầy** hỏi "còn bán không?" (health check). Quầy im lặng hai lần liền là gạch tên, trước khi có nhiều khách phải đứng chờ.
+
+  Còn khi quán muốn **thay đầu bếp quầy B** (deploy), cách lịch sự là treo biển "không nhận khách mới" nhưng vẫn phục vụ nốt khách đang ăn rồi mới đóng quầy — gọi là **connection draining**.
+</Eli5>
+
+"Scale ngang để chịu lỗi" chỉ đúng khi load balancer **phát hiện được** instance hỏng và **ngừng gửi** request tới đó đủ nhanh. Thiếu phần này, 3 instance không hề cho bạn availability cao hơn — mỗi lần deploy hay crash vẫn là một tràng lỗi 5xx.
+
+<HealthCheckFailoverDiagram />
+
+<Technical>
+
+### Passive health check trong Nginx open source
+
+```nginx title="nginx/default.conf"
+upstream app_backend {
+    least_conn;
+    server app:3000 max_fails=3 fail_timeout=10s;
+    keepalive 32;
+}
+
+server {
+    listen 8080;
+    location / {
+        proxy_pass http://app_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 1s;      # mặc định 60s — quá lâu để phát hiện instance chết
+        proxy_read_timeout 10s;
+        proxy_next_upstream error timeout http_502 http_503;
+        proxy_next_upstream_tries 2;   # tối đa 2 server cho một request
+        proxy_next_upstream_timeout 3s;
+    }
+}
+```
+
+- `max_fails=3 fail_timeout=10s`: **3 lần thất bại trong 10s** ⇒ server bị coi là không khả dụng **trong 10s**. Mặc định là `max_fails=1 fail_timeout=10s`; `max_fails=0` tắt việc đếm.
+- "Thất bại" là gì do `proxy_next_upstream` quyết định (mặc định `error timeout`). `http_404` không bao giờ bị tính là lỗi.
+- `proxy_next_upstream` thử lại request ở server khác. Request **không idempotent** (`POST`, `PATCH`, `LOCK`) **không** được retry trừ khi thêm `non_idempotent` — vì có thể server đầu đã xử lý xong rồi mới chết.
+- Nếu upstream chỉ có **một** server, `max_fails`/`fail_timeout` bị bỏ qua. (`server app:3000` resolve ra 3 IP thì là 3 server.)
+
+### Active health check
+
+LB tự gửi probe (`GET /health`) theo chu kỳ, loại instance sau N lần lỗi liên tiếp, thêm lại sau M lần thành công.
+
+| Nơi có | Cấu hình tiêu biểu |
+|---|---|
+| AWS ALB/NLB target group | interval, timeout, healthy/unhealthy threshold, path, matcher |
+| Kubernetes | `readinessProbe` (có nhận traffic không) khác `livenessProbe` (có cần restart không) |
+| HAProxy | `option httpchk` + `check inter 2s fall 3 rise 2` |
+| NGINX Plus | `health_check interval=5 fails=2 passes=2 uri=/health;` — **không có** trong Nginx open source |
+
+### Health check nông hay sâu?
+
+- **Nông (shallow):** process sống, event loop không kẹt, trả `200` nhanh. An toàn cho LB.
+- **Sâu (deep):** kiểm tra cả Postgres/Redis. Nghe kỹ, nhưng khi Postgres chập chờn, **mọi** instance cùng fail ⇒ LB loại tất cả ⇒ sập toàn bộ, kể cả endpoint không cần DB. Dùng deep check cho monitoring/alert, còn LB nên dựa vào sức khoẻ của chính instance.
+
+### Graceful shutdown & connection draining
+
+```ts title="app/src/server.ts (trích)"
+const shutdown = async (signal: string) => {
+  app.log.info({ signal }, "draining: ngừng nhận request mới");
+  await app.close();   // đóng listener, chờ request đang chạy xong
+  await redis.quit();
+  await pool.end();
+  process.exit(0);
+};
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
+```
+
+Docker gửi `SIGTERM`, đợi `stop_grace_period` (mặc định 10s) rồi `SIGKILL`. Trên AWS, target group có **deregistration delay** để request đang chạy làm nốt; Kubernetes dùng readiness fail + `terminationGracePeriodSeconds`. Nginx open source không có draining riêng: đánh dấu `down` rồi `nginx -s reload` — worker cũ phục vụ nốt request đang chạy.
+
+### Ước lượng: cửa sổ lỗi khi một instance chết
+
+Giả định: 600 RPS chia đều 3 instance ⇒ instance chết đang nhận cỡ **200 RPS**; không có retry.
+
+- Active check interval 5s, unhealthy threshold 2 ⇒ phát hiện chậm nhất cỡ **10s** ⇒ tới **~2.000 request lỗi**
+- Passive `max_fails=3 fail_timeout=10s`: bị loại sau 3 lỗi, nhưng mỗi 10s lại thử bằng request thật ⇒ ít lỗi hơn nhiều, *nếu* `proxy_connect_timeout` ngắn; để mặc định 60s thì user chờ tới 60s
+- Có `proxy_next_upstream` với request idempotent ⇒ phần lớn user nhận `200` chậm hơn thay vì `502`
+
+Kết hợp **active + passive + retry cho request idempotent** là cấu hình thường gặp ở hệ thống thật.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Passive (đếm lỗi thật) | Không tốn probe, có sẵn ở Nginx OSS | User thật gặp lỗi đầu tiên; instance "sống mà chậm" khó phát hiện | Nginx OSS, hệ thống nhỏ, luôn bật kèm |
+| Active probe | Phát hiện trước khi nhiều user dính lỗi; kiểm soát thêm lại | Thêm cấu hình; probe có thể "xanh" trong khi request thật lỗi | Managed LB, Kubernetes, production |
+| Retry sang instance khác | Che lỗi tạm thời khỏi user | Nhân tải khi cả cụm quá tải (retry storm); nguy hiểm với request không idempotent | Request `GET`/idempotent, giới hạn `tries` và `timeout` |
+| Deep health check cho LB | Phát hiện dependency hỏng | Một dependency chập chờn loại toàn bộ instance | Hầu như chỉ dùng cho monitoring, không cho LB |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chạy tải nền ở terminal khác", command: "k6 run --vus 200 --duration 2m k6/lb-test.js" },
+    { comment: "Xem tên container các replica", command: "docker compose ps app --format '{{.Name}}'", output: "sd-playground-app-1\nsd-playground-app-2\nsd-playground-app-3" },
+    { comment: "Giết một replica giữa lúc chạy tải", command: "docker kill sd-playground-app-2", output: "sd-playground-app-2" },
+    { comment: "Nginx ghi lại lỗi kết nối và việc tạm loại server", command: "docker compose logs nginx | grep -E 'timed out|temporarily disabled' | tail -2", output: "nginx-1  | 2026/09/15 11:02:41 [error] 29#29: *48211 upstream timed out (110: Connection timed out) while connecting to upstream, client: 172.18.0.1, server: , request: \"GET /api/slow HTTP/1.1\", upstream: \"http://172.18.0.7:3000/api/slow\", host: \"localhost:8080\"\nnginx-1  | 2026/09/15 11:02:42 [warn] 29#29: *48230 upstream server temporarily disabled while connecting to upstream, client: 172.18.0.1, server: , request: \"GET /api/slow HTTP/1.1\", upstream: \"http://172.18.0.7:3000/api/slow\", host: \"localhost:8080\"" },
+    { comment: "Kiểm tra app tắt êm khi nhận SIGTERM (xem log draining)", command: "docker compose stop -t 20 app && docker compose logs app | grep draining | tail -1", output: "app-3  | {\"level\":30,\"signal\":\"SIGTERM\",\"msg\":\"draining: ngừng nhận request mới\"}" },
+    { comment: "Bật lại đủ 3 replica và reload Nginx", command: "docker compose up -d --scale app=3 && docker compose exec nginx nginx -s reload" },
+  ]}
+/>
+
+<Callout type="mistake" title="App không bao giờ nhận được SIGTERM">
+  `CMD npm start` (shell form) hoặc chạy qua `npm` có thể không chuyển tiếp signal tới Node, nên app bị `SIGKILL` sau 10s và cắt ngang request. Dùng exec form `CMD ["node", "dist/server.js"]` (hoặc `init: true` trong compose) và kiểm tra log draining như trên.
+</Callout>
+
+<Callout type="warning" title="Retry có thể làm sự cố tệ hơn">
+  Khi cả cụm quá tải chứ không phải một instance chết, retry nhân đôi số request vào đúng lúc hệ thống yếu nhất. Luôn giới hạn `proxy_next_upstream_tries` và `proxy_next_upstream_timeout`; retry có backoff/jitter và circuit breaker ở SD11.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi hay gặp: *"Một server trong pool chết thì chuyện gì xảy ra?"* Câu trả lời mạnh đi theo dòng thời gian: LB phát hiện (active probe + passive), bao lâu thì phát hiện (interval × threshold), request đang bay thì sao (retry nếu idempotent), deploy thì dùng draining, và cảnh báo health check sâu gây sập dây chuyền. Nhắc thêm N+1 để phần còn lại gánh đủ tải.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "passive health check", meaning: "Đánh giá server dựa trên lỗi của request thật (max_fails, fail_timeout)." },
+    { term: "active health check", meaning: "LB tự gửi probe định kỳ để loại/thêm server." },
+    { term: "proxy_next_upstream", meaning: "Directive Nginx quyết định lỗi nào được thử lại ở server khác." },
+    { term: "idempotent", meaning: "Gọi nhiều lần cho cùng kết quả như gọi một lần — mới an toàn để retry." },
+    { term: "connection draining", meaning: "Ngừng nhận request mới nhưng làm nốt request đang chạy trước khi tắt." },
+    { term: "readiness vs liveness", meaning: "Có nên nhận traffic không / có cần khởi động lại không." },
+    { term: "flapping", meaning: "Server bị loại rồi thêm lại liên tục vì ngưỡng quá nhạy." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một instance vẫn trả `200` cho `/health` nhưng mọi request thật mất 8 giây vì bị kẹt pool DB. Active health check nông không bắt được. Cơ chế nào giúp giảm ảnh hưởng tới user?"
+  options={[
+    "Tăng interval của health check",
+    "Passive check dựa trên timeout của request thật (proxy_read_timeout ngắn + max_fails) kết hợp least_conn",
+    "Chuyển sang ip_hash",
+    "Tắt keepalive",
+  ]}
+  answerIndex={1}
+  explanation="Người gõ cửa hỏi 'còn bán không?' nhận câu 'còn' nhưng khách vào thì chờ mãi. Đếm khách thật bị chờ quá lâu (passive) và dẫn khách tới quầy ít người (least_conn) mới phản ánh đúng thực tế."
+/>

@@ -1,0 +1,155 @@
+import { SessionStoreScenarioDiagram } from "../diagrams/session-store-scenario-diagram";
+
+<Eli5 title="Quán phở đông khách: mua nồi to hay mở thêm quầy?" emoji="🍜">
+  Quán phở bắt đầu đông. Cách thứ nhất: **mua nồi to hơn, thuê một đầu bếp siêu tốc** — đó là **vertical scaling** (scale dọc). Nhanh, không phải đổi cách làm, nhưng nồi to cỡ nào cũng có giới hạn, và nếu đầu bếp đó ốm thì cả quán đóng cửa.
+
+  Cách thứ hai: **mở thêm 3 quầy giống hệt nhau** và thuê một người đứng cửa dẫn khách — đó là **horizontal scaling** (scale ngang). Muốn phục vụ thêm khách thì thêm quầy; một quầy nghỉ thì các quầy khác vẫn bán.
+
+  Nhưng có một điều kiện: **order phải ghi vào sổ chung** ở quầy thu ngân. Nếu mỗi đầu bếp chỉ nhớ order trong đầu, khách quay lại hỏi "phở của tôi đâu?" mà bị dẫn tới quầy khác thì không ai biết. App "nhớ trong đầu" gọi là **stateful**; app ghi mọi thứ ra sổ chung gọi là **stateless**.
+</Eli5>
+
+Ở công việc thật, "scale" gần như luôn bắt đầu bằng câu hỏi: *app của mình có chạy được nhiều bản song song không?* Trong phỏng vấn, câu "tôi sẽ đặt load balancer và scale ngang tầng app" chỉ có giá trị khi bạn nói tiếp được **state nằm ở đâu**.
+
+<SessionStoreScenarioDiagram />
+
+<Technical>
+
+### Vertical vs horizontal scaling
+
+- **Vertical (scale up):** tăng CPU/RAM/disk cho một máy. Không đổi code, không cần load balancer. Giới hạn bởi máy lớn nhất bạn mua được, chi phí tăng nhanh hơn tuyến tính ở các cỡ máy lớn, và nâng cấp thường cần restart (downtime).
+- **Horizontal (scale out):** thêm nhiều máy/container giống nhau sau load balancer. Lý thuyết là "vô hạn", có sẵn khả năng chịu lỗi, nhưng đòi hỏi app **stateless** và kéo theo độ phức tạp: LB, deploy nhiều bản, log/metric tập trung.
+
+Thực tế hay kết hợp: tầng app scale ngang (dễ), còn database thường scale dọc càng lâu càng tốt trước khi phải sharding (SD06).
+
+### Stateless nghĩa là gì?
+
+Một instance **stateless** không giữ dữ liệu nào mà request sau *bắt buộc* phải quay lại đúng instance đó mới đọc được. Những thứ hay "lén" làm app thành stateful:
+
+| State | Chỗ nên đặt |
+|---|---|
+| Session đăng nhập | Redis (hoặc token tự chứa như JWT, đổi lại khó thu hồi) |
+| File user upload | Object storage (S3/MinIO — SD08), không phải disk local |
+| Cache trong RAM | Được, *nếu* mất cache không làm sai kết quả (SD04) |
+| Job/cron chạy trong process | Queue hoặc scheduler riêng (SD07), tránh 3 instance cùng chạy job |
+| WebSocket connection | Vẫn gắn với 1 instance — cần pub/sub để các instance nói chuyện (SD16) |
+
+### Ước lượng nhanh: cần bao nhiêu instance?
+
+Giả định: peak **3.000 RPS**; benchmark cho thấy mỗi instance xử lý cỡ **400 RPS** ở CPU 60% (con số của *app bạn*, phải tự đo bằng k6); muốn chịu được mất 1 instance (N+1).
+
+- 3.000 ÷ 400 ≈ 7,5 ⇒ **8 instance** để chạy tải đỉnh
+- N+1 ⇒ **9 instance**; nếu deploy rolling tắt 1 bản mỗi lần, cân nhắc N+2 ⇒ **10**
+
+Còn availability: 2 instance, mỗi instance 99% và hỏng *độc lập* ⇒ xác suất cả hai cùng chết 0,01 × 0,01 ⇒ tầng app cỡ 99,99%. Giả định "độc lập" hay sai (cùng AZ, cùng bug deploy) và load balancer cũng phải không phải điểm chết duy nhất.
+
+### Session trong Redis (Fastify)
+
+```ts title="app/src/session-routes.ts"
+import { randomUUID } from "node:crypto";
+import cookie from "@fastify/cookie";
+import type { FastifyInstance } from "fastify";
+import { createClient } from "redis";
+
+const redis = createClient({ url: process.env.REDIS_URL ?? "redis://redis:6379" });
+await redis.connect();
+const SESSION_TTL_SECONDS = 30 * 60;
+
+export async function sessionRoutes(app: FastifyInstance) {
+  await app.register(cookie);
+
+  app.post("/login", async (_req, reply) => {
+    const sid = randomUUID();
+    await redis.set(`sess:${sid}`, JSON.stringify({ userId: "u42" }), { EX: SESSION_TTL_SECONDS });
+    reply.setCookie("sid", sid, { httpOnly: true, sameSite: "lax", path: "/" });
+    return { ok: true };
+  });
+
+  app.get("/me", async (req, reply) => {
+    const sid = req.cookies.sid;
+    const raw = sid ? await redis.get(`sess:${sid}`) : null;
+    if (!raw) return reply.code(401).send({ error: "not logged in" });
+    return { ...JSON.parse(raw), servedBy: process.env.HOSTNAME };
+  });
+}
+```
+
+`HOSTNAME` trong container Docker mặc định là container ID ngắn — tiện để thấy request rơi vào instance nào.
+
+### Trade-off: session để ở đâu?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| RAM của instance | Đơn giản, nhanh nhất | Mất khi restart; không scale ngang được | Chỉ 1 instance, prototype |
+| Sticky session ở LB | Không sửa code | Instance chết là mất session; tải lệch; khó scale-in | Giải pháp tạm khi đang migrate app cũ |
+| Store ngoài (Redis) | Instance nào cũng phục vụ được; thu hồi session dễ | Thêm dependency cần HA; thêm ~1 round trip | Mặc định cho web app nhiều instance |
+| Token tự chứa (JWT) | Không cần tra store mỗi request | Khó thu hồi trước hạn; token to hơn | API nhiều service, TTL ngắn + refresh token |
+
+Đổi ý khi: nếu cần "đăng xuất mọi thiết bị ngay lập tức", JWT thuần gây khó — quay lại store ngoài hoặc JWT + danh sách thu hồi.
+
+</Technical>
+
+## Thực hành
+
+Scale `app` lên 3 replica trong `sd-playground`. Service `app` **không** được có `ports:` hay `container_name:` (hai replica không thể cùng giữ port 3000 trên host).
+
+```yaml title="compose.yaml (trích)"
+services:
+  app:
+    build: ./app
+    expose: ["3000"]
+    environment:
+      REDIS_URL: redis://redis:6379
+    depends_on: [redis]
+  nginx:
+    image: nginx:1.27
+    ports: ["8080:8080"]
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on: [app]
+```
+
+<Terminal
+  commands={[
+    { comment: "Chạy 3 replica của app", command: "docker compose up -d --build --scale app=3" },
+    { comment: "Nginx chỉ resolve tên 'app' lúc nạp cấu hình → reload sau khi đổi số replica", command: "docker compose exec nginx nginx -s reload" },
+    { comment: "Đăng nhập, lưu cookie vào jar.txt", command: "curl -s -c jar.txt -X POST localhost:8080/login", output: "{\"ok\":true}" },
+    { comment: "Gọi /me nhiều lần — servedBy đổi nhưng vẫn 200", command: "for i in 1 2 3; do curl -s -b jar.txt localhost:8080/me; echo; done", output: "{\"userId\":\"u42\",\"servedBy\":\"3f2a9c1d7b44\"}\n{\"userId\":\"u42\",\"servedBy\":\"a81e0b5c22f9\"}\n{\"userId\":\"u42\",\"servedBy\":\"c7d4e6f01a3b\"}" },
+    { comment: "Session nằm trong Redis, có TTL", command: "docker compose exec redis redis-cli --scan --pattern 'sess:*'", output: "sess:0b6c3e2a-5f41-4d7e-9a8b-1c2d3e4f5a6b" },
+    { command: "docker compose exec redis redis-cli TTL sess:0b6c3e2a-5f41-4d7e-9a8b-1c2d3e4f5a6b", output: "(integer) 1774" },
+  ]}
+/>
+
+<Callout type="mistake" title="Scale được nhưng vẫn stateful">
+  App chạy 3 replica "ngon" trong demo vì chỉ test bằng một request. Thử lại với **session, file upload, cron job** — ba chỗ hay giữ state trong instance nhất. Cron chạy trong process nhân 3 replica là gửi email nhắc nhở 3 lần.
+</Callout>
+
+<Callout type="warning">
+  Scale ngang trên một laptop bị giới hạn bởi số CPU của Docker VM. Nếu Docker Desktop chỉ có 4 CPU, 8 replica không nhanh hơn 4 replica. Mục tiêu của lab là thấy **hình dạng** đường cong throughput, không phải con số tuyệt đối.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi vẽ "LB → nhiều app server", người phỏng vấn thường hỏi ngay: *"User login ở server 1, request sau vào server 2 thì sao?"* Câu trả lời mạnh: app stateless, session ở Redis (có replica), file ở object storage; nhắc sticky session là phương án tạm và vì sao nó hỏng khi scale-in. Kèm một phép ước lượng số instance có giả định rõ ràng.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "vertical scaling", meaning: "Tăng tài nguyên cho một máy (scale up)." },
+    { term: "horizontal scaling", meaning: "Thêm nhiều máy/instance giống nhau sau load balancer (scale out)." },
+    { term: "stateless", meaning: "Instance không giữ dữ liệu mà request sau bắt buộc phải quay lại đúng nó." },
+    { term: "sticky session", meaning: "LB gắn một client với một instance cố định (cookie/IP)." },
+    { term: "session store", meaning: "Nơi lưu session dùng chung cho mọi instance, ví dụ Redis." },
+    { term: "N+1", meaning: "Dư ra ít nhất một instance để chịu được mất một bản mà vẫn đủ tải." },
+  ]}
+/>
+
+<QuickCheck
+  question="App lưu file avatar user upload vào thư mục `/uploads` trên disk của container. Sau khi scale lên 3 replica, chuyện gì xảy ra?"
+  options={[
+    "Không sao, Docker tự đồng bộ thư mục giữa các replica",
+    "Avatar chỉ hiển thị khi request rơi vào đúng replica đã nhận file; mất luôn khi container bị thay",
+    "Nginx tự cache file nên không ảnh hưởng",
+    "Chỉ bị chậm hơn một chút",
+  ]}
+  answerIndex={1}
+  explanation="Disk local là 'trí nhớ trong đầu' của từng đầu bếp. File upload phải để ở chỗ dùng chung như object storage (S3/MinIO) thì app mới thật sự stateless."
+/>
