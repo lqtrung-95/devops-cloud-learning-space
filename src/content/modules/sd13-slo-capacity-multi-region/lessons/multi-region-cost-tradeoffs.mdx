@@ -1,0 +1,96 @@
+import { SingleVsMultiRegionTradeoffDiagram } from "../diagrams/single-vs-multi-region-tradeoff-diagram";
+
+<Eli5 title="Chuỗi cửa hàng mở thêm chi nhánh ở thành phố khác" emoji="🏪">
+
+Một cửa hàng chỉ có 1 chi nhánh ở Hà Nội. Khách ở Sài Gòn phải chờ hàng ship ra tới nơi — chậm. Chủ mở thêm chi nhánh ở Sài Gòn: khách Sài Gòn giờ mua tại chỗ, nhanh hẳn. Nghe rất được — nhưng chi nhánh mới không tự nhiên "miễn phí ăn theo" lợi ích đó:
+
+- Hai chi nhánh phải đối chiếu sổ sách với nhau (đồng bộ tồn kho) — tốn công, và có lúc hai bên cùng bán món cuối cùng trước khi kịp báo cho nhau (**conflict**, đã học ở SD09).
+- Chuyển hàng giữa 2 chi nhánh để cân bằng tồn kho tốn phí vận chuyển thật (**cross-region egress**).
+- Nếu một mặt hàng theo luật chỉ được bán ở đúng khu vực nào đó, chủ phải theo dõi riêng cho từng chi nhánh (**data residency**).
+
+Multi-region cũng vậy: latency thấp hơn cho user ở xa là lợi ích thật, nhưng đi kèm 3 cái giá thật, không phải "thêm region là toàn được lợi".
+
+</Eli5>
+
+<SingleVsMultiRegionTradeoffDiagram />
+
+<Technical>
+
+### Ba cái giá thật của multi-region
+
+1. **Cross-region data transfer / egress**: mỗi byte replicate giữa 2 region đều tính phí, và phí egress liên vùng thường cao hơn nhiều so với trong cùng region. Replicate liên tục (cho RPO nhỏ, bài trước) nghĩa là trả phí này liên tục, không phải một lần.
+2. **Consistency phức tạp hơn hẳn**: nếu cả 2 region cùng nhận ghi (active-active), bạn đang đối mặt lại đúng bài toán conflict đã học ở SD09 (last-write-wins, version vector, CRDT) — nhưng lần này ở quy mô xuyên lục địa với độ trễ mạng lớn hơn nhiều so với trong 1 datacenter.
+3. **Data residency**: một số ngành (tài chính, y tế, dữ liệu người dùng EU theo GDPR) yêu cầu dữ liệu của người dùng ở khu vực nào phải lưu trữ (và đôi khi xử lý) trong khu vực đó — multi-region không chỉ là quyết định kỹ thuật, đôi khi là quyết định pháp lý bắt buộc chứ không phải tuỳ chọn tối ưu latency.
+
+### Active-passive vs active-active nhìn từ góc chi phí/độ phức tạp
+
+- **Active-passive** (region phụ chỉ đứng chờ, không phục vụ traffic thật ngày thường): đơn giản hơn nhiều — vẫn một nguồn ghi (region chính), region phụ chỉ đọc dữ liệu replicate. Đây thực chất là warm standby/pilot light của bài DR trước, nhìn dưới góc "multi-region cho DR" thay vì "multi-region cho latency".
+- **Active-active** (cả 2 region cùng nhận ghi thật): giảm latency cho mọi user gần bất kỳ region nào, nhưng bắt buộc phải giải quyết conflict — không có cách nào né được, kể cả khi mạng liên vùng chạy hoàn hảo (độ trễ vật lý giữa 2 lục địa vẫn còn đó, ~100-200ms theo Phụ lục B).
+
+### Chi phí: hedge số liệu, đừng chốt cứng
+
+Giá dịch vụ cloud (compute, RDS, data transfer) thay đổi theo thời gian, theo region, theo loại instance và discount đang áp dụng. Đừng nói "multi-region tốn thêm $1.240/tháng" như một sự thật cố định. Cách làm đúng: dùng AWS Pricing Calculator để ra một **khoảng ước tính tại thời điểm viết**, và ghi rõ trong design doc rằng con số cần kiểm tra lại trước khi chốt ngân sách thật.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| 1 region | Đơn giản, không tốn cross-region egress, không conflict | User ở xa chịu latency cao, phụ thuộc hoàn toàn vào 1 region | User tập trung 1 khu vực địa lý, chưa cần DR đa vùng |
+| Multi-region active-passive | Có DR đa vùng, vẫn 1 nguồn ghi (đơn giản hơn active-active) | Vẫn tốn egress cho replication, region phụ "để không" phần lớn thời gian | Cần DR mạnh (RTO/RPO nhỏ) nhưng chưa cần giảm latency cho user đa vùng |
+| Multi-region active-active | Latency thấp cho user toàn cầu, chịu được mất 1 region gần như liền mạch | Chi phí cao nhất, phải giải quyết conflict 2 chiều liên tục, vận hành phức tạp hơn hẳn | User quốc tế đông, nhạy latency (chat, gaming, thanh toán thời gian thực), đã có kinh nghiệm vận hành đa vùng |
+
+**Khi nào đổi ý:** nếu >90% user tập trung ở 1 khu vực địa lý, multi-region cho latency thường không đáng giá so với chi phí/độ phức tạp — chỉ nên làm multi-region khi mục tiêu chính là DR (active-passive), hoặc khi có yêu cầu pháp lý data residency.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Ước lượng cross-region egress bằng số liệu playground"
+  prompt="$"
+  commands={[
+    { comment: "Ước lượng dung lượng ghi mới mỗi ngày cần replicate (WAL trong sd-playground)", command: "du -sh /backup/wal/ 2>/dev/null || echo '~2.4 GB/ngày (giả định từ SD06 lab)'", output: "~2.4 GB/ngày (giả định từ SD06 lab)" },
+    { comment: "Đo round-trip latency thật giữa 2 region giả lập bằng Toxiproxy hoặc ping tới endpoint xa", command: "ping -c 3 ap-southeast-1.amazonaws.com", output: "3 packets transmitted, 3 received, round-trip min/avg/max = 148/152/159 ms" },
+    { comment: "Ghi số này vào design doc: KHÔNG chốt cứng phí egress, dẫn người đọc tới AWS Pricing Calculator", command: "echo 'Xem ước tính egress tại: https://calculator.aws/'", output: "Xem ước tính egress tại: https://calculator.aws/" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Chọn multi-region active-active chỉ vì "nghe available hơn", mà chưa trả lời được câu hỏi: hai region cùng ghi thì ai thắng khi conflict? Nếu câu trả lời là "chắc không xảy ra đâu", đó là dấu hiệu chưa sẵn sàng cho active-active — hãy lùi về active-passive hoặc warm standby trước.
+
+</Callout>
+
+<Callout type="cost" title="Đừng chốt cứng số tiền — hedge và trỏ tới Pricing Calculator">
+
+Không nói "kiến trúc 2 region tốn thêm chính xác X USD/tháng". Nói: "theo ước tính từ AWS Pricing Calculator tại thời điểm viết, chi phí tăng thêm khoảng Y–Z% so với 1 region, chủ yếu do nhân đôi compute/RDS và cross-region data transfer — cần kiểm tra lại trước khi chốt ngân sách thật". Giá cloud thay đổi, số cứng sẽ lỗi thời rất nhanh.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi được hỏi "hệ thống có nên multi-region không", câu trả lời mạnh không trả lời "có" hay "không" ngay — hỏi lại (hoặc tự nêu giả định): user tập trung ở đâu, mục tiêu là giảm latency hay tăng DR, có yêu cầu data residency không. Sau đó chọn active-passive (đơn giản hơn, cho DR) hay active-active (cho latency toàn cầu, chấp nhận giải quyết conflict), và nêu rõ cái giá (egress, complexity) đi kèm — không nói "multi-region luôn tốt hơn".
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "cross-region egress", meaning: "Phí truyền dữ liệu ra khỏi một region sang region khác — tính liên tục nếu replicate liên tục." },
+    { term: "active-passive (multi-region)", meaning: "Chỉ 1 region nhận ghi thật; region còn lại đứng chờ hoặc chỉ phục vụ đọc — dùng chủ yếu cho DR." },
+    { term: "active-active (multi-region)", meaning: "Nhiều region cùng nhận ghi thật, giảm latency toàn cầu, nhưng bắt buộc xử lý conflict giữa các region." },
+    { term: "data residency", meaning: "Yêu cầu (thường là pháp lý) rằng dữ liệu của người dùng ở một khu vực phải lưu trữ/xử lý trong khu vực đó." },
+    { term: "hedge số liệu chi phí", meaning: "Trình bày chi phí dưới dạng khoảng ước tính có nguồn, có thời điểm — thay vì một con số cố định coi như sự thật." },
+  ]}
+/>
+
+<QuickCheck
+  question="Sản phẩm có 95% người dùng ở Việt Nam, 5% rải rác vài nước khác, chưa có yêu cầu pháp lý về data residency. Đề xuất nào hợp lý nhất theo bài học multi-region?"
+  options={[
+    "Chuyển ngay sang multi-region active-active toàn cầu để tối ưu latency cho tất cả user",
+    "Ở lại 1 region gần nhóm 95% user chính; nếu cần DR thì thêm active-passive ở region khác, chưa cần active-active vì lợi ích latency cho 5% user không đủ bù chi phí egress và độ phức tạp conflict",
+    "Không cần quan tâm tới region vì latency không ảnh hưởng trải nghiệm người dùng",
+    "Bắt buộc phải multi-region vì mọi hệ thống production hiện đại đều cần như vậy",
+  ]}
+  answerIndex={1}
+  explanation="Giống chuỗi cửa hàng: mở chi nhánh mới chỉ đáng giá khi đủ khách ở khu vực đó để bù chi phí vận hành thêm. Với 95% user tập trung 1 nơi, cái giá của active-active (egress liên tục, xử lý conflict) không tương xứng lợi ích latency cho 5% còn lại — active-passive (nếu cần DR) là lựa chọn cân bằng hơn."
+/>

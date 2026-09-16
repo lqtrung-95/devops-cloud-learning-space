@@ -27,6 +27,7 @@ import { sd08StorageSearchModule } from "./modules/sd08-storage-search/module-me
 import { sd09ConsistencyReplicationModule } from "./modules/sd09-consistency-replication/module-meta";
 import { sd11ReliabilityPatternsModule } from "./modules/sd11-reliability-patterns/module-meta";
 import { sd12MicroservicesApiDesignModule } from "./modules/sd12-microservices-api-design/module-meta";
+import { sd13SloCapacityMultiRegionModule } from "./modules/sd13-slo-capacity-multi-region/module-meta";
 
 /** All modules of every course (order within a course comes from `module.order`). Add modules after they pass `pnpm validate:module`. */
 export const curriculumModules: ModuleDefinition[] = [
@@ -58,4 +59,5 @@ export const curriculumModules: ModuleDefinition[] = [
   sd09ConsistencyReplicationModule,
   sd11ReliabilityPatternsModule,
   sd12MicroservicesApiDesignModule,
+  sd13SloCapacityMultiRegionModule,
 ];

@@ -1,0 +1,114 @@
+import { DrStrategyRtoRpoSliderDiagram } from "../diagrams/dr-strategy-rto-rpo-slider-diagram";
+
+<Eli5 title="Ổ cứng chứa album ảnh gia đình vừa cháy" emoji="🔥">
+
+Nhà bạn cháy, ổ cứng chứa album ảnh gia đình mất sạch. Hai câu hỏi hoàn toàn khác nhau:
+
+1. **Mất bao nhiêu ảnh là chấp nhận được?** Nếu bạn có thói quen backup lên cloud mỗi tối, bạn chỉ mất ảnh chụp TRONG NGÀY hôm đó. Đây là **RPO** (Recovery Point Objective) — nó quyết định bạn phải backup/đồng bộ THƯỜNG XUYÊN cỡ nào.
+2. **Mất bao lâu để có lại album ảnh (dù thiếu vài tấm)?** Nếu bạn có sẵn tài khoản cloud, tải lại chỉ mất vài phút. Nếu bạn phải chờ dịch vụ khôi phục ổ cứng vật lý, có thể mất cả tuần. Đây là **RTO** (Recovery Time Objective) — nó quyết định bạn cần chuẩn bị sẵn "chỗ để phục hồi vào" tới mức nào.
+
+Hai con số này độc lập nhau: bạn có thể backup rất thường xuyên (RPO nhỏ) mà vẫn mất cả tuần để dựng lại toàn bộ máy chủ (RTO lớn), nếu bạn chưa từng chuẩn bị hạ tầng để restore vào.
+
+</Eli5>
+
+<DrStrategyRtoRpoSliderDiagram />
+
+<Technical>
+
+### RPO và RTO — định nghĩa chính xác
+
+- **RPO (Recovery Point Objective)**: lượng dữ liệu tối đa chấp nhận mất, tính bằng thời gian kể từ bản sao lưu/replicate gần nhất tới lúc sự cố. RPO 5 phút nghĩa là backup/replication phải chạy đủ dày để không bao giờ "hổng" quá 5 phút.
+- **RTO (Recovery Time Objective)**: thời gian tối đa chấp nhận hệ thống ngừng hoạt động, từ lúc sự cố xảy ra tới lúc phục hồi xong và phục vụ lại bình thường. RTO quyết định bạn cần có sẵn bao nhiêu hạ tầng "đứng chờ" ở nơi phục hồi.
+
+**Sai lầm phổ biến nhất:** nhầm RPO là RTO hoặc ngược lại, hoặc coi chúng là một con số duy nhất "thời gian downtime". Chúng trả lời hai câu hỏi khác nhau và kéo theo hai loại đầu tư khác nhau (tần suất backup/replication vs mức độ sẵn sàng của hạ tầng đứng thay).
+
+### 4 chiến lược DR chuẩn (AWS), theo phổ tăng dần chi phí
+
+| Chiến lược | RPO | RTO | Cách hoạt động |
+|---|---|---|---|
+| Backup & restore | Theo lịch backup (vd 24h) | Vài giờ | Chỉ backup định kỳ (`pg_dump`, snapshot). Sự cố: dựng hạ tầng từ IaC + restore. Rẻ nhất, chậm nhất. |
+| Pilot light | Vài phút (WAL archiving/replication liên tục) | Vài chục phút | DB replica chạy sẵn dạng thu nhỏ ở region DR; app server tắt, bật khi cần. |
+| Warm standby | Gần như 0 | Vài phút | Toàn bộ stack chạy ở cả 2 nơi, DR chạy capacity nhỏ hơn — scale-out khi failover thật. |
+| Multi-site active-active | Gần như 0 | Gần như 0 | Cả 2 (hoặc nhiều) nơi cùng phục vụ traffic thật ngày thường. Đắt và phức tạp nhất. |
+
+Đây chính là phổ chuẩn của AWS Well-Architected (Reliability Pillar) và whitepaper Disaster Recovery of Workloads — càng sang phải, RTO/RPO càng nhỏ nhưng chi phí vận hành song song càng cao.
+
+### Áp dụng vào sd-playground: backup/restore Postgres đã học ở SD06
+
+Hai cách đạt RPO khác nhau cho cùng một Postgres:
+
+```bash
+# RPO thô (vài giờ-vài ngày): snapshot định kỳ, đơn giản nhất
+pg_dump -U app -d app -F c -f backup-$(date +%F-%H%M).dump
+
+# RPO nhỏ (vài phút): WAL archiving liên tục + base backup định kỳ
+# postgresql.conf: archive_mode = on, archive_command = 'cp %p /backup/wal/%f'
+pg_basebackup -U app -D /backup/base -Fp -Xs -P
+```
+
+`pg_dump` cho bạn một điểm khôi phục cố định (RPO = khoảng cách giữa 2 lần dump). WAL archiving cho RPO nhỏ hơn nhiều vì có thể replay WAL tới gần đúng thời điểm sự cố, không chỉ tới lần backup gần nhất — đây là nền tảng của chiến lược pilot light trở lên.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Backup & restore | Rẻ nhất, dễ hiểu | RTO/RPO lớn, phục hồi thủ công nhiều bước | Hệ thống nội bộ, downtime vài giờ chấp nhận được |
+| Pilot light | Cân bằng chi phí/RPO tốt | RTO vẫn cần vài chục phút để bật app server | RPO cần nhỏ nhưng RTO vài chục phút vẫn ổn |
+| Warm standby | RTO/RPO tốt, dễ test failover định kỳ | Chi phí chạy 2 nơi song song, dù DR chạy nhỏ | Doanh thu phụ thuộc uptime, ngân sách cho phép |
+| Multi-site active-active | RTO/RPO gần như 0 | Chi phí cao nhất, cần xử lý consistency 2 chiều (SD09) | Hạ tầng tối quan trọng, đã có kinh nghiệm vận hành multi-region |
+
+**Khi nào đổi ý:** đo RTO/RPO THẬT bằng drill (như lab của bài này), không chỉ tin vào tài liệu thiết kế — con số lý thuyết và con số đo được khi thực sự restore thường lệch nhau.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Đo RTO thật bằng cách bấm giờ một lần restore"
+  prompt="$"
+  commands={[
+    { comment: "Ghi thời điểm bắt đầu sự cố (giả lập mất volume)", command: "date -u +%FT%TZ && docker compose stop postgres", output: "2026-03-10T02:15:00Z" },
+    { comment: "Restore từ base backup + replay WAL", command: "pg_basebackup -U app -D ./restore-data -Fp -Xs -P && docker compose up -d postgres", output: "waiting for server to start... done\npostgres ready" },
+    { comment: "Ghi thời điểm app connect DB thành công -> RTO đo được = 02:41:00 - 02:15:00 = 26 phút", command: "curl -s localhost:8080/healthz && date -u +%FT%TZ", output: "{\"status\":\"ok\"}\n2026-03-10T02:41:00Z" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Viết RPO/RTO trong design doc mà chưa từng thực hành restore lần nào. Con số "RTO 30 phút" trên giấy thường bỏ sót các bước tốn thời gian thật: tìm đúng bản backup, chờ IaC dựng lại hạ tầng, DNS propagate, warm-up cache. Drill định kỳ là cách duy nhất biết con số đó có thật hay không.
+
+</Callout>
+
+<Callout type="cost" title="RPO/RTO càng nhỏ, chi phí đứng liên tục càng cao">
+
+Pilot light chỉ trả tiền cho phần lõi chạy thu nhỏ; warm standby và active-active trả tiền cho compute chạy 24/7 ở nơi thứ hai dù phần lớn thời gian không phục vụ traffic thật (hoặc phục vụ một phần). Trước khi chọn chiến lược cao hơn, ước tính chênh lệch chi phí bằng AWS Pricing Calculator (bài tiếp theo) thay vì chọn theo cảm giác "an toàn hơn".
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi được hỏi "DR plan của bạn là gì", câu trả lời mạnh nêu rõ: (1) RPO và RTO cụ thể (không nói chung chung "phục hồi nhanh"); (2) chiến lược trong 4 loại chuẩn khớp với 2 con số đó; (3) đã (hoặc sẽ) drill để xác nhận con số thật; (4) chi phí ước tính của chiến lược đó. Thiếu bất kỳ ý nào trong 4 ý này khiến câu trả lời nghe như học thuộc lòng thay vì đã nghĩ nghiêm túc.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "RPO", meaning: "Recovery Point Objective — lượng dữ liệu tối đa chấp nhận mất, quyết định tần suất backup/replication." },
+    { term: "RTO", meaning: "Recovery Time Objective — thời gian tối đa chấp nhận ngừng hoạt động, quyết định mức sẵn sàng của hạ tầng đứng thay." },
+    { term: "pilot light", meaning: "Chiến lược DR: dữ liệu replicate liên tục ở region DR dạng thu nhỏ, app server tắt, bật khi cần." },
+    { term: "warm standby", meaning: "Chiến lược DR: toàn bộ stack chạy sẵn ở cả 2 nơi, DR chạy capacity nhỏ hơn, scale-out khi failover." },
+    { term: "DR drill", meaning: "Bài tập thực hành phục hồi có bấm giờ, để đo RTO/RPO THẬT thay vì chỉ tin vào con số lý thuyết." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một hệ thống bật WAL archiving liên tục (RPO đo được ~2 phút) nhưng chưa từng thử restore lần nào trong thực tế; tài liệu ghi RTO 'khoảng 20 phút'. Nhận xét nào đúng nhất?"
+  options={[
+    "Không vấn đề gì vì RPO đã tốt, RTO ghi trên giấy là đủ tin cậy",
+    "RPO đo được đáng tin vì có replication liên tục thật; nhưng RTO 20 phút chỉ là ước lượng chưa kiểm chứng — cần drill thật để biết các bước phục hồi (tìm bản backup, dựng hạ tầng, DNS, warm-up) có thực sự xong trong 20 phút hay không",
+    "RPO và RTO luôn tỉ lệ thuận nên RPO tốt thì RTO chắc chắn cũng tốt",
+    "Không cần drill vì WAL archiving tự động đã bao gồm cả việc đo RTO",
+  ]}
+  answerIndex={1}
+  explanation="RPO đo bằng dữ liệu (khoảng cách WAL) khác hẳn RTO đo bằng thời gian phục hồi toàn bộ quy trình — hai con số độc lập. Chỉ có cách chạy thử drill thật (như lab của bài này) mới biết RTO trên giấy có khớp thực tế không; nhiều bước tốn thời gian (dựng hạ tầng, DNS, warm-up) thường bị bỏ sót khi chỉ ước lượng."
+/>

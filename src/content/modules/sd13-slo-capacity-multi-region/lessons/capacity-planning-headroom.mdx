@@ -1,0 +1,99 @@
+import { CapacityHeadroomBreakpointDiagram } from "../diagrams/capacity-headroom-breakpoint-diagram";
+
+<Eli5 title="Quán buffet chuẩn bị cho ngày Tết đông khách gấp 10 lần" emoji="🍲">
+
+Ngày thường quán buffet có 20 bàn, 3 đầu bếp, phục vụ thoải mái. Chủ quán nghe tin Tết này khách có thể đông gấp 10 — không thể chỉ nghĩ "chắc ổn thôi". Phải hỏi cụ thể: 20 bàn hiện đang trống bao nhiêu (headroom chỗ ngồi)? 3 đầu bếp hiện rảnh tay bao nhiêu (headroom nhân lực)? Bãi giữ xe còn được bao nhiêu chỗ?
+
+Ba con số headroom đó **không cạn cùng tốc độ**. Có thể bàn còn dư nhiều (kê thêm bàn được) nhưng bãi xe chỉ có đúng 30 chỗ, hết là hết — không kê thêm được. Capacity planning là bài toán tìm ra: trong tất cả nguồn lực, cái nào là "bãi xe" (giới hạn cứng, vỡ trước) và cái nào là "bàn ghế" (co giãn được).
+
+</Eli5>
+
+Bạn đã có số đo thật từ SD01 (ước lượng ban đầu) và SD03 (k6 load test qua load balancer) — capacity planning ở đây không phải đoán, mà là dùng lại đúng những con số đó để trả lời "traffic tăng 10× thì cái gì vỡ trước".
+
+<CapacityHeadroomBreakpointDiagram />
+
+<Technical>
+
+### Headroom là gì, đo ở đâu
+
+`headroom = (capacity − usage) / capacity`. Đo riêng cho từng thành phần trên đường đi của request:
+
+- **CPU/memory app**: `docker stats` hoặc CloudWatch/Prometheus — đây là loại giới hạn **mềm**, scale ngang (thêm instance) gần như luôn cứu được.
+- **Connection pool DB**: `SELECT count(*) FROM pg_stat_activity` so với `max_connections` — giới hạn **cứng** của một tiến trình Postgres, vượt là bị từ chối kết nối thẳng, không tự "co giãn".
+- **Cache memory**: `INFO memory` của Redis so với `maxmemory` — vượt ngưỡng thì bắt đầu evict theo policy (LRU…), không sập nhưng hit-rate giảm, kéo tải ngược về DB.
+- **Queue/consumer lag**: số message chưa xử lý tăng liên tục nghĩa là consumer không theo kịp producer — dấu hiệu cần thêm consumer trước khi hàng đợi phình to.
+
+### Dự báo tăng trưởng: ngoại suy có giả định rõ ràng
+
+Không có công thức chung "nhân lên là xong" — mỗi loại resource scale khác nhau:
+
+```
+Giả định: QPS tỉ lệ thuận với số VU trong load test (đúng khi request độc lập, không giả định đúng nếu có N+1 query hoặc lock tranh chấp tăng phi tuyến).
+100 VU  -> CPU app 35%,        Postgres connections 40/100
+1000 VU -> CPU app ~350%       (ngoại suy tuyến tính -> cần thêm ~3 instance app)
+        -> Postgres connections ~400/100  (VƯỢT giới hạn cứng, không tự scale)
+```
+
+CPU 350% chỉ là "cần thêm máy" — vô hại về mặt thiết kế. Connection vượt `max_connections` là một loại lỗi khác hẳn: kết nối mới bị từ chối ngay lập tức, không có gì "chạy chậm dần", nó sập đột ngột. Đây là lý do phải nhìn **loại giới hạn**, không chỉ nhìn con số phần trăm.
+
+### Load test định kỳ, không chỉ làm một lần
+
+Capacity plan viết một lần rồi để đó sẽ lạc hậu sau vài tháng khi traffic pattern đổi (tính năng mới, mùa cao điểm). Google SRE Workbook khuyến nghị load test định kỳ (không chỉ trước sự kiện lớn) để headroom đo được luôn phản ánh thực tế, không phải giả định cũ.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Over-provision cố định (giữ luôn 3× công suất) | Đơn giản, không lo autoscale trễ | Tốn tiền chạy dư phần lớn thời gian | Traffic predictable, chi phí không phải ưu tiên số 1 |
+| Autoscale theo metric | Trả tiền sát với tải thật | Có độ trễ scale-out (vài chục giây–vài phút), cần warm-up | Traffic biến động, đã đo được thời gian scale-out chấp nhận được |
+| Reserved capacity + burst | Cân bằng chi phí và độ sẵn sàng | Cần dự báo tốt phần "nền", phần đỉnh vẫn cần autoscale | Có baseline traffic ổn định, đỉnh thỉnh thoảng |
+
+**Khi nào đổi ý:** nếu autoscale liên tục không kịp (bottleneck là connection pool DB, không phải CPU) thì over-provision phần cứng giới hạn đó, đừng cố "autoscale" thứ không co giãn được.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Đo headroom Postgres connection trong sd-playground"
+  prompt="$"
+  commands={[
+    { comment: "Xem giới hạn connection hiện tại", command: "docker compose exec postgres psql -U app -d app -c \"SHOW max_connections;\"", output: " max_connections\n------------------\n 100" },
+    { comment: "Đếm connection đang mở lúc load test đang chạy", command: "docker compose exec postgres psql -U app -d app -c \"SELECT count(*) FROM pg_stat_activity;\"", output: " count\n-------\n    42" },
+    { comment: "Headroom = (100-42)/100 = 58% -> còn dư nhưng sẽ hết rất nhanh khi scale app instance", command: "echo 'scale=2; (100-42)/100*100' | bc", output: "58.00" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Ngoại suy tuyến tính cho MỌI thành phần rồi kết luận "chỉ cần thêm máy là đủ cho 10×". Connection pool, số file descriptor, hay rate limit của một API bên thứ ba là những giới hạn cứng — thêm máy ở tầng app không giải quyết được, phải đổi kiến trúc (PgBouncer, batching, cache thêm).
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi được hỏi "hệ thống chịu được 10× traffic hiện tại không", câu trả lời mạnh bắt đầu bằng số đo hiện tại (không phải suy đoán), chỉ ra headroom từng thành phần, phân loại rõ giới hạn mềm (scale-out cứu được) và giới hạn cứng (cần đổi kiến trúc), rồi mới kết luận thành phần nào vỡ trước. Nói "em sẽ thêm auto-scaling" mà không biết bottleneck thật là gì thường bị hỏi xoáy tiếp.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "headroom", meaning: "Phần dư địa còn lại giữa mức dùng hiện tại và giới hạn của một thành phần cụ thể." },
+    { term: "giới hạn mềm (soft limit)", meaning: "Vượt qua vẫn chạy được, chỉ chậm dần hoặc tốn tiền hơn — thường cứu được bằng scale-out." },
+    { term: "giới hạn cứng (hard limit)", meaning: "Vượt qua bị từ chối/lỗi ngay, không tự co giãn — cần đổi kiến trúc (pooling, batching, cache)." },
+    { term: "connection pooling", meaning: "Dùng một lớp trung gian (PgBouncer) giữ ít connection thật tới DB, cho nhiều client dùng chung." },
+    { term: "load test định kỳ", meaning: "Chạy lại load test theo lịch, không chỉ một lần, để headroom đo được không bị lạc hậu." },
+  ]}
+/>
+
+<QuickCheck
+  question="Load test cho thấy ở 5× traffic hiện tại, CPU app đạt 90% nhưng Postgres connection đã chạm `max_connections` từ 3× traffic. Ưu tiên đầu tư nào đúng nhất cho việc chuẩn bị 10×?"
+  options={[
+    "Thêm nhiều instance app hơn nữa vì CPU luôn là thứ quan trọng nhất",
+    "Giải quyết connection pool trước (PgBouncer hoặc tăng max_connections có kiểm soát) vì nó vỡ SỚM HƠN (ở 3×) và là giới hạn cứng — thêm app instance ở 10× chỉ làm connection cạn nhanh hơn nếu chưa xử lý",
+    "Không cần làm gì vì CPU 90% vẫn còn 10% headroom",
+    "Bỏ qua vấn đề connection vì Postgres tự động scale connection khi cần",
+  ]}
+  answerIndex={1}
+  explanation="Giống bãi giữ xe hết chỗ trước khi bàn ghế hết chỗ: dù bàn ghế (CPU) còn kê thêm được ở 5×, bãi xe (connection) đã đầy từ 3×. Vá đúng chỗ vỡ SỚM NHẤT trước, vì thêm app instance (tăng connection cần) mà chưa giải quyết pool sẽ làm bottleneck đó tệ hơn, không phải tốt hơn."
+/>

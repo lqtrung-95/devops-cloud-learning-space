@@ -1,0 +1,92 @@
+import { SpofEliminationClickthroughDiagram } from "../diagrams/spof-elimination-clickthrough-diagram";
+
+<Eli5 title="Cây cầu nhiều làn xe nhưng chỉ có một trụ đỡ ở giữa" emoji="🌉">
+
+Một cây cầu có 6 làn xe, trông rất "to khoẻ". Nhưng nếu toàn bộ 6 làn đó đứng trên đúng MỘT trụ đỡ ở giữa sông, thì trụ đó sập là cả cây cầu sập — số làn xe không cứu được gì. Trụ đó là single point of failure (SPOF): một thứ mà nếu nó chết, không có gì đứng ra gánh thay.
+
+High availability không phải là "thêm cho nhiều instance vào", mà là hỏi lần lượt từng phần của hệ thống: "nếu cái này chết ngay bây giờ, ai gánh?". Câu trả lời "không ai cả" chính là bạn vừa tìm ra một SPOF.
+
+</Eli5>
+
+<SpofEliminationClickthroughDiagram />
+
+<Technical>
+
+### Rà SPOF: đi theo đường đi của request, không đi theo sơ đồ "đẹp"
+
+Sơ đồ kiến trúc thường vẽ đẹp với nhiều box, nhưng SPOF ẩn ở chi tiết: load balancer có 2 instance nhưng cùng một Elastic IP chưa failover? DNS chỉ trỏ vào 1 record? Secrets manager, message queue, hay chính bản thân Availability Zone đang host toàn bộ stack? Danh sách cần rà cho mọi hệ thống thật:
+
+- Load balancer / reverse proxy
+- App server (đã redundant từ SD03, nhưng cùng 1 AZ thì sao?)
+- Database primary (đã có replica async chưa? Replica có ở AZ khác không?)
+- Cache, message broker, object storage endpoint
+- DNS, certificate/secrets manager, và cả **dependency bên thứ ba** (payment gateway, SMS provider) — SPOF có thể nằm ngoài hạ tầng của chính bạn
+
+### Redundancy phải khớp với loại sự cố muốn chống
+
+Có 2 instance Postgres nhưng đặt cùng một AZ chỉ chống được lỗi phần cứng/tiến trình của MỘT máy — không chống được sự cố cả AZ (mất điện, mất mạng datacenter, thiên tai). Muốn chịu được mất cả AZ, bản sao phải ở AZ khác (đánh đổi thêm vài ms latency đồng bộ). Đây là lý do "đã có replica" chưa chắc là "đã hết SPOF" — phải hỏi thêm: replica đặt ở đâu.
+
+### N+1 và N+2
+
+- **N+1**: đủ dự phòng cho 1 instance chết bất kỳ lúc nào (vd 3 instance chịu tải 2 instance, dư 1).
+- **N+2**: chịu được 2 instance chết cùng lúc (vd trong lúc 1 cái đang bảo trì/deploy, 1 cái khác lại chết đột xuất) — cần cho thành phần mà thời gian phục hồi lâu hoặc downtime cực kỳ tốn kém.
+
+Chọn N+1 hay N+2 phụ thuộc SLO đã chọn ở bài trước: SLO 99,99%+ thường cần N+2 cho thành phần trọng yếu (database), vì kịch bản "vừa bảo trì vừa gặp sự cố" không hiếm như tưởng.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Redundant trong 1 AZ | Rẻ, latency thấp giữa các instance | Không chịu được sự cố cả AZ | Môi trường dev/staging, SLO thấp |
+| Redundant multi-AZ (N+1) | Chịu được mất 1 AZ | Thêm chi phí cross-AZ transfer, đồng bộ hơi chậm hơn | SLO 99,9–99,99%, phần lớn hệ thống production |
+| Redundant multi-AZ (N+2) | Chịu được sự cố chồng sự cố (bảo trì + chết đột xuất) | Chi phí cao hơn hẳn cho phần dư thêm ít dùng tới | Thành phần trọng yếu ở SLO 99,99%+ (DB chính, payment) |
+
+**Khi nào đổi ý:** nếu chi phí N+2 cho một thành phần vượt xa thiệt hại kỳ vọng khi nó down (tính bằng downtime × tần suất × thiệt hại/phút), N+1 là đủ — không phải mọi thành phần đều cần mức redundancy cao nhất.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Kiểm tra Postgres replica có ở AZ khác AZ của primary không"
+  prompt="$"
+  commands={[
+    { comment: "Trong sd-playground, xem container Postgres primary chạy ở đâu (label giả lập AZ)", command: "docker inspect postgres-primary --format '{{ index .Config.Labels \"az\" }}'", output: "ap-southeast-1a" },
+    { comment: "Xem replica có label AZ khác không", command: "docker inspect postgres-replica --format '{{ index .Config.Labels \"az\" }}'", output: "ap-southeast-1a" },
+    { comment: "Cùng AZ -> vẫn là SPOF nếu cả AZ 1a mất điện; cần đổi label sang 1b khi lên môi trường thật", command: "echo 'Same AZ -> replica does not protect against an AZ-level outage'", output: "Same AZ -> replica does not protect against an AZ-level outage" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Kết luận "đã hết SPOF" chỉ vì đếm thấy ≥2 instance ở mỗi tầng, mà không kiểm tra chúng có đặt cùng một AZ, cùng một rack, hay cùng phụ thuộc vào một dependency thứ ba hay không. Redundancy giả (fake redundancy) nguy hiểm hơn cả việc biết rõ mình có SPOF, vì nó tạo cảm giác an toàn sai.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi interviewer hỏi "kiến trúc này có SPOF không", câu trả lời mạnh không chỉ nói "có/không" — đi từng tầng theo đường đi của request (LB → app → cache → DB → dependency ngoài), với mỗi tầng nói rõ redundancy hiện có và redundancy đó chống được loại sự cố nào (chết 1 máy hay mất cả AZ). Đây cũng là kỹ năng review kiến trúc thật ở công việc, không riêng phỏng vấn.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "SPOF", meaning: "Single point of failure — một thành phần mà nếu nó chết, không có gì gánh thay, cả hệ thống hoặc một phần lớn ngừng hoạt động." },
+    { term: "Availability Zone (AZ)", meaning: "Một cụm datacenter độc lập về điện/mạng trong cùng region — redundancy cùng AZ không chống được sự cố cả AZ." },
+    { term: "N+1 redundancy", meaning: "Đủ dự phòng cho đúng 1 instance chết bất kỳ lúc nào mà hệ thống vẫn chịu tải bình thường." },
+    { term: "N+2 redundancy", meaning: "Chịu được 2 instance chết/bảo trì cùng lúc — dành cho thành phần trọng yếu ở SLO rất cao." },
+    { term: "fake redundancy", meaning: "Có ≥2 instance nhưng chúng chia sẻ cùng một điểm hỏng ẩn (cùng AZ, cùng dependency) nên thực chất vẫn là SPOF." },
+  ]}
+/>
+
+<QuickCheck
+  question="Kiến trúc có 2 load balancer, 3 app instance ở 2 AZ khác nhau, nhưng cả hệ thống chỉ gọi đúng một API key của một payment gateway duy nhất, không có gateway dự phòng. Nhận xét nào đúng?"
+  options={[
+    "Không sao, payment gateway không tính là một phần của kiến trúc cần rà SPOF",
+    "Payment gateway đó chính là một SPOF nằm NGOÀI hạ tầng của bạn — mọi redundancy nội bộ (LB, app) đều vô nghĩa với luồng thanh toán nếu gateway đó down và không có phương án dự phòng/fallback",
+    "Chỉ cần thêm nhiều app instance gọi gateway đó là đủ an toàn",
+    "SPOF chỉ áp dụng cho database, không áp dụng cho dịch vụ bên ngoài",
+  ]}
+  answerIndex={1}
+  explanation="Giống cây cầu nhiều làn nhưng chung một trụ: nhiều app instance vẫn phải đi qua đúng một cổng thanh toán duy nhất. Rà SPOF phải đi theo TOÀN BỘ đường đi của request, kể cả phần phụ thuộc bên thứ ba nằm ngoài hạ tầng bạn kiểm soát trực tiếp."
+/>

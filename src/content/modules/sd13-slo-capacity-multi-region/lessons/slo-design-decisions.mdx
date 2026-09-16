@@ -1,0 +1,100 @@
+import { ErrorBudgetBurnDesignDiagram } from "../diagrams/error-budget-burn-design-diagram";
+
+<Eli5 title="Bệnh viện hứa '95% ca cấp cứu được tiếp nhận trong 10 phút'" emoji="🏥">
+
+Một bệnh viện dán bảng: "95% ca cấp cứu được bác sĩ tiếp nhận trong 10 phút". Đó là lời hứa (SLO). Nếu tháng này họ để trễ quá nhiều ca, họ đang "tiêu" hết phần cho phép trễ (error budget) — và ban giám đốc phải quyết định: dừng nhận thêm ca mổ theo lịch để dồn bác sĩ trực cấp cứu, hay vẫn ổn vì chỉ mới trễ vài ca.
+
+Nhưng câu hỏi quan trọng hơn cả con số 95% là: **để giữ được lời hứa đó, bệnh viện cần chuẩn bị gì?** Hứa 95% có thể chỉ cần 1 kíp trực đông hơn bình thường. Hứa 99,99% (gần như không bao giờ trễ) thì không thể chỉ tăng ca trực — phải có sẵn một đội cấp cứu dự phòng luôn túc trực, không chờ gọi mới tới.
+
+</Eli5>
+
+Nếu bạn đã học SLI/SLO/SLA và error budget ở module M16 (SRE Practices) của khoá DevOps & Cloud, phần định nghĩa ở đây sẽ rất quen — chủ động lướt nhanh. Trọng tâm của bài này khác: **một con số SLO cụ thể bắt kiến trúc của bạn phải như thế nào**, chứ không dừng ở việc tính error budget.
+
+<ErrorBudgetBurnDesignDiagram />
+
+<Technical>
+
+### Ôn nhanh (nếu chưa học M16)
+
+- **SLI** (Service Level Indicator): một phép đo cụ thể, ví dụ tỉ lệ request không lỗi 5xx.
+- **SLO** (Service Level Objective): mục tiêu nội bộ cho SLI đó, ví dụ "99,9% request thành công trong 30 ngày".
+- **Error budget**: `100% − SLO`. Với 99,9%, ngân sách là 0,1% — tương đương ~43,8 phút/tháng (Phụ lục B). Ngân sách hết thì ưu tiên chuyển từ "ra tính năng mới" sang "ổn định lại".
+
+### Từ SLO tới kiến trúc: bảng downtime ngân sách theo Phụ lục B
+
+| Mức SLO | Downtime/tháng | Downtime/năm | Kiến trúc tối thiểu thường cần |
+|---|---|---|---|
+| 99% | ~7,3 giờ | ~3,65 ngày | 1 instance có giám sát cơ bản, phục hồi thủ công |
+| 99,9% | ~43,8 phút | ~8,77 giờ | Nhiều instance app, 1 AZ có health check, restart tự động |
+| 99,99% | ~4,4 phút | ~52,6 phút | Multi-AZ, failover DB tự động, on-call được page ngay |
+| 99,999% | ~26 giây | ~5,3 phút | Multi-region active-active, tự phục hồi — con người không kịp phản ứng thủ công |
+
+Đây là bảng **thường cần**, không phải luật cứng — nhưng nó cho thấy quy luật: ngân sách càng nhỏ, thời gian phản ứng cho phép càng ngắn, cho tới khi ngắn hơn cả thời gian một kỹ sư mở laptop. Lúc đó, "human in the loop" không còn khả thi — kiến trúc buộc phải tự phục hồi.
+
+### Burn rate quyết định mức độ khẩn cấp của kiến trúc
+
+Burn rate là tốc độ tiêu ngân sách so với tốc độ "vừa đủ hết khi hết cửa sổ" (thường 30 ngày). Burn rate 6× nghĩa là ngân sách cạn trong `30/6 = 5` ngày nếu cứ tiếp tục ở tốc độ đó. Đây chính là cơ sở cho alert đa cửa sổ đã học ở M16 (`slo-burn-rate-alerting`) — ở đây ta dùng lại con số đó để hỏi: **kiến trúc hiện có phản ứng đủ nhanh với tốc độ cạn ngân sách đó không?**
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| SLO thấp (99–99,9%) + kiến trúc đơn giản | Rẻ, ít vận hành, dễ debug | Chấp nhận vài giờ downtime/tháng | Nội bộ, MVP, sản phẩm chưa nhiều user trả tiền |
+| SLO cao (99,99%) + multi-AZ | Chịu được sự cố 1 AZ, ngân sách vẫn còn vài phút để phản ứng | Chi phí redundancy, cần on-call nghiêm túc | Sản phẩm doanh thu, khách hàng trả phí theo SLA |
+| SLO rất cao (99,999%) + multi-region active-active | Gần như không downtime kể cả mất 1 region | Chi phí gấp nhiều lần, consistency phức tạp (SD09), vận hành 2 nơi | Hạ tầng tài chính, thanh toán, hệ thống bên thứ ba phụ thuộc vào bạn |
+
+**Khi nào đổi ý:** đếm số lần vi phạm SLO gây thiệt hại thật (mất khách, phạt hợp đồng) so với chi phí duy trì mức SLO cao hơn. Nâng SLO "cho chắc" mà không đo thiệt hại thực tế là lãng phí ngân sách kỹ thuật.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Tính error budget và burn rate từ log thật trong sd-playground"
+  prompt="$"
+  commands={[
+    { comment: "Đếm tổng request và request lỗi 5xx trong 30 phút gần nhất (giả lập 30 ngày)", command: "docker compose logs app --since 30m | grep -c ' 200 '", output: "9824" },
+    { comment: "Đếm request lỗi 5xx cùng khoảng thời gian", command: "docker compose logs app --since 30m | grep -c ' 5[0-9][0-9] '", output: "18" },
+    { comment: "Tỉ lệ lỗi ~0,18% -> nếu SLO là 99,9% (ngân sách 0,1%), ngân sách đã bị vượt", command: "echo 'scale=4; 18/9824*100' | bc", output: ".1832" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Chọn SLO 99,99% "cho chắc" rồi mới đi tìm kiến trúc đáp ứng, thay vì hỏi trước "business chịu được downtime bao nhiêu, và trả tiền được cho mức redundancy nào". SLO không phải mục tiêu marketing — nó là con số kéo theo chi phí thật.
+
+</Callout>
+
+<Callout type="cost" title="Mỗi bậc số 9 tốn tiền thật">
+
+Từ 99,9% lên 99,99% thường không phải "cấu hình thêm một dòng" — nó là thêm AZ, thêm replica, thêm giám sát và on-call nghiêm ngặt hơn. Trước khi cam kết một SLO cao hơn với khách hàng (SLA), hãy chắc chắn đã tính chi phí redundancy tương ứng, không chỉ cam kết bằng lời.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi được hỏi "hệ thống của bạn cam kết SLO bao nhiêu", câu trả lời mạnh không dừng ở con số. Nói: (1) mức SLO chọn dựa trên yêu cầu nghiệp vụ nào; (2) downtime ngân sách tương ứng theo tháng/năm; (3) kiến trúc cụ thể nào đáp ứng được ngân sách đó (multi-AZ hay multi-region); (4) ai/cái gì phản ứng khi ngân sách sắp cạn — con người hay cơ chế tự động. Bốn ý đó cho thấy bạn nối được SLO với kiến trúc, không chỉ thuộc định nghĩa.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "SLO", meaning: "Mục tiêu nội bộ cho một SLI, ví dụ '99,9% request thành công trong 30 ngày'." },
+    { term: "error budget", meaning: "Phần 'được phép hỏng' = 100% − SLO; hết ngân sách thì ưu tiên ổn định hơn tính năng mới." },
+    { term: "burn rate", meaning: "Tốc độ tiêu ngân sách so với tốc độ vừa đủ hết khi hết cửa sổ đo (thường 30 ngày)." },
+    { term: "multi-AZ", meaning: "Chạy redundant trên nhiều Availability Zone trong cùng 1 region — chịu được sự cố 1 AZ." },
+    { term: "multi-region active-active", meaning: "Nhiều region cùng phục vụ traffic thật — chịu được mất cả 1 region, chi phí và độ phức tạp cao nhất." },
+  ]}
+/>
+
+<QuickCheck
+  question="Đội bạn cam kết SLO 99,999% (ngân sách ~26 giây/tháng) nhưng vẫn dựa vào runbook thủ công: on-call xem alert, SSH vào server, restart. Vấn đề chính là gì?"
+  options={[
+    "Không có vấn đề, miễn on-call phản ứng nhanh là được",
+    "26 giây/tháng nhỏ hơn cả thời gian con người phát hiện + phản ứng một sự cố — quy trình thủ công không thể nào giữ được mức SLO này, cần cơ chế tự phục hồi",
+    "Vấn đề chỉ là on-call chưa được huấn luyện đủ kỹ",
+    "SLO 99,999% không cần kiến trúc gì đặc biệt, chỉ cần giám sát tốt hơn",
+  ]}
+  answerIndex={1}
+  explanation="Giống đội cấp cứu dự phòng của bệnh viện: ở mức cam kết cực cao, không thể chờ 'ai đó tới xử lý' vì thời gian chờ đã vượt quá cả ngân sách cho phép. Phải có cơ chế tự động (multi-region, health check + failover ngay) đóng vai trò đội cấp cứu luôn túc trực."
+/>
