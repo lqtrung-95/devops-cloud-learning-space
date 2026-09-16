@@ -23,6 +23,7 @@ import { sd04CachingCdnModule } from "./modules/sd04-caching-cdn/module-meta";
 import { sd05DatabaseFundamentalsModule } from "./modules/sd05-database-fundamentals/module-meta";
 import { sd06ScalingDatabasesModule } from "./modules/sd06-scaling-databases/module-meta";
 import { sd07AsyncMessagingModule } from "./modules/sd07-async-messaging/module-meta";
+import { sd09ConsistencyReplicationModule } from "./modules/sd09-consistency-replication/module-meta";
 
 /** All modules of every course (order within a course comes from `module.order`). Add modules after they pass `pnpm validate:module`. */
 export const curriculumModules: ModuleDefinition[] = [
@@ -50,4 +51,5 @@ export const curriculumModules: ModuleDefinition[] = [
   sd05DatabaseFundamentalsModule,
   sd06ScalingDatabasesModule,
   sd07AsyncMessagingModule,
+  sd09ConsistencyReplicationModule,
 ];

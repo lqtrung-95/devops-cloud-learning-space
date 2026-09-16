@@ -1,0 +1,108 @@
+import { ConflictResolutionStrategyDiagram } from "../diagrams/conflict-resolution-strategy-diagram";
+
+<Eli5 title="Hai người cùng sửa một trang wiki khi mất mạng" emoji="📝">
+
+Hai đồng nghiệp A và B cùng mở một trang wiki nội bộ trên laptop, rồi cả hai mất mạng cùng lúc (đi máy bay). Trên máy bay, A sửa mục "liên hệ" thành số điện thoại mới; B, không biết A đang sửa, cũng sửa đúng mục đó thành một số khác. Cả hai hạ cánh, mạng có lại, hai bản wiki cần hợp nhất (merge).
+
+- **Last-write-wins:** hệ thống nhìn đồng hồ hai laptop, ai "ghi sau" theo đồng hồ thì thắng — kể cả khi đồng hồ B chạy nhanh hơn thực tế và B thực ra bấm lưu trước. Bản của A biến mất, không ai được báo.
+- **Version vector:** hệ thống nhận ra "cả hai đều sửa từ cùng một bản gốc, không ai biết về sửa đổi của người kia" — đây là xung đột thật — và hiện cả hai bản, hỏi con người "giữ bản nào, hay gộp tay?".
+- **CRDT:** nếu thứ hai người sửa là loại dữ liệu "cộng dồn được" (như thêm tag, đếm lượt thích), hệ thống tự gộp đúng luôn mà không cần hỏi ai — vì phép cộng/thêm không quan tâm ai làm trước.
+
+</Eli5>
+
+Đây là cái giá thực sự của AP (bài 1): chấp nhận nhiều bản ghi cùng tồn tại một lúc thì sớm muộn cũng phải hoà giải (reconcile) chúng. Ba cách phổ biến khác nhau ở chỗ: cách nào âm thầm mất dữ liệu, cách nào đẩy việc quyết định lên tầng trên, cách nào tự giải quyết được mà không mất gì.
+
+<ConflictResolutionStrategyDiagram />
+
+<Technical>
+
+### Last-write-wins (LWW)
+
+Mỗi ghi kèm một timestamp; khi có nhiều bản, giữ bản có timestamp lớn nhất, **xoá âm thầm** các bản còn lại. Đơn giản, không cần lưu thêm metadata phức tạp — Cassandra, Riak (chế độ mặc định cũ) dùng cách này.
+
+**Vấn đề cốt lõi: LWW cần đồng hồ đáng tin.** Trong hệ phân tán, đồng hồ vật lý (wall clock) của các node/client **không** đồng bộ tuyệt đối — lệch vài mili-giây tới vài giây là bình thường (NTP drift, VM pause). Nếu node B có đồng hồ chạy nhanh hơn, ghi thật sự **xảy ra trước** của node A vẫn có thể mang timestamp lớn hơn ghi thật sự xảy ra sau của B — và LWW chọn nhầm, xoá mất ghi đúng thứ tự thời gian thực. Vì vậy LWW được mô tả chính xác là: **"concurrent writes are silently dropped"** — nó không phát hiện xung đột, nó *chọn đại* một cái thắng.
+
+### Version vector
+
+Mỗi replica giữ một vector đếm số ghi nó đã thấy từ mỗi replica khác, ví dụ `{A: 2, B: 1}` nghĩa là "tôi đã thấy 2 ghi từ A và 1 ghi từ B". Khi so hai version:
+
+- Nếu vector này **≥** vector kia ở **mọi** thành phần ⇒ bản này là hậu duệ trực tiếp của bản kia (không xung đột, giữ bản mới).
+- Nếu **không bên nào ≥ bên kia** ở mọi thành phần (mỗi bên hơn ở một chiều) ⇒ đây là **ghi đồng thời thật sự** (concurrent) — hệ thống **không tự chọn**, mà giữ lại cả hai giá trị ("sibling values") và trả về cho tầng ứng dụng (hoặc người dùng, như Amazon giỏ hàng cũ) tự merge.
+
+Version vector không mất dữ liệu, nhưng đẩy gánh nặng merge logic lên application — đúng với những gì chỉ con người/business logic mới quyết được (giữ số điện thoại nào? gộp cả hai vào một trường?).
+
+### CRDT (Conflict-free Replicated Data Type)
+
+CRDT là các **kiểu dữ liệu được thiết kế sẵn** sao cho hàm merge của chúng luôn **commutative** (thứ tự không quan trọng), **associative** và **idempotent** (áp merge nhiều lần không đổi kết quả) — nhờ vậy hai replica merge theo bất kỳ thứ tự nào cũng ra cùng một kết quả, **không cần trọng tài**, không cần đồng hồ chuẩn. Vài loại phổ biến:
+
+- **G-Counter / PN-Counter** — bộ đếm chỉ tăng (hoặc tăng/giảm), mỗi replica giữ đếm riêng của mình, merge = lấy max từng phần hoặc cộng dồn theo replica.
+- **OR-Set (Observed-Remove Set)** — mỗi lần `add` gắn một ID duy nhất; `remove` chỉ xoá được add đã "thấy". Merge = union các add còn sống trừ remove hợp lệ — add không bao giờ bị mất chỉ vì đến "muộn hơn" theo đồng hồ.
+- **LWW-Register** thực ra cũng là một CRDT (đánh đổi lấy "mất update" như đã nói ở trên, nhưng merge vẫn deterministic).
+
+**Giới hạn quan trọng:** CRDT giải quyết đúng những kiểu dữ liệu/thao tác nó được thiết kế cho (đếm, tập hợp, số tăng dần). Nó **không** thay được logic nghiệp vụ cần "đúng một người thắng" — ví dụ "chỉ một người được là người đặt vé cuối cùng", "tồn kho không được âm" — những bài toán đó vẫn cần quorum có phối hợp, lock, hoặc consensus (SD10), vì bản chất chúng không commutative.
+
+### Trade-off
+
+| Chiến lược | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Last-write-wins | Đơn giản, không cần metadata thêm | Âm thầm mất update, phụ thuộc đồng hồ (clock skew) | Dữ liệu không quan trọng lắm nếu mất, hoặc chỉ 1 writer thực tế mỗi lúc |
+| Version vector | Không mất dữ liệu, phát hiện đúng xung đột thật | Đẩy việc merge lên app; vector phình to nếu nhiều replica | Cần đúng dữ liệu, có thể hỏi người dùng hoặc có business rule merge |
+| CRDT | Tự hội tụ, không cần trọng tài, không cần đồng hồ chuẩn | Chỉ áp dụng cho kiểu dữ liệu/thao tác được thiết kế sẵn (đếm, set, register) | Counter, presence, collaborative set/tag, giỏ hàng dạng "danh sách item" |
+
+**Khi nào đổi ý:** nếu số lượng "sibling values" từ version vector tăng liên tục (người dùng không bao giờ vào merge tay) ⇒ cân nhắc chuyển field đó sang CRDT nếu bản chất phép toán cho phép, hoặc chuyển hẳn sang có leader (một nguồn sự thật) nếu nghiệp vụ thực ra cần strong consistency.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="So 3 chiến lược trên cùng kịch bản offline-merge (xem lab đầy đủ)"
+  prompt="$"
+  commands={[
+    { comment: "LWW: mất update của A do lệch đồng hồ", command: "npx tsx sd09/conflict-demo.ts --strategy lww", output: "merged.email = b@x.com\nWARNING: A's write (t=10) was overwritten by B's write (clock-skewed ts=17)" },
+    { comment: "Version vector: phát hiện xung đột thật, giữ cả hai", command: "npx tsx sd09/conflict-demo.ts --strategy version-vector", output: "CONFLICT detected: {A:1,B:0} vs {A:0,B:1}\nsiblings: [\"a@x.com\", \"b@x.com\"]" },
+    { comment: "CRDT OR-Set: tự hội tụ, không mất add nào", command: "npx tsx sd09/conflict-demo.ts --strategy crdt-set", output: "merged.tags = [\"vip\"]\nno arbiter needed" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Dùng `Date.now()` của client làm timestamp cho LWW rồi tin tưởng tuyệt đối thứ tự đó phản ánh đúng "ai ghi trước". Đồng hồ client càng không đáng tin hơn đồng hồ server (người dùng có thể chỉnh giờ máy). Nếu bắt buộc dùng LWW, ưu tiên timestamp gán bởi server nhận request, hoặc dùng logical clock (Lamport) thay vì wall clock.
+
+</Callout>
+
+<Callout type="warning">
+
+CRDT không phải "cây đũa thần" cho mọi bài toán merge. Nếu nghiệp vụ cần "chỉ một người thắng" (unique constraint, số lượng có hạn), ép nó vào CRDT sẽ tạo ra bug tinh vi (double-booking) khó test hơn cả LWW. Nhận diện đúng: phép toán có commutative không, trước khi chọn CRDT.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu hỏi "Amazon giỏ hàng: hai thiết bị cùng thêm/xoá item lúc mất mạng, merge thế nào?" là ví dụ kinh điển (chính là paper Dynamo). Câu trả lời mạnh: giỏ hàng là một **tập hợp item** — bản chất "thêm" là commutative, nên dùng version vector để phát hiện xung đột thật, rồi merge bằng **union** hai giỏ (thà thừa item để user tự xoá bớt, còn hơn mất item họ đã thêm) — đây gần như một CRDT set thủ công. Tránh trả lời "dùng LWW cho giỏ hàng" — mất item mà không ai biết là trải nghiệm tệ nhất có thể.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "last-write-wins (LWW)", meaning: "Hoà giải xung đột bằng cách giữ bản có timestamp lớn nhất, xoá âm thầm các bản còn lại." },
+    { term: "clock skew", meaning: "Độ lệch giữa đồng hồ của các máy khác nhau — nguồn gốc rủi ro chính của LWW." },
+    { term: "version vector", meaning: "Vector đếm số ghi đã thấy từ mỗi replica, dùng để phát hiện ghi đồng thời (concurrent) thật sự." },
+    { term: "sibling values", meaning: "Nhiều giá trị cùng tồn tại cho một key sau khi phát hiện xung đột bằng version vector, chờ merge." },
+    { term: "CRDT", meaning: "Kiểu dữ liệu có hàm merge commutative/associative/idempotent, tự hội tụ đúng mà không cần trọng tài." },
+    { term: "OR-Set", meaning: "CRDT dạng tập hợp: add gắn ID duy nhất, remove chỉ xoá add đã thấy — không mất add tới sau." },
+    { term: "commutative", meaning: "Thứ tự áp dụng phép toán không ảnh hưởng kết quả cuối — điều kiện cần để một thao tác trở thành CRDT." },
+  ]}
+/>
+
+<QuickCheck
+  question="Trường `view_count` của một bài viết được tăng độc lập ở nhiều datacenter, không cần thấy ngay giá trị chính xác tuyệt đối mọi lúc. Chiến lược hoà giải nào phù hợp và rẻ nhất?"
+  options={[
+    "Last-write-wins theo timestamp — mỗi lần tăng ghi đè giá trị mới",
+    "Version vector, giữ lại toàn bộ sibling values để người dùng chọn",
+    "CRDT dạng bộ đếm (G-Counter/PN-Counter): mỗi datacenter giữ đếm riêng, merge bằng cộng dồn — tự hội tụ đúng tổng, không cần trọng tài",
+    "Không thể replicate được trường này, phải dồn hết về một node duy nhất",
+  ]}
+  answerIndex={2}
+  explanation="Tăng đếm là phép toán commutative kinh điển — chính là bài toán G-Counter/PN-Counter được sinh ra để giải. LWW sẽ làm mất phần lớn lượt tăng (chỉ giữ 1 giá trị); version vector đúng nhưng tạo sibling không cần thiết cho một con số đơn giản chỉ cần cộng dồn."
+/>

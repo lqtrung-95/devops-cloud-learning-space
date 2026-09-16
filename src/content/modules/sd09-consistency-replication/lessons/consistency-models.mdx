@@ -1,0 +1,114 @@
+import { ConsistencyModelLadderDiagram } from "../diagrams/consistency-model-ladder-diagram";
+
+<Eli5 title="Bảng tin dán ở nhiều cổng chung cư" emoji="📌">
+
+Một chung cư có 5 cổng, mỗi cổng có một bảng tin riêng cho ban quản lý dán thông báo. Cách ban quản lý cập nhật 5 bảng tin đó quyết định cư dân thấy gì:
+
+- Nếu chỉ có **một bảng tin thật** (các cổng khác chỉ là gương chiếu tức thời) — ai đứng cổng nào cũng thấy tin mới nhất ngay lập tức. Đó là **linearizable**.
+- Nếu ban quản lý dán theo đúng thứ tự ở mọi cổng, nhưng cổng xa có thể chậm vài giây so với thời điểm dán thật — mọi người rốt cuộc thấy **cùng một thứ tự tin**, chỉ lệch thời điểm. Đó là **sequential**.
+- Nếu tin "họp tổ dân phố" phải luôn xuất hiện sau tin "thông báo họp" mà nó nhắc tới, nhưng hai tin không liên quan (rác và điện nước) thì thứ tự ở mỗi cổng có thể khác nhau — đó là **causal**.
+- Nếu bạn tự tay dán một tin ở cổng bạn hay đi, bạn chắc chắn thấy nó lần sau — nhưng hàng xóm đi cổng khác thì chưa chắc thấy ngay — đó là **read-your-writes**.
+- Nếu ban quản lý chỉ hứa "sớm muộn gì 5 cổng cũng giống nhau", không hứa gì về lúc nào — đó là **eventual**.
+
+</Eli5>
+
+"Consistency" không phải một nút bật/tắt. Nó là một dải các mức đảm bảo, mỗi mức đắt/rẻ khác nhau về latency và khả năng scale. Chọn nhầm mức — quá mạnh thì tốn tiền tốn latency vô ích, quá yếu thì bug khó tái hiện xuất hiện đúng lúc traffic cao.
+
+<ConsistencyModelLadderDiagram />
+
+<Technical>
+
+### Vì sao có nhiều mức, không phải chỉ "consistent" hay "không"
+
+Mỗi mức trả lời câu hỏi: **"Sau khi một write hoàn tất, ai — và khi nào — được đảm bảo thấy nó?"**
+
+- **Linearizable** — MỌI client, NGAY SAU thời điểm write được xác nhận (theo thời gian thực). Đắt nhất: cần phối hợp giữa các node cho mỗi thao tác (thường qua leader hoặc quorum đồng bộ).
+- **Sequential** — MỌI client thấy CÙNG một thứ tự global, khớp thứ tự chương trình của từng client, nhưng thứ tự đó không nhất thiết khớp "giờ thực". Rẻ hơn linearizable một chút vì không cần đồng bộ theo thời gian thực tuyệt đối.
+- **Causal** — chỉ thao tác có quan hệ **happens-before** (B đọc thấy A rồi B mới ghi) mới bị ràng buộc thứ tự. Thao tác độc lập (không ai đọc thấy ai) được tự do — cho phép nhiều concurrency hơn mà vẫn khớp trực giác người dùng ("trả lời phải sau câu hỏi").
+- **Read-your-writes** (một dạng của **session consistency**) — chỉ cam kết cho **chính client vừa ghi**, không cam kết gì cho client khác. Thường implement bằng cách: route mọi đọc của một session về cùng replica đã nhận ghi đó (sticky), hoặc client tự gửi kèm "tôi đã thấy tới version nào" để server đợi đủ.
+- **Eventual** — không cam kết gì tại một thời điểm cụ thể, chỉ cam kết **hội tụ** nếu ngừng ghi đủ lâu. Rẻ nhất, scale tốt nhất, nhưng đòi hỏi ứng dụng chịu được "hiện tại có thể sai một chút".
+
+### Áp vào ví dụ thật
+
+```text
+Timeline: A ghi x = 1 lúc t = 100ms (server xác nhận thành công)
+          B đọc x lúc t = 105ms, ở replica khác với A
+```
+
+| Mức | B có được phép thấy x = 0 (giá trị cũ) không? |
+|---|---|
+| Linearizable | Không — B đọc sau thời điểm A được xác nhận, bắt buộc thấy x = 1 |
+| Sequential | Có thể — miễn là B không bao giờ *sau đó* lại thấy x = 0 (không được thụt lùi) |
+| Causal | Có thể, nếu B chưa từng đọc thấy write của A trước đó (không có quan hệ nhân-quả) |
+| Read-your-writes | Có, nếu B không phải chính A |
+| Eventual | Có, không giới hạn thời gian |
+
+### Đảm bảo mạnh hơn không phải lúc nào cũng "tốt hơn"
+
+Bảng dưới không xếp theo "cái nào hay hơn" — mà theo "cái nào đúng chỗ hơn":
+
+| Mức | Chi phí điển hình | Ví dụ hợp lý |
+|---|---|---|
+| Linearizable | Cao — thường cần leader/quorum đồng bộ cho mỗi thao tác | Trừ số dư ví, cấp một mã đặt chỗ duy nhất, distributed lock |
+| Sequential | Trung bình — cần một thứ tự thống nhất (thường qua Paxos/Raft log) | Log sự kiện cần thứ tự nhất quán để mọi consumer replay giống nhau |
+| Causal | Trung bình-thấp — theo dõi vector clock/happens-before | Bình luận, chat, collaborative editing (thấy đúng nhân-quả là đủ) |
+| Read-your-writes | Thấp — chỉ cần sticky routing hoặc client gửi kèm version | Cập nhật hồ sơ cá nhân, giỏ hàng, cài đặt |
+| Eventual | Thấp nhất — không cần phối hợp lúc ghi | Like/view count, gợi ý, search index đồng bộ từ DB |
+
+**Khi nào đổi ý:** nếu bug report kiểu "tôi vừa lưu mà load lại vẫn thấy cũ" xuất hiện nhiều ⇒ thiếu read-your-writes, cần sticky routing. Nếu latency ghi cao do chờ quorum mà tính năng thực ra chỉ cần eventual (như đếm lượt xem) ⇒ đang trả giá quá đắt cho một đảm bảo không ai cần.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Tái hiện thiếu read-your-writes bằng Postgres streaming replication"
+  prompt="$"
+  commands={[
+    { comment: "Ghi ở primary", command: "docker compose exec postgres psql -U app -d app -c \"UPDATE profiles SET bio = 'updated' WHERE id = 1;\"", output: "UPDATE 1" },
+    { comment: "Đọc NGAY ở replica (có thể chưa kịp nhận WAL) — mô phỏng vi phạm read-your-writes nếu route đọc không sticky", command: "docker compose exec postgres-replica psql -U app -d app -c \"SELECT bio FROM profiles WHERE id = 1;\"", output: "   bio\n---------\n old-bio" },
+    { comment: "Đọc lại sau một khoảng ngắn: replication lag đã đuổi kịp", command: "sleep 1 && docker compose exec postgres-replica psql -U app -d app -c \"SELECT bio FROM profiles WHERE id = 1;\"", output: "   bio\n---------\n updated" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Nhầm "eventual consistency" với "hệ thống lởm/không đáng tin". Eventual là một **lựa chọn thiết kế có chủ đích** để đổi lấy latency và khả năng scale — nó chỉ sai khi bạn dùng nó cho tính năng cần đảm bảo mạnh hơn (như số dư ví), không phải bản thân nó luôn sai.
+
+</Callout>
+
+<Callout type="warning">
+
+"Read-your-writes" và "linearizable" khác nhau ở **phạm vi cam kết** (một client vs mọi client), không phải ở "độ mạnh chung chung". Đừng nói "read-your-writes yếu hơn linearizable nên không cần" — với hầu hết tính năng UI (profile, giỏ hàng), read-your-writes đã đủ và rẻ hơn nhiều.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi thiết kế một tính năng, đừng chỉ nói "em dùng eventual consistency". Chỉ rõ: field nào cần mức nào, và **cơ chế** đạt được mức đó — ví dụ "trạng thái đơn hàng cần causal (trạng thái sau phải luôn theo sau trạng thái trước) nên em dùng version/sequence number kèm mỗi update"; "giỏ hàng cần read-your-writes nên em sticky route theo `userId` trong LB hoặc cookie". Trả lời có cơ chế cụ thể luôn ăn điểm hơn nêu tên mức.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "linearizability", meaning: "Mọi client thấy hệ thống như một bản sao duy nhất, cập nhật đúng theo thời gian thực." },
+    { term: "sequential consistency", meaning: "Mọi node đồng ý một thứ tự toàn cục khớp thứ tự chương trình từng client, không cần khớp thời gian thực." },
+    { term: "causal consistency", meaning: "Chỉ giữ thứ tự cho thao tác có quan hệ nhân-quả (happens-before)." },
+    { term: "read-your-writes", meaning: "Một client luôn thấy chính ghi của mình ở lần đọc sau, không cam kết cho client khác." },
+    { term: "eventual consistency", meaning: "Không đảm bảo tại một thời điểm, chỉ đảm bảo hội tụ nếu ngừng ghi đủ lâu." },
+    { term: "sticky routing", meaning: "Định tuyến mọi request của một session/user về cùng một node/replica để giữ read-your-writes." },
+    { term: "happens-before", meaning: "Quan hệ nhân-quả giữa hai thao tác: một thao tác đọc thấy kết quả của thao tác kia." },
+  ]}
+/>
+
+<QuickCheck
+  question="App chat: tin nhắn trả lời trong một thread phải luôn hiện sau tin nhắn gốc với MỌI người trong thread, nhưng thứ tự giữa hai thread không liên quan nhau thì không quan trọng. Chọn mức consistency rẻ nhất vẫn đáp ứng đúng yêu cầu này."
+  options={[
+    "Eventual — rẻ nhất nên luôn ưu tiên chọn trước",
+    "Linearizable — chỉ có cách này mới đảm bảo đúng thứ tự",
+    "Causal consistency — chỉ ràng buộc thứ tự cho thao tác có quan hệ nhân-quả (trả lời phụ thuộc tin gốc), thread khác không bị ảnh hưởng",
+    "Read-your-writes — đủ vì mỗi người tự thấy tin của mình",
+  ]}
+  answerIndex={2}
+  explanation="Yêu cầu chính xác khớp định nghĩa causal: chỉ ràng buộc cặp có quan hệ nhân-quả, cho phép các thread độc lập tự do về thứ tự. Linearizable đúng nhưng đắt hơn mức cần thiết; read-your-writes không đủ vì yêu cầu là cho MỌI người xem, không chỉ người viết."
+/>

@@ -1,0 +1,113 @@
+import { PartitionCapTradeoffDiagram } from "../diagrams/partition-cap-tradeoff-diagram";
+
+<Eli5 title="Hai chi nhánh bưu điện nối nhau bằng đường dây điện thoại" emoji="☎️">
+
+Chi nhánh A và chi nhánh B của một bưu điện dùng đường dây điện thoại để đối chiếu sổ sách sau mỗi giao dịch. Bình thường, khách hỏi B "đơn #42 giao chưa?", B gọi A xác nhận rồi mới trả lời — chắc chắn đúng nhưng hơi chậm.
+
+Một hôm đường dây bị đứt. Khách vẫn tới hỏi B. B chỉ còn hai lựa chọn thật sự: **đóng cửa, xin lỗi khách, chờ nối lại dây** (chắc chắn không nói sai, nhưng ngừng phục vụ), hoặc **cứ trả lời theo sổ của B**, dù sổ đó có thể đã cũ so với A (phục vụ tiếp, nhưng có thể sai).
+
+Không có lựa chọn thứ ba "vừa đúng tuyệt đối vừa luôn mở cửa" khi dây đang đứt. Đó là CAP. Và ngay cả khi dây **không** đứt, B vẫn phải chọn: gọi xác nhận A trước (chậm hơn, chắc hơn) hay trả lời ngay theo sổ mình (nhanh hơn, có thể chưa cập nhật). Đó là phần PACELC hay bị bỏ quên.
+
+</Eli5>
+
+Đây là chủ đề dễ nói sai nhất trong system design interview — và sai theo đúng một kiểu: "hệ thống của em chọn CA". Câu này lộ ra ngay người nói chưa hiểu CAP đang nói về cái gì. Hiểu đúng CAP/PACELC giúp bạn giải thích *tại sao* Cassandra, DynamoDB, hay chính Postgres primary/replica hành xử khác nhau khi mạng có sự cố — không phải học thuộc bảng so sánh.
+
+<PartitionCapTradeoffDiagram />
+
+<Technical>
+
+### CAP nói chính xác là gì
+
+CAP (Brewer, 2000; chứng minh hình thức bởi Gilbert & Lynch, 2002) nói về **một hệ phân tán có nhiều node lưu cùng dữ liệu**, khi xảy ra **network partition** (một nhóm node không liên lạc được với nhóm còn lại). Lúc đó, với một request tới node vẫn còn sống nhưng bị cô lập, hệ thống chỉ có hai lựa chọn:
+
+- **Consistency (C)** — cụ thể là **linearizability**: hành xử như chỉ có một bản sao duy nhất, luôn phản ánh ghi mới nhất đã được xác nhận. Muốn giữ C khi partition, node bị cô lập phải **từ chối** request (không thể đảm bảo đúng thì thà không trả lời).
+- **Availability (A)** — mọi request tới node còn sống đều nhận được phản hồi (không lỗi, không timeout vô hạn) — nhưng phản hồi đó có thể dựa trên dữ liệu cũ vì node không nói chuyện được với phần còn lại.
+
+**`P` (Partition tolerance) không phải một lựa chọn** — nó là một thực tế bạn phải chấp nhận nếu có ≥2 node giao tiếp qua mạng: cáp đứt, switch lỗi, gói tin rớt, GC pause khiến một node "trông như" mất kết nối. Bạn không "tắt" được P; bạn chỉ chọn C hay A **cho các request diễn ra trong lúc partition**.
+
+### Vì sao "hệ thống CA" không tồn tại (cho hệ phân tán thật)
+
+"CA" nghĩa là: luôn nhất quán VÀ luôn sẵn sàng, kể cả khi partition — tức là *không có partition nào* từng xảy ra. Với một hệ chạy trên **một node duy nhất** (một instance Postgres, không replica), điều đó đúng theo nghĩa tầm thường: không có node thứ hai để mất liên lạc. Nhưng ngay khi bạn thêm replica, thêm multi-region, thêm consensus cluster — bạn đã chấp nhận P, và câu hỏi "chọn C hay A lúc partition" là không thể né. Nói "hệ thống của em là CA" trong interview gần như luôn bị hiểu là chưa nắm được định nghĩa.
+
+### PACELC — phần CAP không nói tới
+
+CAP chỉ mô tả hành vi **lúc có partition**. Nhưng phần lớn thời gian hệ thống **không** partition — vậy có phải lúc đó "miễn phí" cả C lẫn A? Không. PACELC (Daniel Abadi, 2010) bổ sung:
+
+> **P**artition: chọn **A**vailability hay **C**onsistency (như CAP) — **E**lse (bình thường): chọn **L**atency hay **C**onsistency.
+
+Ngay cả khi mọi node liên lạc bình thường, muốn mọi read thấy write mới nhất (consistency mạnh) thường đòi hỏi chờ xác nhận từ nhiều node (round-trip mạng) — tăng latency. Muốn trả lời nhanh (latency thấp), bạn đọc từ bản local/replica gần nhất — có thể chưa nhận write mới nhất. Đây là trade-off **hàng ngày**, không cần sự cố nào cả.
+
+| Hệ thống | Lúc Partition | Lúc bình thường (Else) |
+|---|---|---|
+| Postgres single-primary, đọc/ghi đều ở primary | PC — replica cô lập không phục vụ ghi | EC — mọi read đều đúng, đổi lấy việc không scale ghi ngang |
+| Postgres primary + async replica, đọc ở replica | PA nếu vẫn cho đọc replica cô lập | EL — đọc nhanh ở replica gần, chấp nhận replication lag |
+| DynamoDB (chế độ eventually consistent read) | PA | EL |
+| DynamoDB (chế độ strongly consistent read) | PC cho read đó | EC cho read đó |
+| Cassandra với `QUORUM`/`QUORUM` | Tuỳ node nào cô lập — có thể PA cho phần cô lập | Giữa EL và EC tuỳ chọn consistency level mỗi query |
+
+**Điểm quan trọng:** C/A và L/C là lựa chọn **cho từng loại request**, không phải nhãn dán một lần cho cả hệ thống. Cùng một Cassandra cluster, bạn có thể đọc "số dư ví" bằng `QUORUM` (nghiêng C) và đọc "gợi ý sản phẩm" bằng `ONE` (nghiêng L) — do bạn set consistency level lúc query.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| CP (ưu tiên Consistency khi partition) | Không bao giờ trả dữ liệu sai/mất tiền | Ngừng phục vụ phần bị cô lập — mất doanh thu, trải nghiệm xấu | Số dư ví, tồn kho lúc thanh toán, khoá booking |
+| AP (ưu tiên Availability khi partition) | Luôn phản hồi, trải nghiệm mượt | Có thể trả dữ liệu cũ, cần cơ chế hoà giải sau (SD09 bài 4) | Newsfeed, like count, gợi ý, giỏ hàng hiển thị |
+| EC (ưu tiên Consistency lúc bình thường) | Đơn giản để suy luận, không cần xử lý stale data | Latency cao hơn, throughput ghi thấp hơn | Ít request, mỗi request quan trọng (approve giao dịch lớn) |
+| EL (ưu tiên Latency lúc bình thường) | Nhanh, scale tốt | Phải thiết kế UI/logic chịu được dữ liệu hơi cũ | Đọc nhiều, người dùng không nhận ra lệch vài giây |
+
+**Khi nào đổi ý:** đo tỉ lệ lỗi/khiếu nại do dữ liệu cũ (nghiêng CP/EC hơn) so với tỉ lệ downtime/latency ảnh hưởng doanh thu (nghiêng AP/EL). Không có câu trả lời đúng chung cho mọi tính năng trong cùng một hệ thống.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Kiểm tra hành vi thật của Postgres replica khi mất kết nối primary"
+  prompt="$"
+  commands={[
+    { comment: "Xem trạng thái replication trong sd-playground (giả sử có postgres-replica từ SD06)", command: "docker compose exec postgres psql -U app -d app -c \"SELECT client_addr, state, sync_state FROM pg_stat_replication;\"", output: " client_addr  |   state   | sync_state\n--------------+-----------+------------\n 172.20.0.5   | streaming | async" },
+    { comment: "sync_state = async: primary không chờ replica xác nhận trước khi COMMIT — đây là chọn Latency (EL)", command: "echo 'primary commit ngay, không chờ replica -> nghiêng AP/EL nếu đọc ở replica'", output: "primary commit ngay, không chờ replica -> nghiêng AP/EL nếu đọc ở replica" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Nói "hệ thống em vừa CP vừa AP tuỳ lúc" mà không chỉ rõ **request nào**, **lúc partition** hay **lúc bình thường (PACELC)** thì giám khảo không biết bạn thực sự hiểu hay đang nói cho có. Luôn gắn lựa chọn với một loại request cụ thể.
+
+</Callout>
+
+<Callout type="warning">
+
+CAP không nói gì về hiệu năng hay số lượng node cần thiết — nó chỉ nói về một tình huống nhị phân (partition, có hay không). Đừng dùng CAP để giải thích mọi vấn đề performance; latency bình thường (không partition) là chuyện của PACELC, không phải CAP.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi được hỏi "hệ thống của bạn là CP hay AP?", câu trả lời mạnh không dừng ở một chữ cái. Nói: (1) CAP chỉ áp dụng *lúc có partition*, không phải luôn luôn; (2) chỉ rõ **request nào** — ví dụ "ghi số dư ví thì CP, đọc newsfeed thì AP, cùng một hệ thống"; (3) nhắc PACELC cho lúc bình thường — "kể cả không có partition, em vẫn đánh đổi latency lấy consistency ở bước X". Tránh tuyệt đối câu "hệ thống em là CA".
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "network partition", meaning: "Một nhóm node không liên lạc được với nhóm còn lại dù cả hai vẫn đang chạy." },
+    { term: "linearizability", meaning: "Hệ thống hành xử như chỉ có một bản sao duy nhất, cập nhật tức thời theo thời gian thực — chính là 'C' trong CAP." },
+    { term: "CP", meaning: "Khi partition, ưu tiên Consistency: từ chối phục vụ phần bị cô lập." },
+    { term: "AP", meaning: "Khi partition, ưu tiên Availability: vẫn phục vụ, chấp nhận dữ liệu có thể cũ." },
+    { term: "PACELC", meaning: "Mở rộng CAP: partition thì chọn A/C, bình thường (else) thì chọn Latency/Consistency." },
+    { term: "consistency level (per-query)", meaning: "Nhiều hệ thống (Cassandra, DynamoDB) cho chọn C hay L cho từng query, không cố định toàn hệ thống." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một bạn nói: 'Em dùng Cassandra với replication factor 3, nên hệ thống của em vừa Consistent vừa Available — nó là CA'. Nhận xét đúng nhất?"
+  options={[
+    "Đúng, vì replication factor 3 đủ để đảm bảo cả C lẫn A",
+    "Sai khái niệm: Cassandra là hệ phân tán nhiều node nên partition luôn có thể xảy ra; lúc đó phải chọn C hay A cho request bị ảnh hưởng — 'CA' không phải một trạng thái khả dụng",
+    "Đúng, nhưng chỉ khi dùng consistency level ONE",
+    "Sai, vì Cassandra chỉ hỗ trợ AP, không bao giờ có thể chọn CP",
+  ]}
+  answerIndex={1}
+  explanation="Giống chi nhánh bưu điện: có ≥2 chi nhánh nối bằng đường dây thì dây luôn có thể đứt. 'CA' chỉ đúng cho hệ một node. Cassandra thực ra cho chọn per-query giữa nghiêng C (QUORUM/ALL) hay nghiêng A (ONE), không phải một nhãn cố định."
+/>

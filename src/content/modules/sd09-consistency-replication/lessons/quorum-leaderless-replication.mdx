@@ -1,0 +1,113 @@
+import { QuorumOverlapDiagram } from "../diagrams/quorum-overlap-diagram";
+
+<Eli5 title="Ban quản lý chung cư không có trưởng ban, chỉ có N thư ký giữ sổ thu phí" emoji="🗳️">
+
+Chung cư này không cử một trưởng ban để giữ sổ chính (không có leader). Thay vào đó, có N thư ký, mỗi người giữ một bản sổ riêng. Luật đặt ra: mỗi lần thu phí, người thu phải báo cho **ít nhất W thư ký** ghi vào sổ của họ mới coi là thu xong; mỗi lần tra cứu "nhà này đã đóng phí chưa", người tra phải hỏi **ít nhất R thư ký** rồi tin theo bản ghi mới nhất trong số đó.
+
+Nếu W + R lớn hơn N, hai nhóm thư ký này **chắc chắn** có ít nhất một người trùng nhau — người đó chắc chắn có bản ghi đúng, nên câu trả lời không bao giờ hoàn toàn cũ. Nếu W + R nhỏ hơn hoặc bằng N, hai nhóm hoàn toàn có thể không đụng ai — bạn có thể hỏi đúng nhóm chưa được báo, và nhận câu trả lời sai.
+
+Chỗ ví von hụt: nếu một thư ký nghỉ ốm hôm đó (node down), ban quản lý có thể nhờ thư ký khác ghi tạm hộ (sloppy quorum/hinted handoff) để vẫn đủ W người xác nhận — nhưng người tra cứu không biết phải hỏi thêm thư ký tạm đó, nên "chắc chắn trùng nhau" không còn chắc chắn nữa.
+
+</Eli5>
+
+Leaderless replication (Dynamo, Cassandra, Riak) bỏ hẳn khái niệm "ai là leader" — mọi replica bình đẳng, client (hoặc coordinator) tự ghi/đọc vào nhiều replica cùng lúc. Quorum là công cụ toán học duy nhất giữ cho việc đó không loạn, và nó có đúng một điều kiện hay bị nhớ sai.
+
+<QuorumOverlapDiagram />
+
+<Technical>
+
+### Cơ chế leaderless
+
+Không có leader nhận ghi rồi phát cho follower. Thay vào đó:
+
+- **Write:** client (hoặc coordinator node) gửi giá trị mới tới tất cả N replica cùng lúc, coi là **thành công** khi nhận đủ **W** phản hồi "đã ghi".
+- **Read:** client gửi yêu cầu đọc tới nhiều replica, coi là **xong** khi nhận đủ **R** phản hồi, rồi chọn giá trị có timestamp/version lớn nhất trong số đó.
+- **N** = tổng số replica giữ bản sao của dữ liệu đó (thường ít hơn tổng cluster nếu dùng consistent hashing — SD06).
+
+### Công thức quorum — và cái bẫy hay nhầm
+
+> **`W + R > N`** đảm bảo tập replica được ghi và tập replica được đọc **chắc chắn giao nhau** ít nhất một node.
+
+Đây là pigeonhole đơn giản: chọn W phần tử và R phần tử từ N phần tử, nếu W + R > N thì không thể chọn hai tập đó rời nhau hoàn toàn — bắt buộc có phần tử chung. Diagram phía trên minh hoạ đúng ranh giới này: `W + R = N` (không phải `>`) **không** đảm bảo — hoàn toàn có thể chọn hai tập rời nhau, và bẫy phỏng vấn phổ biến nhất là quên dấu `>` này.
+
+Có "một node chung" giữa tập ghi và tập đọc chỉ đảm bảo **read repair có cơ hội thấy giá trị mới nhất** trong số các replica được hỏi — **không** tự động thành linearizable. Vẫn có các race condition tinh vi hơn (hai write đồng thời, coordinator crash giữa chừng) mà quorum thô không giải quyết hết; muốn linearizable thật sự cần thêm cơ chế (Cassandra: lightweight transactions dùng Paxos cho riêng thao tác đó).
+
+### Sloppy quorum & hinted handoff — phá vỡ đảm bảo
+
+Khi một trong N replica "chính chủ" down, hệ thống có 2 lựa chọn:
+
+1. **Strict quorum** — chờ hoặc từ chối cho tới khi đủ W/R replica *trong đúng N node gốc* phản hồi. An toàn nhưng giảm availability khi node down.
+2. **Sloppy quorum** — ghi tạm vào một node khác **ngoài N node gốc** (gọi là hinted handoff) để vẫn đạt đủ số lượng W xác nhận, ưu tiên availability. Khi node gốc sống lại, dữ liệu "hint" được chuyển giao lại.
+
+Vấn đề: `W + R > N` chỉ đảm bảo overlap **trong đúng tập N node được cả write và read cùng nhắm tới**. Với sloppy quorum, write "đếm" vào W nhưng nằm ở node ngoài N — read (vẫn hỏi trong N node gốc) có thể **không thấy** ghi đó cho tới khi hinted handoff hoàn tất. Công thức số học vẫn đúng (`W + R > N`), nhưng đảm bảo hình học (hai tập cùng chọn từ N phần tử) không còn giữ. Đây chính là lý do Dynamo/Cassandra dùng sloppy quorum + hinted handoff + **read repair** + **anti-entropy** như những lớp phòng thủ bổ sung, không dựa hoàn toàn vào `W+R>N`.
+
+### Read repair
+
+Khi đọc R replica và thấy chúng không khớp nhau, coordinator gửi ngay giá trị mới nhất tới các replica còn cũ (read repair "on read"). Ngoài ra chạy định kỳ **anti-entropy** (so sánh Merkle tree giữa các replica) để bắt cả những key ít khi được đọc.
+
+### Trade-off
+
+| Cấu hình (N=3) | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| W=1, R=1 | Ghi/đọc nhanh nhất, chịu được 2 node down | Không đảm bảo overlap — stale read thường xuyên | Dữ liệu chấp nhận eventual (view count, log) |
+| W=2, R=2 | `W+R=4>N=3` — đảm bảo overlap, cân bằng | Chậm hơn, chỉ chịu được 1 node down mỗi phía | Mặc định hợp lý cho phần lớn dữ liệu quan trọng vừa |
+| W=3, R=1 | Đọc rất nhanh, đọc luôn thấy mới nhất | Ghi chậm, không chịu được node down lúc ghi | Đọc nhiều hơn ghi rất nhiều, ghi hiếm |
+| W=1, R=3 | Ghi rất nhanh | Đọc chậm, đọc phải chờ mọi replica | Ghi cực nhiều, đọc hiếm và không gấp |
+
+**Khi nào đổi ý:** đo tỉ lệ stale read thực tế qua read repair log; nếu sloppy quorum đang kích hoạt thường xuyên (nhiều node flap), cân nhắc `W=N` tạm thời cho dữ liệu nhạy cảm hoặc chuyển hẳn dữ liệu đó sang mô hình có leader.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Quan sát consistency level trong CQL (giả lập tư duy tương tự Cassandra)"
+  prompt="$"
+  commands={[
+    { comment: "Chạy quorum simulator tự viết (xem lab) với N=3, W=1, R=1", command: "npx tsx sd09/quorum-sim.ts --n 3 --w 1 --r 1 --iterations 2000", output: "stale reads: 812/2000 (40.6%)" },
+    { comment: "Tăng lên W=2, R=2 — W+R=4 > N=3", command: "npx tsx sd09/quorum-sim.ts --n 3 --w 2 --r 2 --iterations 2000", output: "stale reads: 0/2000 (0.0%)" },
+    { comment: "Bật sloppy quorum: vẫn W+R>N nhưng stale read quay lại", command: "npx tsx sd09/quorum-sim.ts --n 3 --w 2 --r 2 --sloppy --iterations 2000", output: "stale reads: 143/2000 (7.2%)" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Nghĩ `W + R > N` tự động nghĩa là **linearizable**. Nó chỉ đảm bảo tập đọc và tập ghi giao nhau — đủ để read repair hoạt động và giảm mạnh stale read, nhưng vẫn có race condition (hai write đồng thời, coordinator crash) mà quorum thô không xử lý. Muốn linearizable thật, cần thêm cơ chế như Paxos-based lightweight transaction.
+
+</Callout>
+
+<Callout type="warning">
+
+Sloppy quorum đánh đổi: có nó thì availability cao hơn khi node down, nhưng đảm bảo overlap toán học không còn tuyệt đối — luôn kèm theo read repair/anti-entropy nếu bật sloppy quorum, đừng bật một mình nó.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi được hỏi "thiết kế storage cho dữ liệu cần chịu lỗi node cao mà vẫn nhanh", nhắc tới leaderless + quorum là điểm cộng, nhưng câu trả lời mạnh phải nói được: chọn N/W/R cụ thể kèm lý do (đọc nhiều hơn ghi ⇒ R nhỏ, W lớn hơn), giải thích đúng vì sao cần `>` chứ không phải `≥`, và chủ động nhắc sloppy quorum/hinted handoff làm giảm đảm bảo đó khi có node down — cho thấy bạn biết giới hạn của công thức, không chỉ thuộc công thức.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "leaderless replication", meaning: "Mọi replica bình đẳng, client/coordinator ghi và đọc trực tiếp nhiều replica, không qua một leader cố định." },
+    { term: "quorum W/R/N", meaning: "N = tổng replica; W = số replica cần xác nhận ghi; R = số replica cần hỏi khi đọc." },
+    { term: "W + R > N", meaning: "Điều kiện đảm bảo tập ghi và tập đọc chắc chắn giao nhau ít nhất một node (pigeonhole)." },
+    { term: "sloppy quorum", meaning: "Đếm ghi vào node ngoài N node gốc khi một node chính down, ưu tiên availability." },
+    { term: "hinted handoff", meaning: "Node tạm giữ 'hint' ghi hộ node down, chuyển giao lại khi node đó sống lại." },
+    { term: "read repair", meaning: "Khi đọc phát hiện replica không khớp, coordinator gửi ngay giá trị mới nhất cho replica cũ." },
+    { term: "anti-entropy", meaning: "Quá trình định kỳ so sánh và đồng bộ toàn bộ dữ liệu giữa các replica (thường bằng Merkle tree)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Cluster N=5, đang dùng W=3, R=2. Một node trong 5 node down; hệ thống bật sloppy quorum để vẫn nhận đủ 3 xác nhận ghi bằng cách ghi tạm vào node thứ 6 (ngoài cluster gốc). Nhận định nào đúng về đảm bảo đọc thấy ghi mới nhất ngay sau đó?"
+  options={[
+    "Vẫn được đảm bảo tuyệt đối vì 3 + 2 = 5 > ... vẫn đúng công thức",
+    "Không còn được đảm bảo tuyệt đối: read (hỏi 2 trong 5 node gốc) có thể không thấy ghi vừa nằm ở node thứ 6 ngoài cluster, tới khi hinted handoff chuyển dữ liệu về đúng node",
+    "Không liên quan, sloppy quorum chỉ ảnh hưởng hiệu năng, không ảnh hưởng tính đúng của read",
+    "Đảm bảo tăng lên vì có thêm một node tham gia ghi",
+  ]}
+  answerIndex={1}
+  explanation="Công thức W+R>N chỉ đảm bảo overlap khi cả hai tập đều chọn trong đúng N node gốc. Node thứ 6 nằm ngoài N node mà read sẽ hỏi, nên phần ghi đó không tính vào overlap — vẫn có thể đọc thấy dữ liệu cũ cho tới khi hint được chuyển giao lại."
+/>
