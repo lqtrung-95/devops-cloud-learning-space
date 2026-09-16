@@ -25,6 +25,7 @@ import { sd06ScalingDatabasesModule } from "./modules/sd06-scaling-databases/mod
 import { sd07AsyncMessagingModule } from "./modules/sd07-async-messaging/module-meta";
 import { sd08StorageSearchModule } from "./modules/sd08-storage-search/module-meta";
 import { sd09ConsistencyReplicationModule } from "./modules/sd09-consistency-replication/module-meta";
+import { sd11ReliabilityPatternsModule } from "./modules/sd11-reliability-patterns/module-meta";
 
 /** All modules of every course (order within a course comes from `module.order`). Add modules after they pass `pnpm validate:module`. */
 export const curriculumModules: ModuleDefinition[] = [
@@ -54,4 +55,5 @@ export const curriculumModules: ModuleDefinition[] = [
   sd07AsyncMessagingModule,
   sd08StorageSearchModule,
   sd09ConsistencyReplicationModule,
+  sd11ReliabilityPatternsModule,
 ];

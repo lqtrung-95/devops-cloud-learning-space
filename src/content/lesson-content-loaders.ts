@@ -34,4 +34,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "sd04-caching-cdn": (lessonSlug) => import(`./modules/sd04-caching-cdn/lessons/${lessonSlug}.mdx`),
   "sd09-consistency-replication": (lessonSlug) => import(`./modules/sd09-consistency-replication/lessons/${lessonSlug}.mdx`),
   "sd08-storage-search": (lessonSlug) => import(`./modules/sd08-storage-search/lessons/${lessonSlug}.mdx`),
+  "sd11-reliability-patterns": (lessonSlug) => import(`./modules/sd11-reliability-patterns/lessons/${lessonSlug}.mdx`),
 };

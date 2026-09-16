@@ -1,0 +1,137 @@
+import { RateLimiterAlgorithmPickerDiagram } from "../diagrams/rate-limiter-algorithm-picker-diagram";
+
+<Eli5 title="Người gác cửa đếm vé vào quán" emoji="🎫">
+
+Quán chỉ cho tối đa 100 khách vào mỗi phút để không quá tải. Có nhiều cách người gác cửa đếm vé:
+
+**Token bucket**: gác cửa giữ một rổ vé, mỗi giây bỏ thêm vài vé vào rổ (tới một trần nhất định). Khách tới, có vé trong rổ thì vào ngay — kể cả một nhóm 20 người ập tới cùng lúc, miễn rổ đủ vé, cả nhóm vào hết một lượt. Cho phép burst, miễn "tích luỹ" đủ vé từ trước.
+
+**Leaky bucket**: gác cửa xếp khách vào một hàng, rồi cho vào quán theo đúng một nhịp cố định — 1 khách mỗi 0.6 giây, không hơn không kém, bất kể ngoài cửa đông cỡ nào. Rất đều, nhưng một nhóm bạn muốn vào cùng lúc cũng bị tách ra xếp hàng chờ tới lượt.
+
+**Fixed window**: gác cửa đếm số khách theo từng phút đồng hồ (0:00-1:00, 1:00-2:00...). Vấn đề: một nhóm canh đúng 0:59 ùa vào 100 người, rồi thêm một nhóm khác ùa vào lúc 1:01 — 200 người lọt qua trong 2 giây, dù mỗi "phút" riêng lẻ đều đúng luật.
+
+**Sliding window**: gác cửa đếm theo cửa sổ thời gian TRƯỢT theo thời gian thực (luôn nhìn lại đúng 60 giây gần nhất), không quan tâm mốc đồng hồ tròn — vá được lỗ hổng "canh giờ ùa vào" của fixed window.
+
+</Eli5>
+
+Chọn sai thuật toán rate limit không chỉ là vấn đề hiệu năng — nó quyết định hệ thống của bạn có thật sự được bảo vệ khỏi burst hay không, và trải nghiệm người dùng hợp lệ có bị delay oan hay không.
+
+<RateLimiterAlgorithmPickerDiagram />
+
+<Technical>
+
+### Bốn thuật toán, bốn hành vi với burst
+
+- **Token bucket**: bucket có `capacity` (số token tối đa) và `refill_rate` (token thêm mỗi giây). Mỗi request tiêu 1 token nếu còn; hết token thì từ chối. Cho phép burst tới đúng `capacity`, sau đó throttle về `refill_rate` sustained.
+- **Leaky bucket**: request vào hàng đợi có kích thước giới hạn, xử lý ra theo đúng 1 rate cố định (giống queue + worker chạy tốc độ không đổi). Đầu ra luôn mượt tuyệt đối, nhưng burst hợp lệ cũng bị delay giống burst xấu — không phân biệt được.
+- **Fixed window counter**: đếm request trong một cửa sổ thời gian cố định theo mốc đồng hồ, reset về 0 khi qua cửa sổ mới. Rẻ, dễ cài (một counter + TTL trong Redis), nhưng có **edge burst**: gần gấp đôi limit có thể lọt qua quanh ranh giới 2 window.
+- **Sliding window** (log hoặc counter xấp xỉ): tính số request trong N giây gần nhất tính từ THỜI ĐIỂM HIỆN TẠI, không phải mốc cố định. Sliding window log (lưu timestamp từng request) chính xác nhưng tốn bộ nhớ; sliding window counter (nội suy giữa window hiện tại và window trước theo tỉ lệ thời gian đã trôi qua) là xấp xỉ rẻ hơn, đủ tốt cho hầu hết use case.
+
+### Token bucket bằng Lua script trên Redis (atomic)
+
+Rate limit ở service phân tán nhiều instance cần state DÙNG CHUNG (không thể đếm local ở mỗi instance) — Redis là lựa chọn phổ biến, và phải chạy logic đọc-tính-ghi bằng **Lua script** (atomic trong Redis) để tránh race condition giữa nhiều request cùng lúc:
+
+```lua
+-- token-bucket.lua
+-- KEYS[1] = bucket key, ARGV = {capacity, refill_rate, now}
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+local bucket = redis.call("HMGET", KEYS[1], "tokens", "last_refill")
+local tokens = tonumber(bucket[1]) or capacity
+local last_refill = tonumber(bucket[2]) or now
+
+local elapsed = math.max(0, now - last_refill)
+tokens = math.min(capacity, tokens + elapsed * refill_rate)
+
+if tokens >= 1 then
+  tokens = tokens - 1
+  redis.call("HMSET", KEYS[1], "tokens", tokens, "last_refill", now)
+  return 1 -- cho qua
+else
+  redis.call("HMSET", KEYS[1], "tokens", tokens, "last_refill", now)
+  return 0 -- từ chối, trả 429
+end
+```
+
+Gọi qua `ioredis`: `await redis.eval(script, 1, "rate:user:42", capacity, refillRate, Date.now() / 1000)`.
+
+### Rate limit ở edge (API gateway/Nginx) vs ở service
+
+| Vị trí | Ưu | Nhược |
+|---|---|---|
+| Edge (API gateway, Nginx `limit_req`) | Chặn sớm, tiết kiệm tài nguyên phía sau, bảo vệ được nhiều service cùng lúc | Khó áp rule tinh vi theo business logic (vd hạn mức khác nhau theo gói dịch vụ user) |
+| Service (áp dụng ngay trong code nghiệp vụ) | Linh hoạt theo user/tenant/endpoint, có thể dùng logic nghiệp vụ | Request đã tốn tài nguyên đi qua load balancer, network trước khi bị chặn |
+
+Thực tế thường dùng CẢ HAI lớp: rate limit thô ở edge (chặn abuse/DDoS rẻ), rate limit tinh ở service (theo user, theo gói dịch vụ, theo endpoint).
+
+### Distributed rate limit — vấn đề khi có nhiều instance
+
+Nếu mỗi instance tự đếm local (in-memory), tổng limit thực tế = `limit x số instance` — sai hoàn toàn với ý định ban đầu. Cần state dùng chung (Redis, hoặc counter đồng bộ qua một service trung tâm) để limit đúng NGHĨA TOÀN CỤC, đổi lại một round-trip mạng mỗi lần check (chấp nhận được vì Redis rất nhanh, và có thể cache cục bộ ngắn hạn để giảm tải).
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Token bucket | Cho phép burst hợp lệ, cài đặt vừa phải | Cần lưu state (tokens, last_refill) mỗi key | API cho phép user thỉnh thoảng burst (sync sau mất mạng, batch job) |
+| Leaky bucket | Đầu ra cực mượt, bảo vệ downstream tốt nhất | Delay cả burst hợp lệ, cần hàng đợi (thêm độ trễ + bộ nhớ) | Downstream cực nhạy với spike (hardware cũ, third-party tính phí theo QPS tức thời) |
+| Fixed window | Rẻ nhất, dễ cài (1 counter + TTL) | Edge burst gần gấp đôi limit quanh ranh giới window | Giới hạn thô, không cần chính xác tuyệt đối, ưu tiên đơn giản |
+| Sliding window | Vá được edge burst, công bằng hơn theo thời gian thực | Tốn thêm bộ nhớ/tính toán (log) hoặc độ chính xác đánh đổi (counter xấp xỉ) | Cần giới hạn chính xác và công bằng, có ngân sách kỹ thuật để cài phức tạp hơn |
+
+**Khi nào đổi ý:** bắt đầu với fixed window (rẻ, đủ dùng phần lớn trường hợp); nâng cấp sliding window khi đo được abuse thật sự lợi dụng edge burst; chuyển token bucket khi sản phẩm CẦN cho phép burst hợp lệ (không phải muốn chặn burst).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Token bucket qua Redis Lua script, kiểm tra bằng k6"
+  prompt="$"
+  commands={[
+    { comment: "Chạy thử script trực tiếp qua redis-cli --eval (capacity 10, refill 5 token/giây)", command: "docker compose exec redis redis-cli --eval /scripts/token-bucket.lua rate:user:42 , 10 5 $(date +%s)", output: "(integer) 1" },
+    { comment: "Gọi liên tiếp 12 lần ngay lập tức — 10 lần đầu qua (burst = capacity), 2 lần cuối bị từ chối", command: "for i in {1..12}; do docker compose exec redis redis-cli --eval /scripts/token-bucket.lua rate:user:42 , 10 5 $(date +%s); done", output: "(integer) 1\n(integer) 1\n... (8 dòng '1' nữa) ...\n(integer) 0\n(integer) 0" },
+    { comment: "Bắn tải k6 vượt refill_rate, xem tỉ lệ 429", command: "k6 run --vus 20 --duration 10s rate-limit-burst.js", output: "http_req_duration..............: avg=45ms\nchecks.........................: 62.00% (status 429 for ~38% requests, as expected above sustained rate)" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Đếm rate limit bằng biến in-memory local trên một service chạy nhiều instance sau load balancer — mỗi instance tự đếm riêng khiến limit thực tế bị nhân lên theo số instance, hoàn toàn không đúng ý định "user X tối đa N request/phút toàn hệ thống".
+
+</Callout>
+
+<Callout type="warning">
+
+Dùng `GET` rồi `SET` (hai lệnh riêng) để cập nhật counter trong Redis sẽ có race condition khi nhiều request cùng lúc — hai request có thể cùng đọc giá trị cũ rồi cùng ghi giá trị mới, làm mất một lượt tăng. Luôn dùng Lua script (atomic) hoặc lệnh atomic sẵn có như `INCR`.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu hỏi kinh điển: "thiết kế rate limiter cho API". Trả lời tốt đi theo: (1) hỏi rõ có cần cho phép burst không — quyết định token bucket hay leaky/window; (2) nói rõ fixed window có edge burst, sliding window vá được nhưng tốn hơn; (3) nhắc vị trí đặt (edge vs service, thường cả hai); (4) nhắc distributed rate limit cần state dùng chung (Redis) và phải atomic (Lua script hoặc `INCR`) để tránh race condition.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "token bucket", meaning: "Bucket tích token theo thời gian tới một trần (capacity); mỗi request tiêu 1 token, cho phép burst tới đúng capacity." },
+    { term: "leaky bucket", meaning: "Hàng đợi xử lý request ra theo đúng 1 rate cố định, làm mượt mọi burst nhưng thêm độ trễ." },
+    { term: "fixed window counter", meaning: "Đếm request theo mốc đồng hồ cố định, reset khi qua window mới — dễ cài nhưng có edge burst." },
+    { term: "sliding window", meaning: "Đếm request trong N giây gần nhất tính từ hiện tại, không phải mốc cố định — công bằng hơn, tốn hơn." },
+    { term: "atomic Lua script (Redis)", meaning: "Đoạn script chạy trọn vẹn không bị chen ngang trong Redis, cần thiết để đọc-tính-ghi rate limit đúng dưới tải đồng thời." },
+    { term: "distributed rate limit", meaning: "Rate limit đúng nghĩa toàn cục qua nhiều instance, cần state dùng chung thay vì đếm local mỗi instance." },
+  ]}
+/>
+
+<QuickCheck
+  question="API cho phép user thỉnh thoảng gửi burst 30 request liền (đồng bộ dữ liệu sau mất mạng), miễn trung bình vẫn ≤ 5 req/giây. Nếu dùng LEAKY BUCKET để giới hạn, điều gì xảy ra với burst 30 request đó?"
+  options={[
+    "Cả 30 request được xử lý ngay lập tức vì leaky bucket cho phép burst không giới hạn",
+    "30 request bị xếp hàng và xử lý ra theo đúng rate cố định (vd 5/giây) — burst hợp lệ này bị delay y hệt một burst bất thường, mất khoảng 6 giây mới xử lý hết",
+    "Leaky bucket sẽ từ chối toàn bộ 30 request ngay lập tức",
+    "Leaky bucket tự động tăng rate tạm thời khi phát hiện burst hợp lệ",
+  ]}
+  answerIndex={1}
+  explanation="Leaky bucket không phân biệt burst 'tốt' hay 'xấu' — nó luôn xếp hàng và rót ra đều theo đúng một nhịp cố định, giống gác cửa cho vào đúng 1 khách mỗi 0.6 giây dù cả nhóm 30 người muốn vào cùng lúc. Muốn cho phép burst hợp lệ đi qua ngay, cần token bucket thay vì leaky bucket."
+/>

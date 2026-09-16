@@ -1,0 +1,134 @@
+import { CircuitBreakerStateMachineDiagram } from "../diagrams/circuit-breaker-state-machine-diagram";
+
+<Eli5 title="Bếp treo bảng 'tạm ngừng nhận order từ nhà cung cấp cá'" emoji="🐟">
+
+Bếp đặt cá tươi từ một nhà cung cấp. Vài đơn liên tiếp bị treo máy không ai nghe. Thay vì bồi bàn cứ gọi lại, chờ hết chuông rồi mới biết không ai bắt máy — quản lý bếp ra quyết định: "từ giờ TẠM NGỪNG gọi nhà cung cấp cá, mọi món cá tạm hết". Không ai tốn thời gian gọi vô ích nữa. Đó là circuit breaker ở trạng thái **open**.
+
+Sau một khoảng thời gian (30 phút), quản lý cử một người gọi thử ĐÚNG MỘT cuộc để dò xem nhà cung cấp đã trả lời được chưa — đây là **half-open**. Nếu gọi được, mở lại toàn bộ order cá (**closed**); nếu vẫn không ai nghe, tiếp tục đóng thêm 30 phút nữa.
+
+Giờ hình dung bếp chỉ có DUY NHẤT một cái lò dùng chung cho cả cá, thịt, và rau. Lò dành cho cá bị kẹt (dù chưa hẳn là "lỗi", chỉ là chậm) sẽ chiếm hết chỗ trong lò chung, làm cả món thịt và rau cũng không nấu được — dù nhà cung cấp thịt và rau hoàn toàn bình thường. Cách sửa: cho mỗi loại món **một lò riêng** — đó là bulkhead.
+
+</Eli5>
+
+Circuit breaker và bulkhead giải quyết hai vấn đề khác nhau nhưng thường đi cùng nhau: circuit breaker ngăn việc TIẾP TỤC GỌI một dependency đã biết đang lỗi nặng; bulkhead ngăn việc MỘT dependency chậm (chưa hẳn lỗi hẳn) CHIẾM HẾT tài nguyên dùng chung khiến các tính năng khác cũng bị vạ lây.
+
+<CircuitBreakerStateMachineDiagram />
+
+<Technical>
+
+### Circuit breaker: 3 trạng thái
+
+- **Closed** (bình thường): mọi request đi qua breaker tới dependency thật. Breaker đếm tỉ lệ lỗi trong một cửa sổ trượt (vd 10-20 request gần nhất, hoặc theo thời gian).
+- **Open**: khi tỉ lệ lỗi vượt ngưỡng (`errorThresholdPercentage`) VÀ đã đạt volume tối thiểu (vd cần ít nhất 5 request trong cửa sổ để tránh trip vì 1/1 lỗi ngẫu nhiên) — breaker chuyển sang `open`, từ chối (hoặc trả fallback) mọi request MỚI ngay lập tức, không gọi dependency thật nữa. Ở lại `open` trong `resetTimeout` (vd 10-30s).
+- **Half-open**: sau `resetTimeout`, breaker cho một số lượng nhỏ request thử đi qua. Thành công → `closed`. Thất bại → quay lại `open`, chờ thêm một `resetTimeout` nữa.
+
+Ba tham số quan trọng nhất khi cấu hình: `errorThresholdPercentage` (bao nhiêu % lỗi thì trip), volume tối thiểu (tránh trip giả với mẫu quá nhỏ), và `resetTimeout` (bao lâu thì thử dò lại — quá ngắn thì dò liên tục làm phiền dependency đang hồi phục, quá dài thì phục hồi chậm không cần thiết).
+
+```ts
+import CircuitBreaker from "opossum";
+
+const breaker = new CircuitBreaker(callPaymentGateway, {
+  timeout: 1000, // mỗi lần gọi tối đa 1s trước khi tính là lỗi
+  errorThresholdPercentage: 50, // >=50% lỗi trong cửa sổ thì trip
+  resetTimeout: 10_000, // 10s ở open trước khi thử half-open
+  volumeThreshold: 5, // cần ít nhất 5 request mới tính % lỗi
+});
+
+breaker.fallback(() => ({ status: "queued_for_retry" }));
+breaker.on("open", () => log.warn("payment breaker: open"));
+```
+
+### Fallback & graceful degradation
+
+Circuit breaker chỉ có ích nếu bạn có phương án khi `open`: trả cache cũ, trả giá trị mặc định, đưa vào hàng đợi xử lý sau, hoặc đơn giản là báo lỗi rõ ràng cho người dùng thay vì treo trang. "Ngắt mạch" mà không có fallback chỉ chuyển timeout chậm thành lỗi nhanh — tốt hơn nhưng chưa phải graceful degradation thật sự.
+
+### Bulkhead: cô lập resource pool
+
+Bulkhead (mượn từ vách ngăn khoang tàu) tách riêng resource — thread pool, connection pool, hoặc semaphore giới hạn số call đồng thời — cho từng dependency, để một dependency chậm/bận không thể chiếm hết tài nguyên dùng chung.
+
+```ts
+// Không có bulkhead: mọi outbound call dùng chung 1 agent với pool connection chung
+const sharedAgent = new https.Agent({ maxSockets: 100 });
+
+// Có bulkhead: mỗi dependency có pool riêng, giới hạn riêng
+const recommendationAgent = new https.Agent({ maxSockets: 10 });
+const paymentAgent = new https.Agent({ maxSockets: 30 });
+```
+
+`recommendation` chậm chỉ có thể chiếm tối đa 10 connection của chính nó — dù nó chiếm hết cả 10, `payment` vẫn còn nguyên 30 connection để hoạt động bình thường.
+
+### Circuit breaker vs bulkhead — dùng cùng nhau
+
+| Cơ chế | Phản ứng với | Bảo vệ điều gì |
+|---|---|---|
+| Timeout | Một call chờ quá lâu | Giới hạn thiệt hại của MỘT lần gọi |
+| Circuit breaker | Tỉ lệ lỗi cao liên tục | Ngừng gọi dependency đã biết đang lỗi, tiết kiệm tài nguyên |
+| Bulkhead | Một dependency chiếm hết resource pool dùng chung | Các dependency/tính năng KHÁC không bị vạ lây |
+
+Ba cơ chế bổ sung cho nhau: timeout giới hạn từng call, circuit breaker ngừng gọi khi biết chắc đang lỗi, bulkhead đảm bảo dù có gọi (kể cả khi chưa trip breaker) thì thiệt hại cũng khoanh vùng.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Chỉ timeout, không circuit breaker | Đơn giản | Vẫn tốn tài nguyên gọi dependency đã biết chết, mỗi lần đúng bằng timeout | Dependency hiếm khi lỗi kéo dài, traffic thấp |
+| Circuit breaker không bulkhead | Ngừng gọi dependency lỗi nặng | Dependency CHẬM (chưa đủ lỗi để trip) vẫn có thể chiếm hết pool chung | Chỉ có 1 dependency ngoài dùng resource đó |
+| Bulkhead không circuit breaker | Cô lập thiệt hại resource | Vẫn tốn thời gian/CPU gọi dependency biết chắc đang lỗi | Ít dependency, tỉ lệ lỗi thấp, chưa cần tối ưu |
+| Cả hai | Bảo vệ toàn diện: khoanh vùng resource + ngừng gọi khi lỗi nặng | Cấu hình phức tạp hơn, cần tune nhiều tham số | Hệ thống production nhiều dependency, traffic lớn |
+
+**Khi nào đổi ý:** nếu một dependency vốn cực kỳ ổn định và ít traffic, thêm cả circuit breaker lẫn bulkhead có thể là over-engineering — bắt đầu với timeout, thêm circuit breaker khi đã thấy sự cố lặp lại, thêm bulkhead khi resource pool dùng chung thật sự trở thành điểm nghẽn.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Quan sát log chuyển trạng thái breaker bằng opossum"
+  prompt="$"
+  commands={[
+    { comment: "Ép dependency lỗi 100% qua Toxiproxy", command: "docker compose exec toxiproxy toxiproxy-cli toxic add slow-dep -t timeout -a timeout=0", output: "Added downstream toxic 'timeout_downstream' of type 'timeout'" },
+    { comment: "Bắn 20 request liên tiếp — breaker sẽ trip sau khi vượt errorThresholdPercentage", command: "for i in {1..20}; do curl -s localhost:3000/checkout | jq .breakerState; done | sort | uniq -c", output: "      6 \"closed\"\n     14 \"open\"" },
+    { comment: "Gỡ toxic, đợi hết resetTimeout rồi gọi lại 1 request", command: "docker compose exec toxiproxy toxiproxy-cli toxic remove slow-dep -n timeout_downstream && sleep 11 && curl -s localhost:3000/checkout | jq .breakerState", output: "\"closed\"" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Đặt `volumeThreshold` = 1 khiến breaker trip ngay khi có 1 lỗi ngẫu nhiên đơn lẻ (vd một packet rớt hiếm gặp), gây "flapping" — đóng mở liên tục dù dependency thực ra vẫn khoẻ phần lớn thời gian. Luôn yêu cầu một mẫu tối thiểu hợp lý trước khi tính tỉ lệ lỗi.
+
+</Callout>
+
+<Callout type="tip">
+
+Log MỌI lần chuyển trạng thái breaker (kèm timestamp, dependency name) — đây là dữ liệu quan trọng nhất khi debug incident: bạn cần biết chính xác lúc nào hệ thống bắt đầu tự bảo vệ, để phân biệt "chúng ta gây ra outage" và "chúng ta đang chống chịu outage của người khác".
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu hỏi thường gặp: "circuit breaker khác gì timeout/retry?". Trả lời tốt: timeout giới hạn MỘT call, retry thử lại khi lỗi tạm thời, còn circuit breaker theo dõi XU HƯỚNG lỗi qua nhiều request để quyết định NGỪNG GỌI hẳn — tiết kiệm tài nguyên khi đã biết chắc dependency đang chết, thay vì lặp lại chu trình timeout+retry vô ích. Nhắc thêm bulkhead nếu được hỏi "còn gì bảo vệ các tính năng KHÁC không dùng dependency đó" — đáp án đúng thường bị bỏ sót.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "circuit breaker", meaning: "Cơ chế theo dõi tỉ lệ lỗi của một dependency và tự động ngừng gọi (fail fast) khi vượt ngưỡng." },
+    { term: "closed / open / half-open", meaning: "Ba trạng thái breaker: gọi bình thường / từ chối hẳn / cho thử một số ít request để dò hồi phục." },
+    { term: "resetTimeout", meaning: "Thời gian breaker ở `open` trước khi chuyển sang `half-open` để thử lại." },
+    { term: "fallback", meaning: "Giá trị/hành vi thay thế khi breaker `open` — cache cũ, giá trị mặc định, hàng đợi xử lý sau." },
+    { term: "bulkhead", meaning: "Cô lập resource pool (thread/connection) theo từng dependency để một dependency chậm không chiếm hết tài nguyên dùng chung." },
+    { term: "graceful degradation", meaning: "Hệ thống vẫn hoạt động ở mức giảm tính năng thay vì sập hoàn toàn khi một phần phụ thuộc gặp sự cố." },
+  ]}
+/>
+
+<QuickCheck
+  question="`checkout` gọi cả `payment` và `recommendation` qua cùng một connection pool dùng chung, không có bulkhead. `recommendation` bắt đầu CHẬM (p99 tăng gấp 20 lần) nhưng vẫn trả `200` nên tỉ lệ lỗi chưa đủ để circuit breaker trip. Điều gì nhiều khả năng xảy ra với `payment`?"
+  options={[
+    "Không ảnh hưởng gì vì circuit breaker của `recommendation` sẽ tự bảo vệ `payment`",
+    "`payment` có thể bị ảnh hưởng: các call `recommendation` chậm giữ connection lâu hơn trong pool DÙNG CHUNG, làm cạn connection cho `payment` dù `payment` không hề lỗi",
+    "Không thể xảy ra vì mỗi dependency luôn có pool riêng theo mặc định",
+    "Chỉ ảnh hưởng nếu `payment` và `recommendation` cùng một database",
+  ]}
+  answerIndex={1}
+  explanation="Giống một lò nướng dùng chung cho cá và thịt: cá nướng lâu hơn bình thường (chưa cháy, chưa 'lỗi') vẫn chiếm chỗ lò khiến thịt không có chỗ nấu. Circuit breaker chỉ phản ứng theo TỈ LỆ LỖI, không ngăn được việc pool dùng chung bị chiếm dụng bởi call chậm — đó là lý do cần bulkhead tách riêng pool theo dependency."
+/>

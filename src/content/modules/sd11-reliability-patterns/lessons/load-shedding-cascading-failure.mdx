@@ -1,0 +1,121 @@
+import { CascadingFailureBulkheadDiagram } from "../diagrams/cascading-failure-bulkhead-diagram";
+
+<Eli5 title="Người gác cửa chặn khách mới ngay tại cửa khi quán đã kín bàn" emoji="🚪">
+
+Quán đã kín bàn. Nếu người gác cửa vẫn để khách mới vào, dẫn họ tới một bàn không có, loay hoay tìm chỗ, rồi mới báo "xin lỗi hết bàn rồi" — quán đã tốn công dẫn khách, khách đứng chờ vô ích, và tệ hơn: nhân viên bận rộn với khách sẽ-bị-từ-chối đó lại không phục vụ kịp những bàn ĐANG NGỒI. Cách đúng: gác cửa nhìn qua là biết hết bàn, từ chối NGAY TẠI CỬA, tốn đúng 2 giây thay vì 2 phút. Đó là **load shedding** — từ chối rẻ, sớm, trước khi tốn công.
+
+Giờ hình dung quán A hết bàn vì nhà bếp chung của một chuỗi 4 quán liền kề bị cháy nhỏ ở góc nấu cá. Nếu 4 quán dùng chung một dây chuyền nấu, khói và sự cố ở góc cá có thể buộc dừng cả dây chuyền — cả 4 quán đều đóng cửa dù chỉ một góc bị cháy. Đó là **cascading failure**: một sự cố nhỏ, cục bộ, lan ra toàn hệ thống vì thiếu vách ngăn.
+
+</Eli5>
+
+Hai chủ đề này là "tuyến phòng thủ cuối cùng": timeout, retry+jitter, circuit breaker, bulkhead, rate limiting đều là những lớp phòng ngừa — nhưng khi TẤT CẢ vẫn không đủ và hệ thống thật sự quá tải, load shedding quyết định ai được phục vụ, và hiểu cascading failure giúp bạn tìm đúng điểm cần đặt vách ngăn trước khi sự cố xảy ra.
+
+<CascadingFailureBulkheadDiagram />
+
+<Technical>
+
+### Load shedding: từ chối rẻ, sớm, có chủ đích
+
+Load shedding là chủ động từ chối một phần request khi hệ thống gần/đã quá tải, để phần request còn lại vẫn được phục vụ tốt — thay vì cố xử lý tất cả rồi tất cả đều chậm hoặc lỗi (degradation lan toả, không ai được phục vụ tử tế).
+
+Nguyên tắc quan trọng nhất: **shed CÀNG SỚM CÀNG RẺ càng tốt** — lý tưởng là ngay ở middleware đầu tiên, trước khi chạm DB, trước khi gọi dependency nào khác:
+
+```ts
+// Middleware đầu tiên trong pipeline — chạy trước mọi handler khác
+let inFlight = 0;
+const MAX_IN_FLIGHT = 100;
+
+app.addHook("onRequest", async (req, reply) => {
+  if (inFlight >= MAX_IN_FLIGHT) {
+    reply.code(503).send({ error: "overloaded" });
+    return reply; // dừng ở đây — không chạm DB, không gọi dependency
+  }
+  inFlight++;
+});
+
+app.addHook("onResponse", async () => {
+  inFlight--;
+});
+```
+
+Có thể shed theo tiêu chí thông minh hơn là "vào trước, phục vụ trước": ưu tiên theo loại request (`checkout` quan trọng hơn `prefetch-recommendations`), theo hạng khách hàng (trả phí ưu tiên hơn free tier), hoặc theo tuổi request trong hàng đợi (request chờ quá lâu có khả năng cao user đã bỏ đi, shed nó giải phóng chỗ cho request mới còn cơ hội).
+
+### Backpressure — báo hiệu ngược lên trước khi phải shed
+
+Backpressure là cơ chế một thành phần báo cho thành phần GỬI dữ liệu tới nó "chậm lại" trước khi phải từ chối cứng — vd hàng đợi (queue) từ chối nhận thêm khi đầy, buộc producer tự chậm lại hoặc lưu tạm nơi khác. Load shedding là "van an toàn" cuối cùng khi backpressure không đủ hoặc không có đường truyền tín hiệu ngược (vd traffic từ internet, không kiểm soát được tốc độ gửi của client).
+
+### Cascading failure: một lỗi nhỏ lan ra toàn hệ thống
+
+Cascading failure xảy ra khi lỗi/chậm ở MỘT thành phần làm các thành phần PHỤ THUỘC vào nó cũng hỏng theo, dù bản thân chúng không có lỗi gì. Ba nguyên nhân phổ biến nhất, và cũng là ba thứ đã học trong 2 bài trước:
+
+1. **Thiếu timeout**: thread/connection gọi dependency lỗi bị giữ vô thời hạn → cạn kiệt dần.
+2. **Thiếu bulkhead**: resource pool dùng chung bị một dependency chậm chiếm hết → mọi tính năng dùng chung pool đó đều bị ảnh hưởng, kể cả tính năng không hề gọi dependency đang lỗi.
+3. **Thiếu circuit breaker**: hệ thống tiếp tục gọi một dependency đã biết chắc đang chết, vừa lãng phí tài nguyên vừa có thể làm dependency đó không kịp hồi phục (retry storm ở quy mô service-to-service).
+
+Cascading failure còn có thể lan theo chiều "ngược" nguy hiểm hơn: `service-b` chậm khiến `service-a` retry nhiều hơn → tổng traffic tới `service-b` tăng thêm → `service-b` càng chậm hơn → vòng lặp tự khuếch đại (positive feedback loop), đặc biệt nguy hiểm nếu không có retry budget.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Không load shedding, cứ xử lý hết | Đơn giản, không request nào bị từ chối "oan" khi tải thấp | Khi quá tải thật, MỌI request đều chậm/lỗi — kể cả request quan trọng | Traffic ổn định, có capacity dư dả, chưa từng gặp sự cố quá tải |
+| Load shedding đơn giản (in-flight limit) | Rẻ, dễ cài, chặn được overload cơ bản | Không phân biệt request quan trọng hay không | Bước đầu tiên cho mọi service public-facing |
+| Load shedding có ưu tiên (priority-aware) | Bảo vệ được luồng nghiệp vụ quan trọng nhất khi quá tải | Cần thiết kế phân loại priority, phức tạp hơn | Hệ thống có nhiều loại traffic rõ ràng khác giá trị (checkout vs prefetch) |
+| Chỉ dựa vào auto-scaling, không shedding | Có thể xử lý tăng trưởng traffic hợp lệ | Scale không kịp với spike đột ngột (traffic tăng nhanh hơn thời gian boot instance mới) | Traffic tăng dần dự đoán được, không có spike bất ngờ |
+
+**Khi nào đổi ý:** load shedding và auto-scaling KHÔNG loại trừ nhau — auto-scaling xử lý tăng trưởng dần, load shedding là van an toàn cho spike vượt quá cả khả năng scale kịp thời. Hệ thống production nghiêm túc cần cả hai.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="So sánh p99 latency có/không load shedding khi quá tải"
+  prompt="$"
+  commands={[
+    { comment: "Chưa có load shedding — bắn 300 VU vào endpoint có query Postgres nặng", command: "k6 run --vus 300 --duration 20s overload.js", output: "http_req_duration..............: avg=4.8s p(95)=9.1s p(99)=14.2s\nhttp_req_failed.................: 22.00%" },
+    { comment: "Bật middleware load shedding (MAX_IN_FLIGHT=100), chạy lại đúng kịch bản", command: "k6 run --vus 300 --duration 20s overload.js", output: "http_req_duration..............: avg=180ms p(95)=310ms p(99)=480ms  (request lọt qua)\nhttp_req_failed.................: 61.00%  (503 nhanh, không chạm DB)" },
+    { comment: "Request bị shed trả 503 gần như tức thì — kiểm tra latency riêng của nhóm 503", command: "cat overload-summary.json | jq '.metrics.http_req_duration_503.p95'", output: "12" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Load shedding SAU KHI đã query DB hoặc gọi dependency xong (vd shed ở bước cuối cùng trước khi trả response) gần như vô dụng — chi phí đắt nhất (DB, network) đã bị tiêu tốn rồi. Luôn shed ở lớp NGOÀI CÙNG, càng gần điểm vào hệ thống càng tốt.
+
+</Callout>
+
+<Callout type="warning">
+
+Auto-scaling không phải giải pháp thay thế cho load shedding: instance mới cần thời gian boot (vài chục giây tới vài phút), trong khi một spike traffic có thể đạt đỉnh trong vài giây. Load shedding là lớp bảo vệ tức thời trong lúc chờ scale kịp.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu hỏi "hệ thống của bạn quá tải đột ngột thì sao?" — câu trả lời mạnh nhắc: (1) load shedding ở lớp ngoài cùng, fail fast trước khi tốn tài nguyên; (2) phân biệt được đây không phải circuit breaker (circuit breaker phản ứng theo LỖI của một dependency cụ thể, load shedding phản ứng theo TẢI TỔNG THỂ của chính service mình); (3) nhắc backpressure và auto-scaling là các lớp bổ sung, không thay thế; (4) nếu có thời gian, đưa ví dụ cascading failure cụ thể và chỉ đúng 3 điểm chặn (timeout, bulkhead, circuit breaker) đã học ở 2 bài trước.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "load shedding", meaning: "Chủ động từ chối một phần request khi hệ thống quá tải, càng sớm và càng rẻ càng tốt, để phần còn lại được phục vụ tốt." },
+    { term: "fail fast (fail cheap)", meaning: "Từ chối request ngay tại điểm vào, trước khi tốn tài nguyên xử lý (DB, dependency)." },
+    { term: "backpressure", meaning: "Tín hiệu báo ngược cho bên gửi 'chậm lại' trước khi hệ thống buộc phải từ chối cứng." },
+    { term: "cascading failure", meaning: "Lỗi/chậm ở một thành phần lan ra làm các thành phần phụ thuộc khác cũng hỏng theo, dù bản thân chúng không lỗi." },
+    { term: "priority-aware shedding", meaning: "Shed request kém quan trọng trước, giữ lại request có giá trị nghiệp vụ cao (vd checkout) lâu nhất có thể." },
+    { term: "positive feedback loop (overload)", meaning: "Chậm ở một service khiến upstream retry nhiều hơn, làm tải tăng thêm và service đó càng chậm hơn — vòng lặp tự khuếch đại." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một service quá tải đột ngột do spike traffic bất thường. Auto-scaling đã được cấu hình nhưng instance mới cần 90 giây để boot xong. Trong 90 giây đó, điều gì giúp bảo vệ dịch vụ tốt nhất?"
+  options={[
+    "Không cần làm gì, chờ auto-scaling xử lý là đủ",
+    "Load shedding: từ chối rẻ phần request vượt khả năng xử lý hiện tại NGAY LẬP TỨC, trong lúc chờ instance mới boot xong — auto-scaling và load shedding bổ sung cho nhau, không thay thế nhau",
+    "Tăng timeout lên thật cao để không request nào bị lỗi trong lúc chờ scale",
+    "Tắt hẳn health check để instance không bị loại khỏi load balancer",
+  ]}
+  answerIndex={1}
+  explanation="Giống người gác cửa chặn khách mới ngay tại cửa trong lúc chờ quán mở thêm bàn (tương đương thời gian boot instance mới) — nếu không có ai gác cửa, khách vẫn ùa vào làm nhân viên đang phục vụ những bàn hiện có cũng bị kéo theo quá tải. Auto-scaling giải quyết vấn đề DÀI HẠN (thêm capacity), load shedding giải quyết vấn đề NGAY LÚC ĐÓ."
+/>

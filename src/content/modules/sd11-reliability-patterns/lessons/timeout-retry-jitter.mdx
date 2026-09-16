@@ -1,0 +1,114 @@
+import { RetryStormJitterDiagram } from "../diagrams/retry-storm-jitter-diagram";
+
+<Eli5 title="Mọi bàn cùng gọi lại bếp đúng một lúc" emoji="🍽️">
+
+Nhà hàng giờ cao điểm. Bàn nào gọi món cũng phải chờ bếp trả lời — nếu bồi bàn cứ đứng chờ bếp trả lời vô thời hạn, cả nhà hàng sẽ kẹt cứng chỉ vì vài bàn xui xẻo gặp món chế biến lâu. Đó là lý do luôn cần **timeout**: đứng chờ tối đa một khoảng thời gian, hết giờ thì thôi, để bàn tiếp theo còn được phục vụ.
+
+Giờ bếp bị nghẽn thật sự, treo hết mọi order trong 30 giây. Mỗi bồi bàn tự tính: "chờ 1s không thấy, thử lại; vẫn không thấy, chờ 2s rồi thử; rồi 4s...". Nghe hợp lý — cho tới khi bếp vừa thông thoáng trở lại thì TẤT CẢ bồi bàn cùng thử lại đúng giây đó (vì ai cũng tính cùng công thức, cùng bắt đầu đếm cùng lúc). Bếp vừa thở được một nhịp đã bị dội ngay một đợt order dồn dập gấp nhiều lần bình thường — và sập tiếp.
+
+Cách sửa không phải là bỏ backoff, mà là mỗi bồi bàn tự **chọn một thời điểm ngẫu nhiên** trong khung giờ cho phép để thử lại, thay vì ai cũng thử đúng cùng một giây. Đó là jitter.
+
+</Eli5>
+
+Đây là lỗi rất phổ biến trong hệ thống thật: một dependency (payment gateway, search service, một API bên thứ ba) chậm hoặc down, code gọi nó có retry "cho chắc" nhưng không nghĩ tới việc hàng nghìn instance khác cũng đang retry theo cùng một lịch trình. Hiểu đúng timeout + backoff + jitter là nền tảng để đọc và thiết kế mọi cơ chế reliability phía sau (circuit breaker, rate limiter đều dựa trên giả định là bạn đã có timeout tử tế).
+
+<RetryStormJitterDiagram />
+
+<Technical>
+
+### Timeout: đừng bao giờ chờ vô thời hạn
+
+Mọi lời gọi ra ngoài (network call, DB query, gọi service khác) đều phải có timeout — không có timeout nghĩa là một dependency chậm có thể giữ thread/connection của bạn mãi mãi, dù dependency đó cuối cùng cũng trả lời (chỉ là quá chậm). Timeout không ngăn dependency lỗi, nó chỉ giới hạn **thiệt hại tối đa mỗi lần gọi** gây ra cho bạn.
+
+Chọn timeout dựa trên p99 latency bình thường của dependency cộng thêm biên độ, không phải một con số tuỳ tiện: timeout quá ngắn gây lỗi giả (false positive) khi dependency chỉ đang chậm nhẹ; timeout quá dài thì gần như vô dụng vì vẫn giữ tài nguyên lâu.
+
+### Retry: chỉ nên dùng cho lỗi có thể tạm thời
+
+Retry hợp lý cho timeout, lỗi mạng, `503`/`429` — những lỗi có khả năng biến mất nếu thử lại. Retry KHÔNG hợp lý cho `400 Bad Request` hay lỗi logic nghiệp vụ — thử lại mãi cũng vẫn sai request đó.
+
+**Retry budget:** giới hạn tổng số retry cho phép trong một khoảng thời gian (vd tối đa 10% traffic gốc là retry) để retry của bạn không bao giờ trở thành phần lớn tải lên dependency — nếu retry vượt quá ngân sách, hệ thống nên fail fast thay vì cố thêm.
+
+### Exponential backoff + full jitter
+
+Backoff đơn thuần: `delay = min(cap, base * 2^attempt)` — tăng dần theo cấp số nhân, nhưng **xác định** (deterministic). Nếu N client cùng bắt đầu retry gần cùng một mốc thời gian (vd dependency vừa hồi phục sau outage), tất cả sẽ retry đúng cùng những giây đó — đây là **retry storm** (thundering herd), có thể đánh sập lại chính dependency đang cố hồi phục.
+
+**Full jitter** (khuyến nghị bởi AWS Builders' Library) giữ nguyên cận trên exponential nhưng random hoá điểm rơi thực tế:
+
+```ts
+function fullJitterDelay(attempt: number, baseMs = 100, capMs = 10_000): number {
+  const upperBound = Math.min(capMs, baseMs * 2 ** attempt);
+  return Math.random() * upperBound; // random(0, upperBound)
+}
+```
+
+Cùng tổng số lần retry, cùng cận trên exponential — nhưng thời điểm retry thực tế trải đều thay vì dồn cục. Có các biến thể khác (`equal jitter`, `decorrelated jitter`) đánh đổi giữa độ trải đều và việc không delay quá ngắn; full jitter là lựa chọn mặc định an toàn nhất cho phần lớn trường hợp.
+
+### Idempotency — điều kiện bắt buộc để retry an toàn
+
+Retry lặp lại một request nghĩa là dependency có thể nhận request đó **nhiều lần** (vd request thành công nhưng response bị mất trên đường về, client tưởng lỗi nên retry). Nếu request không idempotent (vd "trừ 100k vào ví"), retry có thể trừ tiền hai lần. Giải pháp chuẩn: gắn `idempotency key` (UUID sinh 1 lần cho mỗi thao tác nghiệp vụ) để phía nhận phát hiện và bỏ qua request trùng.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Không retry, chỉ timeout | Đơn giản, không rủi ro retry storm | Lỗi thoáng qua (network blip) cũng làm request fail hẳn | Thao tác không idempotent chưa có idempotency key, hoặc latency budget rất chặt |
+| Retry cố định (không backoff) | Dễ cài | Dồn tải lại dependency ngay lập tức nếu nó đang quá tải | Chỉ hợp khi lỗi chắc chắn là thoáng qua, tần suất thấp |
+| Exponential backoff không jitter | Giảm tải dần theo thời gian | Vẫn gây retry storm khi nhiều client đồng bộ pha | Hầu như không nên dùng ở production có nhiều instance |
+| Exponential backoff + full jitter | Giảm tải dần VÀ tránh đồng bộ pha | Cài đặt phức tạp hơn một chút, cần retry budget đi kèm | Mặc định nên dùng cho mọi outbound call có retry |
+
+**Khi nào đổi ý:** nếu dependency cực kỳ nhạy với bất kỳ retry nào (vd hệ thống thanh toán bên thứ ba tính phí theo mỗi lần gọi), có thể cần retry budget nghiêm ngặt hơn hoặc bỏ retry, chuyển hẳn sang circuit breaker + fallback (bài tiếp theo).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Thêm timeout + retry jitter cho một call chậm trong sd-playground"
+  prompt="$"
+  commands={[
+    { comment: "Thêm 2s latency vào dependency chậm qua Toxiproxy", command: "docker compose exec toxiproxy toxiproxy-cli toxic add slow-dep -t latency -a latency=2000 -a jitter=100", output: "Added downstream toxic 'latency_downstream' of type 'latency'" },
+    { comment: "Bắn tải khi CHƯA có timeout — connection bị giữ 2s mỗi request", command: "k6 run --vus 50 --duration 15s checkout-load.js", output: "http_req_duration..............: avg=2.01s min=1.98s med=2.00s max=2.15s p(95)=2.08s" },
+    { comment: "Thêm timeout 500ms + retry full jitter, chạy lại", command: "k6 run --vus 50 --duration 15s checkout-load.js", output: "http_req_duration..............: avg=612ms min=498ms med=520ms max=1.9s p(95)=1.4s\nhttp_req_failed.................: 3.10%" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Thêm retry mà không thêm timeout là làm mọi thứ tệ hơn: mỗi lần retry lại chờ vô thời hạn thêm một lần nữa, nhân thời gian treo lên gấp N lần thay vì N lần timeout ngắn.
+
+</Callout>
+
+<Callout type="warning">
+
+`base * 2^attempt` mà không có `cap` sẽ khiến delay tăng vô hạn theo số lần retry — luôn đặt `cap` (vd 10-30 giây) để tránh một request chờ hàng phút chỉ vì backoff tăng quá nhanh.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi được hỏi "làm sao xử lý khi dependency chậm hoặc lỗi", câu trả lời mạnh đi theo thứ tự: (1) timeout ở mọi call — không có ngoại lệ; (2) retry chỉ cho lỗi tạm thời, có retry budget; (3) exponential backoff PHẢI có jitter, nói rõ full jitter là gì và vì sao (chống retry storm); (4) nhắc idempotency key nếu thao tác có side-effect. Bỏ qua jitter là dấu hiệu ứng viên chưa từng vận hành hệ thống thật ở quy mô nhiều instance.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "timeout", meaning: "Giới hạn thời gian chờ tối đa cho một lời gọi trước khi coi là thất bại." },
+    { term: "exponential backoff", meaning: "Tăng dần thời gian chờ giữa các lần retry theo cấp số nhân: `base * 2^attempt`, có `cap` giới hạn trên." },
+    { term: "retry storm (thundering herd)", meaning: "Nhiều client cùng retry đồng bộ vào cùng một thời điểm, tạo tải đột biến có thể đánh sập lại dependency." },
+    { term: "full jitter", meaning: "Random hoá delay retry trong khoảng `[0, cận trên exponential]` để tránh đồng bộ pha giữa các client." },
+    { term: "retry budget", meaning: "Giới hạn tổng tỉ lệ request được phép là retry, để retry không chiếm phần lớn tải lên dependency." },
+    { term: "idempotency key", meaning: "Định danh duy nhất gắn vào một thao tác nghiệp vụ để phía nhận phát hiện và bỏ qua request bị gửi trùng do retry." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hệ thống của bạn gọi một API thanh toán bên thứ ba, có retry exponential backoff nhưng KHÔNG có jitter. API đó vừa bị outage 1 phút và hồi phục. Điều gì nhiều khả năng xảy ra nhất?"
+  options={[
+    "Không có vấn đề gì vì exponential backoff đã giảm tải đủ rồi",
+    "API có thể bị sập lại ngay lập tức vì mọi client retry đồng bộ đúng cùng những mốc thời gian backoff",
+    "Retry sẽ tự động dừng lại khi API hồi phục",
+    "Vấn đề chỉ xảy ra nếu dùng linear backoff, không xảy ra với exponential",
+  ]}
+  answerIndex={1}
+  explanation="Giống mọi bàn trong nhà hàng cùng gọi lại bếp đúng lúc bếp vừa hết nghẽn: exponential backoff không jitter vẫn hoàn toàn xác định (deterministic), nên nhiều client bắt đầu retry cùng lúc sẽ tiếp tục đồng bộ pha ở mọi lần retry sau — đúng định nghĩa retry storm."
+/>
