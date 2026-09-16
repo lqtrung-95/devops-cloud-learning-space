@@ -1,0 +1,127 @@
+import { HotKeyMitigationDiagram } from "../diagrams/hot-key-mitigation-diagram";
+
+<Eli5 title="Hot key giống một quầy vé duy nhất bán vé concert đang hot" emoji="🎫">
+
+Bạn chia khách mua vé cho 4 quầy theo số CCCD — công bằng, đều đặn, mọi hôm đều ổn. Rồi một concert cực hot mở bán: **ai cũng muốn mua đúng vé đó**. Vé đó nằm ở **đúng một quầy** vì nó là một dòng dữ liệu — quầy đó vỡ trận, ba quầy kia vẫn rảnh queo.
+
+Mở thêm quầy không giúp gì — vé đó vẫn chỉ có thể nằm ở một chỗ, vì quy tắc chia là theo *loại vé*. Cách chữa thật sự: hoặc dựng một **bảng thông báo** (cache) để đa số người chỉ cần đọc bảng thay vì chen vào quầy, hoặc **tách nhỏ chính chiếc vé đó** ra thành nhiều "vé phụ" ở nhiều quầy rồi cộng lại khi cần tổng số.
+
+Còn **rebalancing** giống việc mở thêm quầy vào một ngày bình thường: phải **dọn** một phần khách đang xếp hàng dở sang quầy mới mà không làm rơi ai — vừa dời vừa vẫn phải bán vé.
+
+</Eli5>
+
+Shard key tốt (bài trước) giải quyết được tải trung bình, nhưng dữ liệu thực tế luôn có phần **lệch** — một celebrity, một mã giảm giá viral, một server Discord triệu member. Đó là hot key/hot partition, và nó không tự hết khi bạn thêm shard. Bài này là phần "vận hành" của sharding: nhận diện lệch tải, xử lý key nóng, và **di chuyển dữ liệu khi hệ thống đang chạy** — kỹ năng interviewer dùng để phân biệt người chỉ vẽ sơ đồ với người từng vận hành thật.
+
+<HotKeyMitigationDiagram />
+
+<Technical>
+
+### Nhận diện hot key/hot partition
+
+- **Triệu chứng**: p99 latency tăng dù CPU trung bình cluster vẫn thấp; một shard cụ thể luôn dẫn đầu về CPU/IOPS trong dashboard; một vài key chiếm phần lớn traffic khi soi log.
+- **Công cụ**: Redis `redis-cli --hotkeys` (cần `maxmemory-policy` dạng LFU) hoặc lấy mẫu lệnh bằng `MONITOR` trong thời gian ngắn; Postgres theo dõi `pg_stat_user_tables` (`seq_scan`, `n_tup_upd` theo bảng/partition) để so lệch giữa các partition.
+- **Phân biệt hai loại**: *hot key* (một khoá cụ thể quá tải, ví dụ 1 dòng trong Postgres hoặc 1 key Redis) và *hot partition/shard* (một vùng dữ liệu quá tải dù trải trên nhiều khoá — ví dụ mọi tin nhắn của cùng 1 channel khổng lồ).
+
+### Xử lý hot key
+
+| Lựa chọn | Cách làm | Cái giá | Dùng khi |
+|---|---|---|---|
+| Cache phía đọc | TTL ngắn (vài giây) trước khi chạm shard | Đọc trong TTL có thể hơi cũ; không giúp được ghi | Đọc nhiều hơn ghi, chấp nhận độ trễ nhỏ |
+| Salting key | Ghi vào `key#0..N-1` ngẫu nhiên, đọc fan-out N key rồi gộp | Đọc phức tạp hơn, latency = nhánh chậm nhất | Ghi nhiều (counter, comment) trên đúng 1 key |
+| Đọc từ replica riêng cho key đó | Route hot key sang một replica dành riêng, không lẫn với traffic khác | Cần cơ chế route theo key, tốn thêm node | Đọc quá tải nhưng ghi vẫn ít |
+| Tách bản ghi ra bảng/dòng riêng | Ví dụ đếm view bằng nhiều "shard đếm" rồi cộng định kỳ (giống ý tưởng sharded counter) | Số liệu tức thời chỉ là gần đúng, cần job cộng dồn | Counter/aggregate có 1 khoá nóng |
+
+Ví dụ salting bộ đếm bình luận bằng Redis:
+
+```ts title="hot-key-counter.ts"
+const SHARDS = 8;
+
+async function incrementComments(streamId: string) {
+  const shard = Math.floor(Math.random() * SHARDS);
+  await redis.incr(`stream:${streamId}:comments:${shard}`);
+}
+
+async function totalComments(streamId: string): Promise<number> {
+  const keys = Array.from({ length: SHARDS }, (_, i) => `stream:${streamId}:comments:${i}`);
+  const values = await redis.mget(...keys);
+  return values.reduce((sum: number, v) => sum + Number(v ?? 0), 0);
+}
+```
+
+Chỉ áp dụng salting cho key **thật sự** nóng (phát hiện qua metrics) — salting toàn bộ key biến một hệ thống đơn giản thành fan-out mọi nơi mà không cần thiết.
+
+### Rebalancing: dời dữ liệu khi đang chạy
+
+Khi thêm shard hoặc dữ liệu lệch quá mức, phải dời một phần dữ liệu sang node mới **mà không dừng hệ thống**:
+
+1. **Chọn phạm vi dời** — theo consistent hashing (bài trước) thì phạm vi đã rõ: chỉ phần giữa node cũ và node mới; theo hash slot cố định thì chọn hẳn một số slot để chuyển.
+2. **Double-write / dual-read tạm thời**: trong lúc copy, ghi vào **cả node cũ và mới** (hoặc đọc ưu tiên mới, fallback cũ) để không mất dữ liệu ghi trong lúc chuyển.
+3. **Copy dữ liệu nền**: bulk copy phần dữ liệu đã chọn, theo dõi tiến độ (giống lấy snapshot rồi bám theo lệnh ghi tiếp theo, cùng ý tưởng với `pg_basebackup -X stream` ở bài đầu module).
+4. **Cắt traffic (cutover)**: khi node mới đã bắt kịp, cập nhật bảng định tuyến/hash ring để đọc/ghi mới đi thẳng vào node mới.
+5. **Dọn dẹp**: xoá dữ liệu đã dời khỏi node cũ, tắt double-write.
+
+Đây là lý do các hệ dùng slot cố định (Redis Cluster) tách rời "quyết định key thuộc slot nào" (ổn định) khỏi "slot đó đang ở node nào" (đổi khi rebalance) — dời dữ liệu trở thành thao tác ở mức slot, dễ theo dõi hơn dời từng key lẻ.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Rebalance tự động (driver hash ring) | Không cần vận hành thủ công | Khó kiểm soát *khi nào* dời, có thể trùng giờ cao điểm | Cache, dữ liệu tái tạo được, chấp nhận một khoảng miss |
+| Rebalance có kiểm soát (slot/directory) | Chọn thời điểm, theo dõi tiến độ, rollback được | Cần xây cơ chế double-write/cutover | Dữ liệu bền (database), SLA chặt |
+| Không rebalance, tạo shard mới chỉ cho dữ liệu mới | Đơn giản nhất, không cần dời | Shard cũ vẫn lệch tải mãi mãi | Dữ liệu có key tăng theo thời gian (ví dụ user mới) |
+
+</Technical>
+
+## Thực hành
+
+Tiếp lab `chat-messages-shard-key`: mô phỏng hot partition trên bảng `messages` đã tạo ở bài Sharding, rồi viết phần failure modes cho design doc.
+
+<Terminal
+  commands={[
+    { comment: "Đổ thêm 200.000 tin chỉ vào channel 42 — mô phỏng 1 channel khổng lồ", command: "docker compose exec postgres psql -U app -c \"INSERT INTO messages SELECT 42, g, g % 500, 'hi' FROM generate_series(20001, 220000) g;\"", output: "INSERT 0 200000" },
+    { comment: "So kích thước các partition — partition chứa channel 42 phình bất thường", command: "docker compose exec postgres psql -U app -c \"SELECT relname, pg_size_pretty(pg_relation_size(oid)) AS size FROM pg_class WHERE relname LIKE 'messages_p%' ORDER BY relname;\"", output: "  relname   |  size\n-------------+---------\n messages_p0 | 664 kB\n messages_p1 | 24 MB\n messages_p2 | 664 kB\n messages_p3 | 664 kB" },
+    { comment: "So số dòng mỗi partition qua pg_stat_user_tables (cần ANALYZE trước)", command: "docker compose exec postgres psql -U app -c \"ANALYZE messages;\" -c \"SELECT relname, n_live_tup FROM pg_stat_user_tables WHERE relname LIKE 'messages_p%' ORDER BY relname;\"", output: " relname   | n_live_tup\n-------------+------------\n messages_p0 |       5000\n messages_p1 |     205000\n messages_p2 |       5000\n messages_p3 |       5000" },
+  ]}
+/>
+
+Viết tiếp phần **Bottleneck, failure modes & mở rộng** của design doc (Phụ lục A) cho bảng `messages`:
+
+- **Hot partition**: channel 42 chiếm ~95% dữ liệu của partition nó thuộc — mọi query/ghi liên quan tới channel này cạnh tranh I/O với channel khác cùng partition.
+- **Cách xử lý**: đổi shard key sang `(channel_id, bucket 10 ngày)` như đã chọn ở bài Sharding để giới hạn kích thước mỗi phần; với channel cực lớn có thể route riêng sang shard dành cho "channel VIP" (giống directory sharding).
+- **Resharding từ 16 lên 32 shard**: nếu dùng consistent hashing, chỉ ~1/33 dữ liệu di chuyển; áp dụng quy trình double-write → copy nền → cutover ở trên, thực hiện ngoài giờ cao điểm và theo dõi replication/copy lag như một chỉ số riêng.
+- **Query "tin của 1 user"**: do shard theo channel nên đây luôn là scatter-gather; giải quyết bằng bảng index riêng (`user_id → message_id`, shard theo `user_id`) được cập nhật bất đồng bộ, hoặc đẩy sang một search engine (SD08).
+
+<Callout type="mistake" title="Coi hot key là lỗi tạm thời, không đo lại">
+
+Hot key thường lặp lại theo mùa (sale, livestream, breaking news) chứ không phải sự cố một lần. Không có dashboard theo dõi phân bố tải theo key/shard thì lần sau lại bị bất ngờ y hệt.
+
+</Callout>
+
+<Callout type="mistake" title="Double-write mãi mãi mà quên cutover">
+
+Bật ghi đúp vào node cũ và mới "cho an toàn" rồi quên tắt — tốn gấp đôi tài nguyên ghi vĩnh viễn, và khi node cũ hết dung lượng mới cuống cuồng đi tìm nguyên nhân. Rebalancing cần một bước dọn dẹp rõ ràng trong plan, không phải "để đó tính sau".
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu hỏi hot key thường đến ngay sau khi bạn chọn shard key: *"Nếu một khoá/partition chiếm phần lớn traffic thì sao?"*. Câu trả lời mạnh phân biệt **hot key** (salting, cache) với **hot partition** (đổi shard key có thêm chiều thời gian/bucket, hoặc route riêng cho tenant lớn), và nhắc quy trình rebalancing có double-write + cutover thay vì nói chung chung "thêm shard là xong".
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "hot key", meaning: "Một khoá dữ liệu cụ thể nhận lượng truy cập vượt trội so với phần còn lại." },
+    { term: "hot partition/shard", meaning: "Một partition/shard nhận tải lớn bất thường, thường do shard key không đủ mịn cho một nhóm dữ liệu." },
+    { term: "salting", meaning: "Thêm hậu tố ngẫu nhiên vào key để rải một khoá nóng ra nhiều khoá con." },
+    { term: "sharded counter", meaning: "Bộ đếm được chia thành nhiều khoá con, cộng lại khi cần tổng." },
+    { term: "double-write", meaning: "Ghi đồng thời vào node cũ và mới trong lúc dời dữ liệu để không mất bản ghi." },
+    { term: "cutover", meaning: "Thời điểm chuyển hẳn traffic đọc/ghi sang vị trí dữ liệu mới sau khi copy xong." },
+    { term: "rebalancing", meaning: "Quá trình phân phối lại dữ liệu giữa các node khi thêm/bớt node hoặc khi tải lệch." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một mã giảm giá viral khiến dòng `SELECT ... WHERE code = 'SALE50' FOR UPDATE` trên Postgres bị khoá dồn dập, dù CPU cluster vẫn thấp. Cách nào đúng hướng nhất?"
+  options={["Thêm read replica cho bảng mã giảm giá", "Tăng số shard của bảng đơn hàng", "Giảm số lần đọc bằng cách bỏ `FOR UPDATE`", "Tách quota của mã đó thành N dòng đếm con (sharded counter), trừ vào một dòng ngẫu nhiên và cộng dồn định kỳ để kiểm tra tổng"]}
+  answerIndex={3}
+  explanation="Đây là hot key ở mức một dòng, không phải thiếu năng lực đọc hay thiếu shard — thêm replica hay shard không tách nhỏ được một dòng duy nhất. Bỏ `FOR UPDATE` thì mất khoá, dễ bán vượt quota. Sharded counter rải khoá ghi ra nhiều dòng, giống ý tưởng salting."
+/>

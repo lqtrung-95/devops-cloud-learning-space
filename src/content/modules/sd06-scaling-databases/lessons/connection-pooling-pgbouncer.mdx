@@ -1,0 +1,139 @@
+import { PgbouncerPoolingModesDiagram } from "../diagrams/pgbouncer-pooling-modes-diagram";
+
+<Eli5 title="PgBouncer giống quầy giao dịch ngân hàng có máy bốc số thứ tự" emoji="🏦">
+
+Ngân hàng có **20 giao dịch viên** (server connection) nhưng mỗi sáng có **200 khách** (client connection). Nếu mỗi khách được giữ riêng một giao dịch viên từ lúc bước vào tới lúc ra về, 180 người còn lại đứng chờ ngoài cửa — hoặc ngân hàng phải thuê 200 người, trả lương cả khi họ ngồi không.
+
+**PgBouncer là máy bốc số**: khách ngồi ghế chờ thoải mái, chỉ khi **thật sự làm giao dịch** mới được gọi lên một quầy trống; xong là nhả quầy cho người tiếp theo. 20 giao dịch viên phục vụ đủ 200 khách vì phần lớn thời gian khách chỉ… ngồi.
+
+Cái bẫy: nếu bạn dặn giao dịch viên quầy 3 *"nhớ giùm là tôi thích tiền mệnh giá 500k nhé"*, lần sau máy gọi bạn lên quầy 7 — chẳng ai nhớ lời dặn đó. Đó là lý do một số tính năng "gắn với phiên" của Postgres hỏng khi dùng transaction pooling.
+
+</Eli5>
+
+Khi scale ngang app (SD03) từ 4 lên 20 instance, số connection tới database nhân theo mà không ai để ý — cho tới ngày deploy thì Postgres báo `too many clients`. Thêm read replica cũng không giúp nếu mỗi replica cũng bị ngập connection. Hiểu giới hạn connection là điều kiện để các bài scale database phía sau có ý nghĩa.
+
+<PgbouncerPoolingModesDiagram />
+
+<Technical>
+
+### Vì sao connection Postgres đắt
+
+- Postgres dùng mô hình **một process cho mỗi connection**. Mỗi backend tốn bộ nhớ riêng (cỡ vài MB trở lên, tăng theo `work_mem`, cache catalog, query đang chạy — cần đo trên hệ thống của bạn), cộng chi phí fork + xác thực + TLS khi mở kết nối.
+- `max_connections` mặc định **100**, trong đó vài slot để dành cho superuser (`superuser_reserved_connections`). Tăng lên hàng nghìn thường làm throughput **giảm**: nhiều process tranh CPU, lock và snapshot.
+- Ước lượng: 30 instance app × pool 10 = **300 connection** chỉ riêng một service, chưa kể cron job, migration, công cụ admin. Trong khi CPU 8 core thực sự chỉ chạy song song cỡ vài chục query cùng lúc.
+
+### Ba chế độ của PgBouncer
+
+| `pool_mode` | Server connection bị giữ trong | Tương thích |
+|---|---|---|
+| `session` | Suốt thời gian client còn kết nối | Mọi tính năng Postgres |
+| `transaction` | Chỉ trong một transaction | Hỏng các tính năng mức session (bảng dưới) |
+| `statement` | Chỉ một câu lệnh; cấm transaction nhiều câu | Hẹp nhất, hiếm dùng cho app thường |
+
+Theo bảng tương thích trên tài liệu PgBouncer, ở **transaction pooling** các thứ sau **không dùng được**:
+
+- `SET` / `RESET` mức session (ví dụ `SET search_path`, `SET statement_timeout`) → dùng `SET LOCAL` trong transaction, hoặc đặt ở mức role/database (`ALTER ROLE … SET`).
+- `LISTEN` (còn `NOTIFY` thì được).
+- **Session-level advisory lock** (`pg_advisory_lock`) → dùng `pg_advisory_xact_lock`.
+- Cursor `WITH HOLD`, bảng tạm `PRESERVE/DELETE ROWS` (bảng tạm `ON COMMIT DROP` thì được), lệnh `LOAD`.
+- `PREPARE` / `DEALLOCATE` bằng SQL. Prepared statement ở **mức protocol** (driver dùng extended query) được hỗ trợ khi đặt `max_prepared_statements` khác 0 — tính năng này có từ các bản PgBouncer gần đây, kiểm tra tài liệu phiên bản bạn dùng.
+
+### Cấu hình tối thiểu
+
+```ini title="pgbouncer/pgbouncer.ini"
+[databases]
+app = host=postgres port=5432 dbname=app
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = transaction
+; số client được phép nối vào PgBouncer
+max_client_conn = 1000
+; số server connection cho mỗi cặp (database, user)
+default_pool_size = 20
+admin_users = app
+```
+
+```ini title="pgbouncer/userlist.txt"
+"app" "app"
+```
+
+Mật khẩu plain-text trong `userlist.txt` chỉ để học trên máy; môi trường thật dùng SCRAM secret hoặc `auth_query`. Tổng `default_pool_size` × số cặp (database, user) × số instance PgBouncer phải **nhỏ hơn** `max_connections`.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Chỉ pool trong app (`pg.Pool`) | Không thêm thành phần; đủ mọi tính năng | Tổng connection = instance × pool, tăng theo autoscale | Ít instance, số lượng ổn định |
+| PgBouncer `session` | Tương thích 100% | Không giảm connection khi app giữ kết nối lâu | Client đóng/mở liên tục (script, PHP-style) |
+| PgBouncer `transaction` | Hàng nghìn client dùng chung vài chục connection | Mất tính năng session; transaction dài chiếm quầy | Nhiều instance/serverless, transaction ngắn |
+| Proxy managed (RDS Proxy, Supavisor…) | Không tự vận hành, tích hợp failover | Chi phí, giới hạn riêng từng dịch vụ (đọc tài liệu) | Đã ở trên cloud, Lambda/serverless |
+
+Đổi ý khi: app bắt buộc dùng `LISTEN` hoặc advisory lock mức session → tách riêng connection đó đi thẳng Postgres (hoặc pool session riêng), phần còn lại vẫn qua transaction pool.
+
+</Technical>
+
+## Thực hành
+
+Thêm service vào `docker-compose.yml` của playground (image cộng đồng, ví dụ `edoburu/pgbouncer` — pin tag cụ thể khi dùng; khi mount sẵn `pgbouncer.ini`, entrypoint của image không ghi đè):
+
+```yaml title="docker-compose.yml (phần thêm)"
+services:
+  pgbouncer:
+    image: edoburu/pgbouncer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports: ["6432:6432"]
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+```
+
+<Terminal
+  commands={[
+    { comment: "Bảng pgbench đã tạo ở lab replica (pgbench -i -s 10). Nối thẳng 150 client vào Postgres", command: "docker compose exec -e PGPASSWORD=app postgres pgbench -h postgres -U app -c 150 -j 4 -T 20 app", output: "pgbench: error: connection to server at \"postgres\" (172.18.0.3), port 5432 failed: FATAL:  sorry, too many clients already\npgbench: error: could not create connection for client 97" },
+    { comment: "Cùng 150 client nhưng đi qua PgBouncer (transaction mode)", command: "docker compose up -d pgbouncer && docker compose exec -e PGPASSWORD=app postgres pgbench -h pgbouncer -p 6432 -U app -c 150 -j 4 -T 20 app", output: "transaction type: <builtin: TPC-B (sort of)>\nnumber of clients: 150\nnumber of failed transactions: 0 (0.000%)\n...\ntps = ... (without initial connection time)" },
+    { comment: "Trong lúc pgbench chạy: xem pool trên admin console của PgBouncer", command: "docker compose exec -e PGPASSWORD=app postgres psql -h pgbouncer -p 6432 -U app pgbouncer -x -c \"SHOW POOLS;\"", output: "-[ RECORD 2 ]---------+------------\ndatabase              | app\nuser                  | app\ncl_active             | 20\ncl_waiting            | 130\nsv_active             | 20\nsv_idle               | 0\n...\npool_mode             | transaction" },
+    { comment: "Postgres chỉ thấy khoảng 20 connection từ PgBouncer", command: "docker compose exec postgres psql -U app -c \"SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend';\"", output: " count\n-------\n    21\n(1 row)" },
+  ]}
+/>
+
+`cl_waiting` cao nghĩa là client đang chờ quầy — với pgbench (không nghỉ giữa các transaction) là bình thường; ở app thật, `cl_waiting` kéo dài + `maxwait` tăng là dấu hiệu pool quá nhỏ **hoặc** có transaction chạy quá lâu. Số tps phụ thuộc máy bạn — ghi lại để so, đừng so với số trên mạng.
+
+<Callout type="mistake" title="Tăng max_connections lên 5000 cho xong">
+
+Sửa triệu chứng, không sửa bệnh: mỗi connection là một process, RAM và context switch tăng theo; lúc tải đỉnh DB chậm hơn thay vì nhanh hơn. Đặt pooler phía trước và giữ số server connection gần với số query DB thực sự chạy song song được.
+
+</Callout>
+
+<Callout type="mistake" title="Transaction mode + transaction mở trong lúc gọi API ngoài">
+
+`BEGIN` → gọi payment gateway 3 giây → `COMMIT`: suốt 3 giây đó giữ chặt một server connection. 20 request như vậy là cả pool đứng hình. Gọi dịch vụ ngoài **trước hoặc sau** transaction.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi thiết kế có nhiều app instance hoặc serverless nói chuyện với Postgres/MySQL, chủ động nhắc **connection limit** và **pooler** (PgBouncer, RDS Proxy). Câu trả lời mạnh có con số (instance × pool vs `max_connections`), nêu **transaction pooling** và ít nhất một tính năng bị hỏng (`SET`, advisory lock mức session, `LISTEN`).
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "connection pool", meaning: "Tập connection mở sẵn được tái sử dụng thay vì mở mới mỗi request." },
+    { term: "max_connections", meaning: "Số connection tối đa Postgres chấp nhận; mặc định 100." },
+    { term: "PgBouncer", meaning: "Connection pooler nhẹ đứng giữa app và Postgres." },
+    { term: "session pooling", meaning: "Client giữ một server connection suốt phiên kết nối." },
+    { term: "transaction pooling", meaning: "Client chỉ mượn server connection trong một transaction." },
+    { term: "cl_waiting / sv_active", meaning: "Số client đang chờ / số server connection đang bận trong `SHOW POOLS`." },
+  ]}
+/>
+
+<QuickCheck
+  question="Worker dùng `pg_advisory_lock(42)` để đảm bảo chỉ một worker chạy job, rồi làm nhiều transaction trước khi `pg_advisory_unlock(42)`. Sau khi chuyển qua PgBouncer transaction mode, lock hoạt động lung tung. Cách sửa hợp lý?"
+  options={["Tăng `default_pool_size`", "Cho connection của worker đi thẳng Postgres (hoặc pool session riêng), hoặc đổi thiết kế sang lock trong một transaction", "Chuyển PgBouncer sang `statement` mode", "Gọi `pg_advisory_lock` hai lần cho chắc"]}
+  answerIndex={1}
+  explanation="Advisory lock mức session gắn với một giao dịch viên cụ thể; lần sau máy bốc số gọi bạn sang quầy khác nên lock ở quầy cũ vẫn treo hoặc unlock nhầm chỗ. Cần một quầy riêng cố định, hoặc dùng `pg_advisory_xact_lock` gói trong một transaction."
+/>

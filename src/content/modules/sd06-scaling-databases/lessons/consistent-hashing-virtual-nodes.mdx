@@ -1,0 +1,168 @@
+import { HashRingAddNodeDiagram } from "../diagrams/hash-ring-add-node-diagram";
+
+<Eli5 title="Consistent hashing giống chia khách cho shipper ngồi quanh một vòng xoay" emoji="🛵">
+
+Cách chia đơn giản: khách ở **nhà số 17**, có **4 shipper** → 17 chia 4 dư 1 → shipper số 1. Chạy tốt cho tới ngày thuê thêm **shipper thứ 5**: giờ 17 chia 5 dư 2 → shipper số 2. Làm lại phép chia cho mọi khách thì **gần như ai cũng đổi shipper** — shipper nào cũng phải học lại tuyến đường từ đầu. Đó là `hash mod N`.
+
+Cách thông minh hơn: vẽ một **vòng xoay giao thông**, đặt khách và shipper rải quanh vòng theo địa chỉ. Mỗi khách đi **theo chiều kim đồng hồ**, gặp shipper nào đầu tiên thì thuộc về shipper đó. Thêm shipper mới? Họ đứng vào một chỗ trên vòng và **chỉ nhận bớt khách của người đứng ngay sau mình**. Mọi người khác giữ nguyên tuyến.
+
+Nếu mỗi shipper chỉ đứng một chỗ, người may thì phụ trách đoạn dài, người xui đoạn ngắn. Nên mỗi shipper **đứng nhiều chỗ nhỏ rải khắp vòng** — đó là **virtual nodes**.
+
+</Eli5>
+
+Cache cluster, database phân tán kiểu Dynamo/Cassandra, load balancer giữ "sticky" theo user đều cần trả lời: *key này nằm ở node nào, và khi thêm/bớt node thì phải dời bao nhiêu dữ liệu?* Dời dữ liệu nghĩa là băng thông, cache miss hàng loạt, và DB phía sau bị dội tải. Consistent hashing là câu trả lời kinh điển trong phỏng vấn — nhưng nói đúng con số và biết khi nào **không** dùng nó mới là điểm cộng.
+
+<HashRingAddNodeDiagram />
+
+<Technical>
+
+### Vì sao `hash mod N` xáo trộn gần hết
+
+Key giữ nguyên node khi `h mod N = h mod (N+1)`. Với hash phân bố đều, chỉ khoảng **1/(N+1)** key thoả điều kiện đó ⇒ khoảng **N/(N+1)** key đổi node:
+
+| Thay đổi | `hash mod N` phải dời | Consistent hashing phải dời (trung bình) |
+|---|---|---|
+| 4 → 5 node | ~4/5 = 80% | ~1/5 = 20% |
+| 10 → 11 node | ~10/11 ≈ 91% | ~1/11 ≈ 9% |
+| 5 → 4 node (một node chết) | ~4/5 = 80% | ~1/5 = 20% (chỉ key của node chết) |
+
+Với cache: giả định 10 node Redis cache, hit rate 95%, DB phía sau chịu 2.000 QPS lúc cache ổn ⇒ thêm 1 node bằng `mod N` làm ~91% key trượt cache ⇒ tải DB có thể nhảy lên gấp nhiều lần trong vài phút đầu. Với consistent hashing chỉ ~9% key bị ảnh hưởng.
+
+### Hash ring
+
+1. Hash không gian ra một vòng, ví dụ `0 … 2³² − 1`.
+2. Mỗi node được hash (theo tên/địa chỉ) ra một **điểm** trên vòng.
+3. Key được hash ra một điểm, đi theo chiều kim đồng hồ tới node đầu tiên ⇒ đó là chủ của key.
+4. Thêm node X: chỉ các key nằm giữa node đứng trước X và X chuyển sang X — lấy từ **node đứng sau** X.
+5. Bớt node: key của nó chuyển sang node kế tiếp; không key nào khác bị động tới.
+
+Tra cứu = binary search trên mảng điểm đã sắp xếp ⇒ `O(log(số điểm))`.
+
+### Virtual nodes
+
+Chỉ một điểm/node thì các đoạn trên vòng dài ngắn ngẫu nhiên — một node có thể gánh gấp rưỡi phần trung bình. **Virtual nodes**: mỗi node vật lý đặt `V` điểm (`db-1#0`, `db-1#1`, …).
+
+- Phân bố đều hơn khi `V` tăng (số đo ở phần Thực hành).
+- Node rời đi ⇒ tải của nó rải cho **nhiều** node, không dồn hết vào một hàng xóm.
+- **Trọng số**: server mạnh gấp đôi nhận gấp đôi số vnode.
+- Đổi lại: bảng điểm lớn hơn (`nodes × V`), metadata cần đồng bộ giữa các client.
+
+Paper Dynamo (Amazon, 2007) dùng đúng ý tưởng này: vòng hash + virtual nodes, và mỗi key được **replicate lên N node kế tiếp** trên vòng (preference list) — vì vậy phần partitioning và replication gắn chặt với nhau.
+
+### Không phải hệ nào cũng dùng ring
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| `hash mod N` | Đơn giản, tra O(1), không metadata | Đổi N là dời gần hết | Số node cố định hoặc dữ liệu tái tạo được rẻ |
+| Consistent hashing + vnodes | Thêm/bớt node chỉ dời ~1/N; hỗ trợ trọng số | Cần bảng điểm; phân bố vẫn cần vnode mới đều | Cache cluster phía client, hệ kiểu Dynamo/Cassandra |
+| Số slot cố định (Redis Cluster: 16384 hash slot) | Dời dữ liệu theo **slot** rõ ràng, dễ quan sát, dễ điều khiển | Phải chọn số slot đủ lớn từ đầu; cần bảng slot → node | Muốn rebalancing chủ động, kiểm soát được |
+| Rendezvous (HRW) hashing | Không cần ring; mỗi key tính điểm với từng node, chọn max | Tra O(N) mỗi key | Số node nhỏ, cần đơn giản |
+
+Đổi ý khi: bạn cần **điều khiển** dữ liệu nào ở đâu (dời một tenant nóng, cân bằng theo dung lượng thật) → dùng slot cố định hoặc directory thay vì để hash quyết định hoàn toàn.
+
+</Technical>
+
+## Thực hành
+
+Lab `consistent-hashing-typescript`. Toàn bộ trong một file, chạy bằng `npx tsx`:
+
+```ts title="ring.ts"
+import { createHash } from "node:crypto";
+
+// 32-bit hash: 4 byte đầu của MD5 (đủ đều cho demo, không dùng cho bảo mật)
+const hash32 = (s: string) => createHash("md5").update(s).digest().readUInt32BE(0);
+
+class HashRing {
+  private points: { point: number; node: string }[] = [];
+
+  constructor(nodes: string[], private vnodes = 100) {
+    nodes.forEach((node) => this.add(node));
+  }
+
+  add(node: string) {
+    for (let i = 0; i < this.vnodes; i++) this.points.push({ point: hash32(`${node}#${i}`), node });
+    this.points.sort((a, b) => a.point - b.point);
+  }
+
+  remove(node: string) {
+    this.points = this.points.filter((p) => p.node !== node);
+  }
+
+  get(key: string): string {
+    const h = hash32(key);
+    let lo = 0;
+    let hi = this.points.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (this.points[mid].point < h) lo = mid + 1;
+      else hi = mid;
+    }
+    return this.points[lo % this.points.length].node; // quá điểm cuối thì vòng về đầu
+  }
+}
+
+const keys = Array.from({ length: 100_000 }, (_, i) => `user:${i}`);
+const pct = (moved: number) => `${((moved / keys.length) * 100).toFixed(1)}%`;
+
+const modMoved = keys.filter((k) => hash32(k) % 4 !== hash32(k) % 5).length;
+
+const ring = new HashRing(["db-1", "db-2", "db-3", "db-4"]);
+const before = keys.map((k) => ring.get(k));
+ring.add("db-5");
+const ringMoved = keys.filter((k, i) => ring.get(k) !== before[i]).length;
+
+console.log(`mod N     4→5 node: ${pct(modMoved)} key đổi node`);
+console.log(`hash ring 4→5 node: ${pct(ringMoved)} key đổi node`);
+
+for (const v of [1, 10, 100, 500]) {
+  const r = new HashRing(["db-1", "db-2", "db-3", "db-4"], v);
+  const counts = new Map<string, number>();
+  keys.forEach((k) => counts.set(r.get(k), (counts.get(r.get(k)) ?? 0) + 1));
+  const max = Math.max(...counts.values());
+  console.log(`vnodes=${String(v).padEnd(3)} max/avg = ${(max / (keys.length / 4)).toFixed(2)}`);
+}
+```
+
+<Terminal
+  commands={[
+    { comment: "Chạy (số lẻ sẽ khác chút nếu bạn đổi hàm hash hoặc tên key)", command: "npx tsx ring.ts", output: "mod N     4→5 node: 79.7% key đổi node\nhash ring 4→5 node: 19.2% key đổi node\nvnodes=1   max/avg = 1.47\nvnodes=10  max/avg = 1.37\nvnodes=100 max/avg = 1.15\nvnodes=500 max/avg = 1.03" },
+  ]}
+/>
+
+Đọc kết quả: `mod N` dời gần đúng 4/5, ring dời gần 1/5. Với 1 vnode, node nặng nhất gánh gần gấp rưỡi mức trung bình; 500 vnode thì gần như đều. Bài tập mở rộng: gọi `remove("db-2")` và kiểm chứng chỉ key từng thuộc `db-2` đổi chủ.
+
+<Callout type="mistake" title="Nói 'consistent hashing thì không phải dời dữ liệu'">
+
+Vẫn phải dời — trung bình khoảng 1/(N+1) key khi thêm một node — chỉ là ít hơn nhiều so với `mod N`. Dữ liệu đó vẫn cần được **copy thật** trước khi node mới nhận traffic, nếu không là đọc hụt.
+
+</Callout>
+
+<Callout type="mistake" title="Mỗi client tự giữ danh sách node khác nhau">
+
+Client A biết 5 node, client B còn tưởng 4 node ⇒ cùng một key được ghi vào hai nơi. Danh sách node (hoặc bảng slot) phải có **một nguồn sự thật** được phân phối nhất quán — service discovery, gossip, hoặc config tập trung.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Consistent hashing xuất hiện trong gần như mọi câu "design distributed cache / key-value store". Câu trả lời mạnh nói được: `mod N` dời ~N/(N+1) key còn ring dời ~1/(N+1); **virtual nodes** để phân bố đều và hỗ trợ trọng số; replicate lên các node kế tiếp như Dynamo; và biết một số hệ chọn **slot cố định** (Redis Cluster) vì dễ điều khiển rebalancing hơn.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "hash mod N", meaning: "Gán key cho node bằng phần dư của hash chia số node." },
+    { term: "consistent hashing", meaning: "Đặt node và key trên một vòng hash; key thuộc node đầu tiên theo chiều kim đồng hồ." },
+    { term: "hash ring", meaning: "Không gian giá trị hash được xem như vòng tròn khép kín." },
+    { term: "virtual node (vnode)", meaning: "Một trong nhiều điểm trên ring đại diện cho cùng một node vật lý." },
+    { term: "preference list", meaning: "Danh sách N node kế tiếp trên ring giữ bản sao của một key (Dynamo)." },
+    { term: "hash slot", meaning: "Ô trung gian cố định (Redis Cluster có 16384) được gán cho node." },
+  ]}
+/>
+
+<QuickCheck
+  question="Cluster cache 9 node dùng consistent hashing có vnode. Một node chết. Điều gì xảy ra với key?"
+  options={["Khoảng 1/9 key (của node chết) trượt cache và được rải sang nhiều node còn lại", "Gần như toàn bộ key đổi node", "Không key nào bị ảnh hưởng", "Toàn bộ key của node chết dồn vào đúng một node bên cạnh, dù có vnode"]}
+  answerIndex={0}
+  explanation="Một shipper nghỉ thì chỉ khách của người đó cần shipper mới; nhờ mỗi shipper đứng nhiều chỗ nhỏ trên vòng xoay, khách của họ được chia cho nhiều người thay vì đè lên một người đứng sau."
+/>

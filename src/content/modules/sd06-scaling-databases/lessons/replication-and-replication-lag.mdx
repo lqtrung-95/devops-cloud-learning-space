@@ -1,0 +1,192 @@
+import { WalStreamingReplicationDiagram } from "../diagrams/wal-streaming-replication-diagram";
+
+<Eli5 title="Replication giống quán phở gốc gửi bản photo sổ bán hàng cho chi nhánh" emoji="📒">
+
+Quán phở gốc có **một cuốn sổ** ghi mọi đơn bán — chỉ quán gốc được ghi (**primary / leader**). Khách hỏi "hôm qua bán bao nhiêu tô?" thì đông quá, một cuốn sổ không kịp cho mọi người tra.
+
+Nên mỗi khi ghi xong một trang, quán gốc **photo trang đó** và nhờ xe ôm chở tới các chi nhánh. Chi nhánh chép lại vào sổ của mình (**replica / follower**) và cho khách tra thoải mái.
+
+Xe ôm luôn mất một lúc mới tới — đó là **replication lag**. Nếu chủ quán **đợi chi nhánh gọi điện xác nhận "đã nhận"** rồi mới đưa hoá đơn cho khách, đó là **sync**; đưa hoá đơn luôn rồi gửi sau là **async**.
+
+Chỗ ví von bị lệch: Postgres không gửi "bản photo của cả trang dữ liệu" mà gửi **nhật ký thay đổi (WAL)** — replica tự áp lại từng thay đổi lên bản sao của mình.
+
+</Eli5>
+
+Phần lớn hệ thống đọc nhiều hơn ghi rất nhiều (feed, profile, trang sản phẩm). Replication là cách rẻ nhất để **scale đọc** và có **bản dự phòng** khi primary chết. Nhưng mọi thiết kế có replica đều phải trả lời hai câu mà interviewer chắc chắn hỏi: *đọc từ replica có thể thấy dữ liệu cũ không?* và *primary chết thì mất gì?* Bài này trả lời câu thứ nhất.
+
+<WalStreamingReplicationDiagram />
+
+<Technical>
+
+### Leader-follower qua WAL
+
+- Mọi thay đổi trong Postgres được ghi vào **WAL (write-ahead log)** trước khi áp vào file dữ liệu. Mỗi vị trí trong WAL có một **LSN** (log sequence number), ví dụ `0/3000148`.
+- **Streaming replication**: replica mở kết nối replication tới primary; tiến trình **walsender** trên primary đẩy WAL, **walreceiver** trên replica nhận, ghi xuống đĩa, rồi tiến trình startup **replay** vào dữ liệu.
+- Replica là **physical copy** của toàn cluster (mọi database, mọi bảng) và mặc định là **hot standby**: đọc được, không ghi được.
+- Có bốn "mốc" trên đường đi của một bản ghi WAL, và `pg_stat_replication` báo đủ cả bốn: `sent_lsn` → `write_lsn` → `flush_lsn` → `replay_lsn`. Chỉ khi qua `replay_lsn` thì query trên replica mới thấy thay đổi.
+
+### Sync vs async — thực chất là `synchronous_commit`
+
+Postgres mặc định **async**. Muốn sync phải khai báo `synchronous_standby_names` trên primary; khi đó `synchronous_commit` quyết định primary đợi tới mốc nào:
+
+| `synchronous_commit` | Primary đợi replica tới đâu | Primary chết có mất commit? | Đọc replica ngay sau commit |
+|---|---|---|---|
+| `off` / `local` | Không đợi replica | Có thể mất | Có thể cũ |
+| `remote_write` | Replica đã nhận, ghi vào OS (chưa fsync) | Chỉ mất nếu cả replica cũng sập OS | Có thể cũ |
+| `on` (khi có sync standby) | Replica đã **flush** WAL xuống đĩa | Không | **Vẫn có thể cũ** (chưa replay) |
+| `remote_apply` | Replica đã **replay** | Không | Thấy ngay |
+
+```ini title="postgresql.conf (primary) — ví dụ sync với quorum"
+wal_level = replica              # mặc định từ PG10, ghi rõ cho dễ đọc
+max_wal_senders = 10
+synchronous_standby_names = 'ANY 1 (replica1, replica2)'
+synchronous_commit = on
+```
+
+`ANY 1 (…)` nghĩa là chỉ cần **một trong hai** replica xác nhận — tránh việc một replica chậm làm treo toàn bộ ghi.
+
+### Replication lag đến từ đâu
+
+- **Mạng**: gửi WAL qua region khác thêm hàng chục ms.
+- **Tải ghi dồn dập**: batch job, migration, `VACUUM FULL`, tạo index sinh hàng GB WAL.
+- **Replica bận**: query dài trên replica có thể xung đột với replay; Postgres sẽ hoãn replay (tối đa `max_standby_streaming_delay`) hoặc huỷ query — lag tăng hoặc query của bạn bị cancel.
+- Ước lượng: giả định primary sinh 20MB WAL/s lúc peak, replica chỉ replay được 15MB/s ⇒ lag tăng thêm 5MB mỗi giây, sau 10 phút trễ ~3GB. Lag không tự hết cho tới khi tải giảm — cần đo, không đoán.
+
+### Read-your-writes và bạn bè
+
+Replication lag sinh ra các anomaly có tên riêng (DDIA ch.5):
+
+- **Read-your-writes**: user vừa ghi, đọc lại không thấy (sơ đồ ở trên).
+- **Monotonic reads**: user reload hai lần, lần hai trúng replica trễ hơn → dữ liệu "đi lùi". Cách chữa: gắn user vào một replica cố định (hash `user_id`).
+- **Consistent prefix reads**: thấy câu trả lời trước câu hỏi — hay gặp khi dữ liệu nằm ở nhiều partition.
+
+Cách xử lý read-your-writes để dành cho bài sau; điều cần nhớ ở đây là **async replica = eventual consistency**, và "eventual" có thể là vài giây.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Async replication | Ghi nhanh nhất; replica chậm/chết không ảnh hưởng primary | Có lag; failover có thể mất commit gần nhất | Mặc định cho read replica, analytics, đa số web app |
+| Sync (`on`, quorum `ANY 1`) | Commit đã OK thì không mất khi failover | Thêm latency mỗi lần ghi; cần ≥2 replica để không treo | Tiền, đơn hàng, dữ liệu không được mất (RPO = 0) |
+| Sync `remote_apply` | Đọc replica thấy ngay sau commit | Ghi chậm nhất; replay chậm kéo cả primary | Rất ít khi đáng — thường route đọc đó về primary rẻ hơn |
+| Không replica | Đơn giản | Không scale đọc, không có bản dự phòng nóng | Prototype, dữ liệu tái tạo được |
+
+Đổi ý khi: latency ghi p99 là SLO chính và dữ liệu mất vài giây chấp nhận được → async; có quy định RPO = 0 → sync quorum.
+
+</Technical>
+
+## Thực hành
+
+Thêm replica vào `sd-playground` (lab `postgres-streaming-replica`). Bước 1 — trên primary, tạo role replication và cho phép nó kết nối (script init chỉ chạy khi volume data còn rỗng):
+
+```bash title="db/10-replication.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replicator';
+SQL
+# "all" trong cột database KHÔNG bao gồm kết nối replication — phải ghi rõ
+echo "host replication replicator all scram-sha-256" >> "$PGDATA/pg_hba.conf"
+```
+
+Bước 2 — service `postgres-replica` clone primary bằng `pg_basebackup -R` (tự tạo `standby.signal` và `primary_conninfo`), rồi chạy Postgres ở chế độ standby:
+
+```yaml title="docker-compose.yml (phần thêm)"
+services:
+  postgres:
+    image: postgres:17
+    command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=10"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./db/10-replication.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+    # giữ nguyên environment + healthcheck pg_isready như SD01
+
+  postgres-replica:
+    image: postgres:17
+    user: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: replicator
+    ports: ["5433:5432"]
+    volumes:
+      - pg-replica-data:/var/lib/postgresql/data
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then
+          pg_basebackup -h postgres -U replicator -D /var/lib/postgresql/data \
+            -R -X stream -C -S replica1 -P
+          chmod 0700 /var/lib/postgresql/data
+        fi
+        exec postgres
+
+volumes:
+  pg-data:
+  pg-replica-data:
+```
+
+- `-X stream` kéo luôn WAL phát sinh trong lúc backup; `-C -S replica1` tạo **replication slot** để primary giữ WAL cho tới khi replica nhận.
+- `chmod 0700`: Postgres từ chối khởi động nếu thư mục data mở quyền rộng.
+- `chmod +x db/10-replication.sh` — file `.sh` không có quyền chạy sẽ bị entrypoint `source` thay vì chạy riêng.
+- Tên volume/đường dẫn `init.sql` theo playground SD01 của bạn — chỉnh cho khớp. Init script chỉ chạy trên volume rỗng: với playground, `docker compose down -v` rồi `up -d` (xoá dữ liệu!).
+
+Sau đó quan sát:
+
+<Terminal
+  commands={[
+    { comment: "Trên primary: replica nào đang nối, trễ bao nhiêu", command: "docker compose exec postgres psql -U app -c \"SELECT client_addr, state, sync_state, sent_lsn, replay_lsn, replay_lag FROM pg_stat_replication;\"", output: " client_addr |   state   | sync_state | sent_lsn  | replay_lsn |   replay_lag\n-------------+-----------+------------+-----------+------------+-----------------\n 172.18.0.6  | streaming | async      | 0/3000148 | 0/3000148  | 00:00:00.000631\n(1 row)" },
+    { comment: "Trên replica: đang ở chế độ recovery (chỉ đọc)?", command: "docker compose exec postgres-replica psql -U app -c \"SELECT pg_is_in_recovery(), pg_last_wal_replay_lsn();\"", output: " pg_is_in_recovery | pg_last_wal_replay_lsn\n-------------------+------------------------\n t                 | 0/3000148\n(1 row)" },
+    { comment: "Tạo lag có kiểm soát: tạm dừng replay trên replica", command: "docker compose exec postgres-replica psql -U app -c \"SELECT pg_wal_replay_pause();\"" },
+    { comment: "Ghi ở primary", command: "docker compose exec postgres psql -U app -c \"CREATE TABLE IF NOT EXISTS lag_demo(id int); INSERT INTO lag_demo VALUES (1);\"" },
+    { comment: "Đọc ở replica — bảng chưa tồn tại vì WAL chưa được replay", command: "docker compose exec postgres-replica psql -U app -c \"SELECT * FROM lag_demo;\"", output: "ERROR:  relation \"lag_demo\" does not exist" },
+    { comment: "Primary thấy replica trễ bao nhiêu byte", command: "docker compose exec postgres psql -U app -c \"SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS bytes_behind FROM pg_stat_replication;\"", output: " bytes_behind\n--------------\n        26192\n(1 row)" },
+    { comment: "Cho replay chạy tiếp, đọc lại", command: "docker compose exec postgres-replica psql -U app -c \"SELECT pg_wal_replay_resume();\" -c \"SELECT * FROM lag_demo;\"", output: " id\n----\n  1\n(1 row)" },
+    { comment: "Replica từ chối ghi", command: "docker compose exec postgres-replica psql -U app -c \"INSERT INTO lag_demo VALUES (2);\"", output: "ERROR:  cannot execute INSERT in a read-only transaction" },
+  ]}
+/>
+
+<Callout type="mistake" title="Đo lag bằng thời gian khi primary đang rảnh">
+
+`now() - pg_last_xact_replay_timestamp()` trên replica cho biết **lần replay transaction gần nhất cách đây bao lâu** — không phải lag. Primary không ghi gì 10 phút thì con số này là 10 phút dù replica đã bắt kịp hoàn toàn. Hãy so LSN (`pg_wal_lsn_diff`) hoặc xem `replay_lag` trong `pg_stat_replication` (cột này về `NULL` khi replica đã bắt kịp và primary rảnh một lúc).
+
+</Callout>
+
+<Callout type="warning" title="Replication slot có thể làm đầy đĩa primary">
+
+Slot bắt primary **giữ lại mọi WAL** replica chưa nhận. Replica chết cả tuần mà slot vẫn còn → WAL chồng chất tới khi primary hết đĩa. Theo dõi `pg_replication_slots` (cột `active`), đặt `max_slot_wal_keep_size`, và khi dựng lại replica từ volume rỗng thì xoá slot cũ trước (`SELECT pg_drop_replication_slot('replica1');`) — nếu không `pg_basebackup -C` báo slot đã tồn tại.
+
+</Callout>
+
+<Callout type="warning" title="Replication không phải backup">
+
+`DROP TABLE orders;` chạy trên primary sẽ được replay trung thành sang mọi replica trong vài ms. Replica bảo vệ bạn khỏi **máy chết**, không khỏi **lệnh sai**. Vẫn cần backup + WAL archive để point-in-time recovery.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi vẽ "DB primary + read replicas", câu tiếp theo thường là *"user vừa post xong reload không thấy bài thì sao?"*. Câu trả lời mạnh: nêu tên **replication lag** và **read-your-writes**, nói replica mặc định **async** nên eventual consistency, rồi đưa 1–2 cách xử lý (đọc từ primary sau khi ghi, so LSN). Điểm cộng: biết sync `on` chỉ đảm bảo **không mất dữ liệu**, không đảm bảo **đọc replica thấy ngay**.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "primary / replica", meaning: "Node duy nhất nhận ghi / node chép lại thay đổi, chỉ phục vụ đọc." },
+    { term: "WAL", meaning: "Write-ahead log — nhật ký thay đổi ghi trước khi áp vào dữ liệu, cũng là thứ được stream sang replica." },
+    { term: "LSN", meaning: "Vị trí trong WAL; so LSN của primary và replica để biết replica trễ bao nhiêu byte." },
+    { term: "replication lag", meaning: "Khoảng trễ giữa lúc primary commit và lúc replica replay thay đổi đó." },
+    { term: "synchronous_commit", meaning: "Setting quyết định primary đợi replica tới mốc nào (không đợi, write, flush, apply) trước khi báo COMMIT OK." },
+    { term: "read-your-writes", meaning: "Đảm bảo user luôn thấy thay đổi chính mình vừa ghi." },
+    { term: "hot standby", meaning: "Replica vừa nhận WAL vừa cho phép query chỉ đọc." },
+  ]}
+/>
+
+<QuickCheck
+  question="Replica async trễ 3 giây trong giờ cao điểm. Việc nào sau đây KHÔNG bị ảnh hưởng bởi lag này?"
+  options={["User xem lại comment vừa đăng trên trang đọc từ replica", "Tốc độ COMMIT trên primary", "Báo cáo 'đơn hàng 5 phút gần nhất' chạy trên replica", "Lượng dữ liệu có thể mất nếu primary chết ngay lúc đó"]}
+  answerIndex={1}
+  explanation="Async nghĩa là quán gốc đưa hoá đơn cho khách mà không đợi xe ôm — nên lag không làm commit chậm đi. Nhưng người tra ở chi nhánh thấy sổ cũ, và trang sổ chưa gửi sẽ mất nếu quán gốc cháy."
+/>

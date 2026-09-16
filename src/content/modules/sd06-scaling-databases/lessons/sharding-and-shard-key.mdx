@@ -1,0 +1,112 @@
+import { ShardKeyChoiceDiagram } from "../diagrams/shard-key-choice-diagram";
+
+<Eli5 title="Sharding giống chia hồ sơ công dân vào nhiều tủ" emoji="🗃️">
+
+Phường có 1 triệu hồ sơ, một tủ không chứa nổi và một cán bộ không kịp tìm. Phải chia ra **nhiều tủ, mỗi tủ một cán bộ** — đó là **sharding**. Quy tắc chia chính là **shard key**.
+
+Chia theo **chữ cái đầu của họ** (range): tủ "A–D", "E–M", "N–Z"… Nghe hợp lý cho tới khi nhận ra gần 4/10 người Việt họ **Nguyễn** — tủ "N" chật cứng, cán bộ tủ đó làm không xuể, tủ "X" bỏ trống.
+
+Chia theo **số cuối CCCD** (hash): các tủ đều nhau. Nhưng ai hỏi "cho xem hồ sơ cả gia đình ông Ba" thì cán bộ phải **chạy đi hỏi mọi tủ** rồi gom lại (scatter-gather), vì người trong một nhà có số CCCD khác nhau.
+
+Còn một cách: **sổ tra cứu** ghi "hồ sơ này ở tủ nào" (directory) — linh hoạt, nhưng cuốn sổ đó phải luôn đúng và luôn tra được.
+
+</Eli5>
+
+Replica chỉ scale **đọc**. Khi ghi hoặc dung lượng vượt sức một máy, bạn phải chia dữ liệu. Sharding là quyết định **khó đảo ngược nhất** trong thiết kế database: shard key sai nghĩa là hot shard, query chạm mọi shard, và cách sửa duy nhất là di chuyển toàn bộ dữ liệu khi hệ thống đang chạy. Interviewer hỏi "shard key là gì, vì sao?" để xem bạn có xuất phát từ **access pattern** hay không.
+
+<ShardKeyChoiceDiagram />
+
+<Technical>
+
+### Ước lượng: khi nào một máy không đủ
+
+App chat, giả định: 10M DAU × 40 tin/ngày ⇒ 400M tin/ngày ≈ **4.000 ghi/s** trung bình (÷10⁵ s), peak 2–3× ⇒ cỡ 8.000–12.000 ghi/s. Mỗi tin ~1KB kể cả index ⇒ cỡ **400GB/ngày ≈ 150TB/năm**.
+
+Dù một node chịu được mức ghi đó (cần benchmark), 150TB/năm vẫn vượt xa một ổ đĩa hợp lý và làm backup/restore, thêm index, vacuum mất hàng ngày. ⇒ Cần chia. Giả sử mỗi shard giữ tối đa ~2TB để còn vận hành được ⇒ cần cỡ 75 shard sau một năm, nên chọn số partition logic lớn hơn nhiều ngay từ đầu (xem bài rebalancing).
+
+### Partitioning vs sharding
+
+- **Partitioning**: chia một bảng thành nhiều phần (có thể trên cùng một máy — Postgres `PARTITION BY`).
+- **Sharding**: partition nằm trên **nhiều máy**, mỗi máy (thường kèm replica) giữ một phần dữ liệu. Tên gọi khác nhau theo hệ: *shard* (MongoDB, Vitess), *region* (HBase), *vnode/partition* (Cassandra, DynamoDB).
+- Sharding và replication đi cùng nhau: mỗi shard là một nhóm primary + replica.
+
+### Ba chiến lược chia
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| **Range** (`created_at`, `A–M`) | Query theo khoảng chỉ chạm ít shard; dễ tách shard đôi | Key tăng đơn điệu (thời gian, id tuần tự) dồn ghi vào shard cuối; phân bố lệch | Dữ liệu time-series có truy vấn theo khoảng, bảng log ghi xong ít sửa |
+| **Hash** (`hash(key) → shard`) | Phân bố đều nếu key đủ đa dạng | Mất thứ tự → query theo khoảng phải hỏi mọi shard; resharding phải chọn cách hash khéo (bài sau) | Truy cập theo key chính xác: user, session, channel |
+| **Directory** (bảng tra `key → shard`) | Linh hoạt nhất: dời một tenant lớn sang shard riêng chỉ bằng sửa bảng tra | Thêm một lookup mỗi request; bảng tra phải HA và cache; thêm một thứ có thể sai | Multi-tenant SaaS có tenant chênh lệch lớn |
+
+### Tiêu chí chọn shard key
+
+1. **Khớp query nóng nhất**: query chạy nhiều nhất phải chứa shard key để đi đúng **1 shard**.
+2. **Cardinality cao, phân bố đều**: `country` chỉ vài giá trị, `is_premium` chỉ hai — không chia được.
+3. **Không tăng đơn điệu** nếu dùng range.
+4. **Gom thứ cần transaction cùng nhau**: dữ liệu hay ghi trong một transaction nên nằm cùng shard.
+5. **Kích thước partition có trần**: `channel_id` đơn thuần cho phép một channel phình vô hạn; thêm `bucket` thời gian như cách Discord mô tả giữ mỗi partition trong giới hạn.
+
+### Cái giá phải trả
+
+- **Scatter-gather**: query không có shard key → gửi tới mọi shard, đợi tất cả, gộp và sắp xếp. Latency bằng shard **chậm nhất**; 1 shard chết là query lỗi hoặc thiếu dữ liệu.
+- **Secondary index**: *local index* (mỗi shard index riêng → query theo index vẫn scatter) hoặc *global index* (một bảng index được shard theo cột index → đọc nhanh, nhưng ghi phải cập nhật hai nơi và thường chỉ eventually consistent).
+- **Cross-shard transaction**: không còn `BEGIN … COMMIT` đơn giản; phải 2PC (chậm, kẹt khi coordinator chết) hoặc saga (SD12). Thiết kế để tránh.
+- **JOIN, `COUNT(*)`, unique constraint toàn cục** đều trở thành bài toán ứng dụng.
+- **Vận hành**: N shard = N lần backup, migration schema, giám sát.
+
+Đổi ý khi: dữ liệu vẫn vừa một máy lớn + replica trong 2–3 năm tới → **chưa shard**; tối ưu query, archive dữ liệu cũ, tách database theo service trước. Cần shard nhưng muốn giữ SQL → cân nhắc Citus (Postgres), Vitess (MySQL) hoặc database phân tán sẵn, thay vì tự viết routing.
+
+</Technical>
+
+## Thực hành
+
+Playground chỉ có một Postgres, nhưng **hash partitioning** cục bộ cho thấy đúng hiện tượng routing: query có partition key chỉ chạm 1 partition, query không có thì chạm tất cả.
+
+<Terminal
+  commands={[
+    { comment: "Bảng messages chia 4 partition theo hash(channel_id)", command: "docker compose exec postgres psql -U app -c \"CREATE TABLE messages (channel_id bigint, id bigint, author_id bigint, body text, PRIMARY KEY (channel_id, id)) PARTITION BY HASH (channel_id);\"" },
+    { comment: "Tạo 4 partition", command: "for i in 0 1 2 3; do docker compose exec postgres psql -U app -c \"CREATE TABLE messages_p$i PARTITION OF messages FOR VALUES WITH (MODULUS 4, REMAINDER $i);\"; done" },
+    { comment: "20.000 tin giả, 50 channel, 500 author", command: "docker compose exec postgres psql -U app -c \"INSERT INTO messages SELECT g % 50, g, g % 500, 'hi' FROM generate_series(1, 20000) g; ANALYZE messages;\"", output: "INSERT 0 20000\nANALYZE" },
+    { comment: "Query nóng: 50 tin mới nhất của channel 42 → chỉ 1 partition (tên partition của bạn có thể khác)", command: "docker compose exec postgres psql -U app -c \"EXPLAIN (COSTS OFF) SELECT * FROM messages WHERE channel_id = 42 ORDER BY id DESC LIMIT 50;\"", output: "                                QUERY PLAN\n--------------------------------------------------------------------------\n Limit\n   ->  Index Scan Backward using messages_p1_pkey on messages_p1 messages\n         Index Cond: (channel_id = 42)" },
+    { comment: "Query không có shard key: mọi tin của author 7 → chạm cả 4 partition (scatter-gather)", command: "docker compose exec postgres psql -U app -c \"EXPLAIN (COSTS OFF) SELECT * FROM messages WHERE author_id = 7;\"", output: "                 QUERY PLAN\n--------------------------------------------\n Append\n   ->  Seq Scan on messages_p0 messages_1\n         Filter: (author_id = 7)\n   ->  Seq Scan on messages_p1 messages_2\n         Filter: (author_id = 7)\n   ->  Seq Scan on messages_p2 messages_3\n         Filter: (author_id = 7)\n   ->  Seq Scan on messages_p3 messages_4\n         Filter: (author_id = 7)" },
+  ]}
+/>
+
+Trên một máy, `Append` qua 4 partition chỉ tốn thêm vài ms. Khi 4 partition nằm trên 4 máy, mỗi nhánh là một round trip mạng, và latency p99 của query bằng nhánh chậm nhất.
+
+<Callout type="mistake" title="Chọn shard key vì 'phân bố đều nhất'">
+
+`hash(message_id)` đều tuyệt đối nhưng query nóng nhất (tin của một channel) phải hỏi mọi shard. Phân bố đều là **điều kiện cần**; khớp access pattern mới là **điều kiện đủ**. Luôn viết ra 3–5 query chính trước khi chọn key.
+
+</Callout>
+
+<Callout type="mistake" title="Shard quá sớm">
+
+Một Postgres được tối ưu tốt + read replica phục vụ được rất nhiều hệ thống. Shard sớm nghĩa là trả giá scatter-gather, cross-shard transaction và vận hành N cụm từ ngày đầu cho một vấn đề chưa tới. Có số ước lượng cho thấy vượt ngưỡng rồi hẵng shard.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi nói "shard database", interviewer sẽ hỏi ngay *theo key nào*. Câu trả lời mạnh: (1) liệt kê access pattern chính, (2) chọn key và chỉ ra query nào đi 1 shard, query nào scatter-gather và xử lý nó ra sao (bảng index riêng, search engine), (3) nêu rủi ro **hot partition** với key đó, (4) nhắc cross-shard transaction là đắt và thiết kế tránh nó.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "sharding", meaning: "Chia dữ liệu một bảng ra nhiều máy, mỗi máy giữ một phần." },
+    { term: "shard key / partition key", meaning: "Cột (hoặc tổ hợp cột) quyết định bản ghi nằm ở shard nào." },
+    { term: "range partitioning", meaning: "Chia theo khoảng giá trị liên tục của key." },
+    { term: "hash partitioning", meaning: "Chia theo giá trị hash của key để phân bố đều." },
+    { term: "directory-based sharding", meaning: "Dùng bảng tra để biết key nằm ở shard nào." },
+    { term: "scatter-gather", meaning: "Gửi query tới mọi shard rồi gộp kết quả." },
+    { term: "hot shard", meaning: "Shard nhận phần tải lớn bất thường so với các shard khác." },
+  ]}
+/>
+
+<QuickCheck
+  question="SaaS quản lý dự án, mọi query đều lọc theo `tenant_id`; vài khách hàng doanh nghiệp lớn gấp 1.000 lần khách thường. Chiến lược sharding nào hợp lý nhất?"
+  options={["Range theo `created_at`", "Hash theo `task_id`", "Directory theo `tenant_id`: tenant nhỏ dùng chung shard, tenant lớn được dời sang shard riêng", "Không cần shard key, scatter-gather mọi query"]}
+  answerIndex={2}
+  explanation="Như có cuốn sổ tra 'hồ sơ công ty này ở tủ nào': công ty nhỏ ở chung tủ, tập đoàn lớn được một tủ riêng — chỉ cần sửa sổ tra. Hash `task_id` rải dữ liệu một tenant ra khắp nơi; range thời gian tạo hot shard."
+/>

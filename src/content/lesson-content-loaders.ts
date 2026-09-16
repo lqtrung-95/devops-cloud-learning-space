@@ -27,4 +27,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "m17-devsecops": (lessonSlug) => import(`./modules/m17-devsecops/lessons/${lessonSlug}.mdx`),
   "sd05-database-fundamentals": (lessonSlug) => import(`./modules/sd05-database-fundamentals/lessons/${lessonSlug}.mdx`),
   "sd07-async-messaging": (lessonSlug) => import(`./modules/sd07-async-messaging/lessons/${lessonSlug}.mdx`),
+  "sd06-scaling-databases": (lessonSlug) => import(`./modules/sd06-scaling-databases/lessons/${lessonSlug}.mdx`),
 };

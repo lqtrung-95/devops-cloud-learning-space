@@ -17,6 +17,7 @@ import { m15ObservabilityModule } from "./modules/m15-observability/module-meta"
 import { m16SrePracticesModule } from "./modules/m16-sre-practices/module-meta";
 import { m17DevsecopsModule } from "./modules/m17-devsecops/module-meta";
 import { sd05DatabaseFundamentalsModule } from "./modules/sd05-database-fundamentals/module-meta";
+import { sd06ScalingDatabasesModule } from "./modules/sd06-scaling-databases/module-meta";
 import { sd07AsyncMessagingModule } from "./modules/sd07-async-messaging/module-meta";
 
 /** All modules of every course (order within a course comes from `module.order`). Add modules after they pass `pnpm validate:module`. */
@@ -39,5 +40,6 @@ export const curriculumModules: ModuleDefinition[] = [
   m16SrePracticesModule,
   m17DevsecopsModule,
   sd05DatabaseFundamentalsModule,
+  sd06ScalingDatabasesModule,
   sd07AsyncMessagingModule,
 ];

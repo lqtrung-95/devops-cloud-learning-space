@@ -1,0 +1,136 @@
+import { AsyncFailoverDataLossDiagram } from "../diagrams/async-failover-data-loss-diagram";
+
+<Eli5 title="Read replica và failover giống quầy tra cứu phụ và phó quản lý lên thay ca" emoji="🧾">
+
+Quán gốc mở thêm **quầy tra cứu phụ** ở chi nhánh: ai hỏi "món này giá bao nhiêu" thì ra quầy phụ, ai **đặt món** thì phải vào quầy chính. Quầy chính đỡ đông hẳn — đó là **routing đọc/ghi**.
+
+Rắc rối: khách vừa đặt món ở quầy chính chạy ra quầy phụ hỏi "đơn của tôi đâu?" — quầy phụ chưa nhận bản photo. Cách lịch sự: **ai vừa đặt món thì cho hỏi ở quầy chính thêm vài phút**.
+
+Một hôm quản lý quầy chính ngất xỉu. **Phó quản lý ở quầy phụ lên thay** (failover). Nhưng những trang sổ quản lý đã ghi mà xe ôm **chưa kịp chở tới** thì phó quản lý không hề biết — các đơn đó coi như mất, dù khách đã cầm hoá đơn.
+
+</Eli5>
+
+Tách đọc sang replica là bước scale đầu tiên của hầu hết database quan hệ, trước cả sharding. Nhưng nó biến "đọc" từ strongly consistent thành eventually consistent, và biến "primary chết" thành một quyết định về **RPO** (mất tối đa bao nhiêu dữ liệu) và **RTO** (mất bao lâu để phục vụ lại). Người thiết kế phải nói rõ hai con số này, không phải chỉ vẽ thêm một hộp "replica".
+
+<AsyncFailoverDataLossDiagram />
+
+<Technical>
+
+### Ước lượng trước: replica giúp được bao nhiêu?
+
+Giả định: 5M DAU, mỗi user 20 lần đọc + 1 lần ghi/ngày ⇒ 100M đọc/ngày ≈ **1.000 QPS đọc** trung bình (÷10⁵ s), peak 3× ≈ 3.000 QPS; ghi ≈ 50 QPS, peak 150.
+
+- Nếu benchmark cho thấy một node Postgres chịu được cỡ 1.500 QPS query đọc của bạn (tuỳ query và phần cứng — **phải đo**), thì cần primary + 2 replica cho peak, thêm 1 để còn chịu tải khi một node chết.
+- Ghi chỉ 150 QPS ⇒ primary đơn còn dư sức. **Replica chỉ scale đọc**; ghi quá tải thì replica vô ích — đó là lúc nghĩ tới sharding.
+
+### Routing đọc/ghi
+
+| Cách | Mô tả | Ghi chú |
+|---|---|---|
+| Trong app | Hai connection pool: `primary`, `replica` | Rõ ràng nhất, app biết query nào cần tươi |
+| Driver/ORM | Ví dụ libpq `target_session_attrs=read-write` / `prefer-standby` | Chọn node theo vai trò khi kết nối |
+| Proxy | Pgpool-II, HAProxy + health check, RDS reader endpoint | App không đổi code nhưng không biết ngữ cảnh "vừa ghi" |
+
+Nguyên tắc: **mọi thứ trong một transaction có ghi đi primary**; đọc để quyết định ghi (kiểm tra số dư, tồn kho) cũng đi primary.
+
+### Xử lý read-your-writes
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Đọc dữ liệu của chính user từ primary trong N giây sau khi ghi (cờ trong Redis/cookie) | Dễ làm, đa số trường hợp đủ | Chọn N là đoán; lag > N vẫn lộ | Profile, comment, cài đặt |
+| So LSN: ghi xong lấy `pg_current_wal_lsn()`, chỉ đọc replica khi `pg_last_wal_replay_lsn()` ≥ LSN đó | Chính xác | Thêm query, phải lưu LSN theo user/session | Luồng quan trọng, lag biến động mạnh |
+| Luôn đọc primary cho một số màn hình | Không bao giờ cũ | Tải dồn về primary | Giỏ hàng, thanh toán, admin |
+| Trả ngay dữ liệu vừa ghi từ response/UI optimistic | Không tốn DB | Chỉ che mắt người ghi, người khác vẫn thấy cũ | Feed, like, post mới |
+
+```ts title="app/src/db-router.ts"
+import { Pool } from "pg";
+import Redis from "ioredis";
+
+const primary = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
+const replica = new Pool({ connectionString: process.env.REPLICA_URL, max: 10 });
+const redis = new Redis(process.env.REDIS_URL ?? "redis://redis:6379");
+const STICKY_SECONDS = 5; // lớn hơn lag p99 đo được, không phải con số đoán
+
+export async function writeForUser(userId: string, sql: string, params: unknown[]) {
+  const result = await primary.query(sql, params);
+  await redis.set(`rw:${userId}`, "1", "EX", STICKY_SECONDS);
+  return result;
+}
+
+export async function readForUser(userId: string, sql: string, params: unknown[]) {
+  const recentlyWrote = (await redis.exists(`rw:${userId}`)) === 1;
+  return (recentlyWrote ? primary : replica).query(sql, params);
+}
+```
+
+### Failover: phát hiện, promote, trỏ lại, fencing
+
+1. **Phát hiện**: health check thất bại liên tục vài lần. Quá nhạy → failover nhầm vì mạng chập chờn; quá chậm → RTO dài.
+2. **Chọn và promote**: chọn replica có LSN mới nhất, `pg_promote()` (hoặc `pg_ctl promote`).
+3. **Trỏ client**: đổi DNS/VIP, cập nhật service discovery, hoặc client dùng connection string nhiều host với `target_session_attrs=read-write`.
+4. **Fencing**: bảo đảm primary cũ **không bao giờ nhận ghi nữa** (tắt máy, gỡ khỏi LB, lease hết hạn). Không fencing → **split brain**: hai primary cùng nhận ghi, dữ liệu rẽ nhánh và rất khó gộp.
+5. **Dựng lại node cũ** thành replica bằng `pg_rewind` hoặc `pg_basebackup`.
+
+Đừng tự viết failover bằng cron + script. Dùng công cụ có consensus (Patroni + etcd) hoặc dịch vụ quản lý (RDS/Aurora, Cloud SQL) — việc "ai là primary" là bài toán consensus của SD10.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Failover tự động, async replica | RTO ngắn (cỡ chục giây–vài phút tuỳ cấu hình), ghi nhanh | RPO > 0: mất commit trong khoảng lag | Đa số web app chấp nhận mất vài giây dữ liệu hiếm khi |
+| Failover tự động, sync quorum | RPO = 0 cho commit đã báo OK | Ghi chậm hơn, cần ≥3 node DB | Tiền, đơn hàng, ledger |
+| Failover thủ công (on-call quyết định) | Tránh failover nhầm, có người kiểm tra lag trước khi promote | RTO tính bằng phút–giờ | Team nhỏ, hệ thống nội bộ, hoặc khi failover nhầm còn tệ hơn downtime |
+
+</Technical>
+
+## Thực hành
+
+Giả lập failover trên playground (sau lab replica). Chỉ làm với dữ liệu thử. Tên network/container lấy từ `docker network ls` và `docker compose ps` — ví dụ dưới giả định thư mục `sd-playground`:
+
+<Terminal
+  commands={[
+    { comment: "Cắt mạng của replica: WAL mới sẽ không tới được (giả lập lag lúc sự cố)", command: "docker network disconnect sd-playground_default sd-playground-postgres-replica-1" },
+    { comment: "Ghi một đơn ở primary — async nên vẫn COMMIT OK ngay", command: "docker compose exec postgres psql -U app -c \"CREATE TABLE IF NOT EXISTS orders_demo(id int); INSERT INTO orders_demo VALUES (1042);\"", output: "CREATE TABLE\nINSERT 0 1" },
+    { comment: "Primary 'chết' đột ngột (kill, không shutdown êm)", command: "docker compose kill postgres", output: "[+] Killing 1/1\n ✔ Container sd-playground-postgres-1  Killed" },
+    { comment: "Nối mạng lại cho replica rồi promote", command: "docker network connect sd-playground_default sd-playground-postgres-replica-1 && docker compose exec postgres-replica psql -U app -c \"SELECT pg_promote();\"", output: " pg_promote\n------------\n t\n(1 row)" },
+    { comment: "Replica giờ là primary — nhưng đơn 1042 có còn không?", command: "docker compose exec postgres-replica psql -U app -c \"SELECT pg_is_in_recovery();\" -c \"SELECT * FROM orders_demo;\"", output: " pg_is_in_recovery\n-------------------\n f\n(1 row)\n\nERROR:  relation \"orders_demo\" does not exist" },
+    { comment: "Dọn dẹp: dựng lại cặp primary/replica từ đầu (xoá dữ liệu playground)", command: "docker compose down -v && docker compose up -d" },
+  ]}
+/>
+
+Kết quả `does not exist` là cố ý: WAL chứa đơn 1042 chỉ nằm trên primary đã "chết" — đó chính là RPO > 0 của async replication, thu nhỏ lại để nhìn thấy được. Lưu ý: chỉ `pg_wal_replay_pause()` (WAL đã tới replica nhưng chưa replay) thì **không** mô phỏng được mất dữ liệu, vì khi promote replica vẫn replay nốt WAL đã nhận.
+
+<Callout type="mistake" title="Kiểm tra số dư trên replica rồi trừ tiền trên primary">
+
+`SELECT balance` trên replica (cũ 500ms) rồi `UPDATE` trên primary dựa vào số đó → trừ quá tay. Đọc phục vụ quyết định ghi phải nằm **cùng transaction trên primary**, kèm `FOR UPDATE` hoặc điều kiện trong câu `UPDATE` (SD05).
+
+</Callout>
+
+<Callout type="mistake" title="Health check replica chỉ kiểm tra 'còn sống'">
+
+Replica còn trả lời `SELECT 1` nhưng trễ 10 phút vẫn nhận traffic đọc. Router nên loại replica có lag vượt ngưỡng (ví dụ `pg_wal_lsn_diff` hoặc `replay_lag` > vài giây) khỏi pool.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Khi thêm read replica, nói ngay ba điều: (1) replica chỉ giải quyết **read-heavy**, kèm con số tỉ lệ đọc/ghi; (2) cách xử lý **read-your-writes** cho luồng user thấy được; (3) **RPO/RTO khi failover** — async có thể mất commit gần nhất, sync quorum thì không nhưng ghi chậm hơn. Nhắc **split brain và fencing** là tín hiệu bạn từng vận hành thật.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "read replica", meaning: "Replica nhận traffic đọc để giảm tải cho primary." },
+    { term: "failover / promote", meaning: "Chuyển vai trò primary sang replica khi primary chết." },
+    { term: "RPO", meaning: "Recovery Point Objective — lượng dữ liệu tối đa chấp nhận mất khi sự cố." },
+    { term: "RTO", meaning: "Recovery Time Objective — thời gian tối đa để phục vụ lại." },
+    { term: "split brain", meaning: "Hai node cùng tin mình là primary và cùng nhận ghi." },
+    { term: "fencing", meaning: "Cơ chế chặn hẳn node cũ để nó không thể ghi nữa." },
+    { term: "sticky read", meaning: "Tạm route đọc của một user về primary sau khi họ ghi." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hệ thống đặt vé dùng 1 primary + 1 replica async, failover tự động. Sếp yêu cầu 'đã báo khách đặt vé thành công thì không được mất'. Thay đổi nào đáp ứng đúng yêu cầu?"
+  options={["Thêm 2 read replica async nữa", "Giảm thời gian health check xuống 1 giây", "Chuyển sang sync replication với quorum (ví dụ `ANY 1` trên 2 replica) cho database đặt vé", "Bật sticky read 10 giây sau khi ghi"]}
+  answerIndex={2}
+  explanation="Chỉ khi quán gốc đợi ít nhất một chi nhánh xác nhận đã cất trang sổ thì mới đưa hoá đơn — phó quản lý lên thay mới chắc chắn có đơn đó. Thêm replica async hay failover nhanh hơn không đổi được việc trang sổ chưa gửi bị mất."
+/>
