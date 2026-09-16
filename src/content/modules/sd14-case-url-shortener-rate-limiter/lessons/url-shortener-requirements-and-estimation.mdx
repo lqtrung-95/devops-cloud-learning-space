@@ -1,0 +1,136 @@
+import { FourStepFrameworkUrlShortenerDiagram } from "../diagrams/four-step-framework-url-shortener-diagram";
+
+<Eli5 title="URL shortener giống một bưu điện phát số thứ tự" emoji="🏤">
+
+Bưu điện không hỏi "anh muốn ô số mấy" — họ phát cho bạn một số ngắn, dễ đọc, và giữ trong sổ ai ứng với số nào. Bạn chỉ cần đưa số đó ra là lấy đúng gói hàng, dù địa chỉ gốc dài cỡ nào.
+
+URL shortener làm y hệt: nhận một `long_url` dài (đôi khi vài trăm ký tự với query string), phát ra một `short_code` ngắn (6–8 ký tự), rồi giữ sổ (database) ánh xạ code → URL gốc. Khi ai đó gõ short URL, hệ thống tra sổ và "phát hàng" — tức redirect tới URL gốc.
+
+Chỗ ví von bị hụt: bưu điện phát số tuần tự ai cũng thấy được; short code thì đôi khi KHÔNG được để lộ thứ tự (lộ tổng số link đã tạo, hoặc cho phép đoán link người khác) — đây là lý do "khả năng đoán được" là một yêu cầu thật, không chỉ chi tiết cài đặt.
+
+</Eli5>
+
+Đây là case study đầu tiên của Phase 4, và cũng là case "dễ" nhất trong danh sách — đúng vì vậy, nó là bài tập chuẩn để luyện chạy đúng framework 4 bước (SD01) không sai nhịp, trước khi gặp các case phức tạp hơn (news feed, chat, booking). Interviewer dùng câu hỏi này để xem bạn có **hỏi yêu cầu trước khi vẽ hộp** hay không — không phải để xem bạn có nhớ base62 hay không.
+
+<FourStepFrameworkUrlShortenerDiagram />
+
+<Technical>
+
+### Bước 1 — Requirements
+
+**Functional requirements** (User có thể…):
+- Tạo short link từ một `long_url`, tuỳ chọn đặt `alias` riêng (custom alias)
+- Truy cập short URL và được redirect tới `long_url` tương ứng
+- Xem số lượt click của short link mình tạo (tối thiểu: tổng số click)
+- (Tuỳ mở rộng) Đặt ngày hết hạn cho link
+
+**Non-functional requirements** (có số):
+- Redirect là đường nóng nhất: latency p99 < 20ms (không tính network tới client), availability 99,99%
+- Tạo link ít khắt khe hơn về latency (p99 vài trăm ms vẫn chấp nhận được) nhưng cần **không sinh trùng code**
+- Short code không được đoán được liên tiếp (không lộ "hôm nay đã tạo bao nhiêu link")
+- Durability: mapping không được mất — mất một dòng nghĩa là một short link chết vĩnh viễn
+
+**Out of scope** (nói rõ để không lạc đề khi phỏng vấn):
+- Custom domain riêng cho từng user (kiểu `abc.ly`)
+- Phân tích chi tiết theo vùng địa lý/thiết bị của click
+- Quét link độc hại (malware/phishing) — có thể nhắc là "cần" nhưng không đào sâu trừ khi được hỏi
+
+### Bước 2 — Ước lượng (theo Phụ lục B)
+
+Giả định: **100 triệu short link mới/tháng**, read:write ≈ **100:1** (đúng như số liệu tham khảo ở SD01 cho URL shortener).
+
+| Đại lượng | Giả định | Kết quả |
+|---|---|---|
+| Write (tạo link)/tháng | 100.000.000 | — |
+| QPS ghi trung bình | 1 tháng ≈ 30 × 10⁵ giây | 100.000.000 / 3.000.000 ≈ **33 QPS** |
+| QPS ghi đỉnh | hệ số peak 2–3× | **cỡ 70–100 QPS** |
+| Read (redirect)/tháng | read:write ≈ 100:1 | 100.000.000 × 100 = 10 tỷ |
+| QPS đọc trung bình | như trên | 10.000.000.000 / 3.000.000 ≈ **cỡ 3.300 QPS** |
+| QPS đọc đỉnh | hệ số peak 2–3× | **cỡ 7.000–10.000 QPS** |
+| Storage 5 năm | 100M/tháng × 60 tháng = 6 tỷ link, mỗi dòng ~500 byte (code + URL + metadata + index) | 6×10⁹ × 500B ≈ **cỡ 3TB thô** (×3 nếu replicate ⇒ ~9TB) |
+
+QPS đọc **cỡ 3.300 trung bình, hàng nghìn lúc đỉnh** — đây là con số quan trọng nhất của toàn case: nó quyết định gần như mọi lựa chọn kiến trúc ở các bài sau (cache là bắt buộc, không phải "nice to have").
+
+### Bước 3 — API (sơ bộ)
+
+```text
+POST /api/shorten
+  body: { longUrl: string, alias?: string, expiresAt?: string }
+  → 201 { shortCode: string, shortUrl: string }
+
+GET /:code
+  → 301 hoặc 302, Location: <long_url>
+  → 404 nếu code không tồn tại hoặc đã hết hạn
+```
+
+API tối giản có chủ đích — phần khó của case này không nằm ở số lượng endpoint mà ở **cách sinh code** (bài sau) và **cách phục vụ 3.300+ QPS đọc** (bài sau nữa).
+
+### Bước 4 — Data model (preview, chi tiết ở bài sau)
+
+```sql
+CREATE TABLE urls (
+  short_code   TEXT PRIMARY KEY,
+  long_url     TEXT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at   TIMESTAMPTZ,
+  click_count  BIGINT NOT NULL DEFAULT 0
+);
+```
+
+Một bảng đơn, không cần join — mọi truy vấn đều theo `short_code` (khoá chính). Đây là lý do một quan hệ đơn giản trên Postgres là đủ; không có lý do kỹ thuật nào để nhảy sang NoSQL ở quy mô này (xem SD05/SD06 về khi nào NoSQL mới thật sự cần).
+
+### Custom alias: cho phép hay không?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Chỉ auto-generate code | Đơn giản, không cần validate/kiểm tra "đẹp", không có vấn đề đoán được nếu chọn thuật toán đúng | User không tự chọn được tên dễ nhớ (`/sale2025`) | Sản phẩm phổ thông, không cần branding cho từng link |
+| Cho phép custom alias (opt-in) | Link dễ nhớ, tốt cho marketing | Cần kiểm tra trùng NGAY LÚC REQUEST (không thể pre-generate), cần validate ký tự/độ dài, cần chặn từ nhạy cảm | Sản phẩm nhắm tới marketing/branding, sẵn sàng trả thêm độ phức tạp cho một luồng riêng |
+
+**Khi nào đổi ý:** nếu custom alias chỉ chiếm < 1% lượng tạo link, tách thành một nhánh xử lý riêng (validate + kiểm tra trùng đồng bộ) thay vì làm phức tạp hoá luồng auto-generate chính — luồng auto-generate vẫn nên tối ưu cho tốc độ và không cần kiểm tra trùng (xem bài sau).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Chuẩn bị schema cho URL shortener trong sd-playground"
+  commands={[
+    { comment: "Thêm bảng urls vào schema hiện có của sd-playground", command: "cat >> db/init.sql << 'EOF'\nCREATE TABLE urls (\n  short_code TEXT PRIMARY KEY,\n  long_url TEXT NOT NULL,\n  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),\n  expires_at TIMESTAMPTZ,\n  click_count BIGINT NOT NULL DEFAULT 0\n);\nCREATE SEQUENCE url_id_seq;\nEOF" },
+    { comment: "Dữ liệu chưa có nên xoá volume cũ để init.sql chạy lại (mất dữ liệu playground cũ, chấp nhận được ở bài học)", command: "docker compose down -v && docker compose up -d --build" },
+    { comment: "Xác nhận bảng đã tồn tại", command: "docker compose exec postgres psql -U playground -c '\\d urls'", output: "                                     Table \"public.urls\"\n   Column    |           Type           | ...\n-------------+--------------------------+-----\n short_code  | text                     | not null\n long_url    | text                     | not null\n created_at  | timestamp with time zone | not null default now()\n expires_at  | timestamp with time zone |\n click_count | bigint                   | not null default 0\nIndexes:\n    \"urls_pkey\" PRIMARY KEY, btree (short_code)" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Bỏ qua bước ước lượng và nhảy thẳng vào "dùng Redis cho nhanh" là dấu hiệu yếu trong phỏng vấn. QPS đọc 3.300 (giả định của case này) mới là lý do KỸ THUẬT để cần cache — nói con số trước, giải pháp sau.
+</Callout>
+
+<Callout type="warning">
+  Đừng nhầm QPS trung bình với QPS thiết kế. Hệ thống phải chịu được mức đỉnh (2–3× trung bình theo giả định phổ biến) — 33 QPS ghi trung bình không có nghĩa hệ thống chỉ cần chịu 33 QPS.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi nghe "thiết kế URL shortener", đừng vội nói "dùng hash MD5". Hỏi trước: quy mô cỡ nào (DAU/link mới mỗi ngày), có cần custom alias không, analytics quan trọng tới mức nào (ảnh hưởng chọn 301 hay 302 ở bài sau). Rồi mới ước lượng và đưa API. Một câu trả lời mạnh luôn nói được: "read:write cỡ 100:1, nên phần lớn effort nên dồn vào đường đọc."
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Short code", meaning: "Chuỗi ngắn (thường 6–8 ký tự) dùng làm khoá tra cứu long_url." },
+    { term: "Custom alias", meaning: "Short code do user tự chọn thay vì hệ thống tự sinh." },
+    { term: "Read:write ratio", meaning: "Tỉ lệ số lượt đọc (redirect) trên số lượt ghi (tạo link) — quyết định hướng tối ưu kiến trúc." },
+    { term: "Out of scope", meaning: "Phần yêu cầu chủ động không giải quyết trong thiết kế, nói rõ để không lạc đề." },
+    { term: "Durability", meaning: "Đảm bảo dữ liệu đã ghi không bị mất, kể cả khi có sự cố phần cứng." },
+  ]}
+/>
+
+<QuickCheck
+  question={"Interviewer nói: \"Thiết kế URL shortener\" và không cho thêm chi tiết. Câu hỏi làm rõ nào giá trị nhất để hỏi TRƯỚC?"}
+  options={[
+    "Nên dùng ngôn ngữ lập trình gì?",
+    "Quy mô cỡ nào (bao nhiêu link mới mỗi ngày/tháng) và có cần custom alias không?",
+    "Database nên là MySQL hay PostgreSQL?",
+    "Short code nên dài bao nhiêu ký tự?",
+  ]}
+  answerIndex={1}
+  explanation="Quy mô quyết định toàn bộ ước lượng (bước 2) và từ đó quyết định gần hết kiến trúc; custom alias quyết định có cần một luồng kiểm tra trùng đồng bộ hay không. Ngôn ngữ, database cụ thể, độ dài code đều là chi tiết triển khai nên quyết định SAU khi có yêu cầu và số liệu."
+/>

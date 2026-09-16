@@ -1,0 +1,142 @@
+import { ShortCodeGenerationStrategyDiagram } from "../diagrams/short-code-generation-strategy-diagram";
+
+<Eli5 title="Ba cách phát số ở quầy: bốc số thứ tự, rút thăm, hay lấy vé đã in sẵn" emoji="🎟️">
+
+**Bốc số thứ tự** (counter): mỗi khách lấy đúng số tiếp theo — 1, 2, 3… Không bao giờ hai người trùng số, vì có đúng MỘT máy phát số. Nhưng nhìn số là biết hôm nay đã phục vụ bao nhiêu khách.
+
+**Rút thăm theo nội dung** (hash): số vé được tính từ chính thứ khách mang tới (băm `long_url` ra vài ký tự). Ngẫu nhiên, không đoán được — nhưng nếu quầy có rất nhiều khách và vé chỉ có vài chữ số, thỉnh thoảng hai khách khác nhau ra cùng một số (đụng độ / collision), phải rút lại.
+
+**Vé in sẵn** (pre-generated pool): quầy đã in sẵn một xấp vé ngẫu nhiên từ trước, khách tới chỉ lấy 1 vé còn trống trong xấp. Nhanh, không cần tính toán lúc khách tới — nhưng phải có người lo in thêm vé trước khi xấp vé cạn.
+
+</Eli5>
+
+Đây là quyết định kỹ thuật "trung tâm" nhất của URL shortener — mọi câu hỏi tiếp theo (có đoán được không, có cần bước kiểm tra trùng không, có cần thêm hạ tầng gì) đều bắt nguồn từ đây.
+
+<ShortCodeGenerationStrategyDiagram />
+
+<Technical>
+
+### Chiến lược 1 — Counter + base62
+
+Dùng một bộ đếm tăng dần (`id`), rồi encode `id` sang base62 (`0-9a-zA-Z`, 62 ký tự).
+
+```ts
+const ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+function toBase62(id: number): string {
+  if (id === 0) return ALPHABET[0];
+  let out = "";
+  while (id > 0) {
+    out = ALPHABET[id % 62] + out;
+    id = Math.floor(id / 62);
+  }
+  return out;
+}
+```
+
+7 ký tự base62 ⇒ 62⁷ ≈ **3,5 nghìn tỷ** tổ hợp — thừa sức cho 6 tỷ link tích luỹ sau 5 năm ở giả định của case này.
+
+**Không bao giờ trùng** vì mỗi `id` chỉ được phát đúng một lần — miễn là bộ đếm là NGUỒN PHÁT DUY NHẤT. Cách hiện thực:
+- `CREATE SEQUENCE` trong Postgres, gọi `nextval()` — đơn giản, nhưng mọi request tạo link đều đi qua một sequence tập trung (có thể là điểm nghẽn ở QPS ghi rất cao, dù ở case này chỉ ~33-100 QPS nên chưa đáng lo)
+- **Chia range** cho từng app instance: instance A giữ `[1M, 2M)`, instance B giữ `[2M, 3M)`… mỗi instance tự tăng trong range của mình, chỉ cần "xin range mới" khi dùng gần hết — giảm round-trip tới nguồn phát trung tâm
+
+**Nhược điểm thật:** `id` tăng dần lộ thông tin (đoán được thứ tự tạo, suy ra tổng số link) — nếu yêu cầu "không đoán được" là bắt buộc, cần thêm một bước xáo trộn (ví dụ XOR với một số cố định, hoặc dùng bảng chuyển vị) trước khi encode base62, KHÔNG đổi bản chất "counter đảm bảo duy nhất".
+
+### Chiến lược 2 — Hash + xử lý collision
+
+```ts
+import { createHash } from "node:crypto";
+
+function candidateCode(longUrl: string, salt = ""): string {
+  const hash = createHash("sha256").update(longUrl + salt).digest("hex");
+  return toBase62(BigInt("0x" + hash.slice(0, 10))).slice(0, 7); // rút gọn minh hoạ
+}
+```
+
+Cắt ngắn hash luôn đánh đổi độ dài lấy xác suất trùng — theo bài toán sinh nhật, xác suất này tăng nhanh hơn trực giác khi số bản ghi lớn dần. Thiết kế đúng KHÔNG được bỏ qua bước kiểm tra:
+
+```text
+1. candidate = base62(sha256(long_url))[:7]
+2. INSERT ... ON CONFLICT (short_code) DO NOTHING  -- atomic, không cần SELECT trước rồi INSERT
+3. Nếu 0 dòng được insert (đã tồn tại) → thử lại với salt khác, quay lại bước 1
+```
+
+Dùng `ON CONFLICT DO NOTHING` (hoặc constraint UNIQUE + bắt lỗi) thay vì `SELECT` rồi `INSERT` riêng — hai lệnh tách rời có race condition giống hệt bài học về counter Redis ở SD11 (hai request cùng kiểm tra "chưa tồn tại" rồi cùng insert).
+
+### Chiến lược 3 — Pre-generated key pool
+
+Một worker nền chạy định kỳ: sinh ngẫu nhiên hàng loạt code base62 chưa dùng, lưu vào một bảng/set riêng (`available_codes`). Request tạo link chỉ cần "lấy 1 code rảnh và đánh dấu used" — atomic bằng `DELETE ... RETURNING` hoặc `UPDATE ... WHERE used = false LIMIT 1 RETURNING` (transaction).
+
+Ưu điểm: request tạo link không tốn thời gian tính hash hay chờ counter — chỉ một lần lấy từ pool. Nhược điểm: cần vận hành thêm một worker, theo dõi pool sắp cạn (alert khi còn dưới một ngưỡng), và pool cần lưu trữ (dù mỗi code chỉ vài byte, hàng triệu code vẫn tốn một khoản storage riêng).
+
+### Khả năng đoán được (predictability) — vì sao nó là một yêu cầu thật
+
+| Chiến lược | Đoán được thứ tự? | Rủi ro |
+|---|---|---|
+| Counter thô (chưa xáo trộn) | Có — id tăng dần lộ ra trực tiếp | Đối thủ suy ra tổng số link đã tạo; kẻ xấu duyệt tuần tự để quét toàn bộ link (kể cả link không public) |
+| Hash | Không (nếu salt/input đủ đa dạng) | Gần như không đoán được, nhưng cần xử lý collision |
+| Pre-generated (sinh ngẫu nhiên) | Không | Không đoán được, đổi lại chi phí vận hành pool |
+
+### Trade-off: chọn chiến lược nào
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Counter + base62 | Không bao giờ collision, tính toán rẻ, dễ hiểu | Cần counter/range phối hợp; lộ thứ tự nếu không xáo trộn thêm | Ưu tiên đơn giản, "đoán được" không phải yêu cầu bắt buộc, hoặc chấp nhận thêm bước xáo trộn |
+| Hash + collision retry | Không cần hạ tầng phối hợp counter; tự nhiên không đoán được | Cần bước kiểm tra + retry (thêm round-trip khi trùng); phức tạp hơn khi tải ghi rất cao | Muốn tránh phụ thuộc một nguồn phát counter tập trung, chấp nhận độ phức tạp collision |
+| Pre-generated pool | Request tạo link cực nhanh (chỉ lấy sẵn), không đoán được | Cần worker nền + giám sát pool; thêm một thành phần vận hành | Write QPS rất cao, muốn tách hẳn "sinh code" khỏi đường ghi chính |
+
+**Khi nào đổi ý:** bắt đầu với counter+base62 (đơn giản nhất, đủ cho case study và phần lớn hệ thống thật ở quy mô vừa); chuyển sang hash hoặc pre-generated khi "không đoán được" trở thành yêu cầu bảo mật cứng, hoặc khi counter tập trung đo được là điểm nghẽn thật (không phải lo trước khi có số đo).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="So sánh 3 chiến lược bằng node REPL trong container app"
+  commands={[
+    { comment: "Vào container app để thử nhanh bằng node REPL", command: "docker compose exec app node" },
+    { comment: "Counter + base62: id=125 và id=125000000 minh hoạ độ dài code tăng chậm", command: "> const A='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'; const b62=n=>{let o='';while(n>0){o=A[n%62]+o;n=Math.floor(n/62)}return o||A[0]}; console.log(b62(125), b62(125000000))", output: "21 8sud2" },
+    { comment: "Hash: hai long_url gần giống nhau cho code hoàn toàn khác nhau (tính chất avalanche)", command: "> const {createHash}=require('crypto'); const h=s=>createHash('sha256').update(s).digest('hex').slice(0,7); console.log(h('https://a.com/x'), h('https://a.com/y'))", output: "6ce057e ae8f395" },
+  ]}
+/>
+
+<Callout type="mistake">
+
+Kiểm tra trùng bằng `SELECT` xem code đã tồn tại chưa, rồi mới `INSERT` ở một câu lệnh riêng — hai request cùng lúc có thể cùng thấy "chưa tồn tại" rồi cùng insert, dẫn tới lỗi hoặc dữ liệu sai (giống hệt bài học race condition khi tăng counter rate limit ở SD11). Luôn dùng `INSERT ... ON CONFLICT DO NOTHING` (atomic) rồi kiểm tra số dòng ảnh hưởng.
+
+</Callout>
+
+<Callout type="warning">
+
+Đừng chọn độ dài short code "cho chắc" (ví dụ 12 ký tự) mà không tính toán. Dài hơn cần thiết làm short URL kém "ngắn gọn" — đúng mục đích sản phẩm. Tính ngược từ quy mô 5 năm (Phụ lục B) rồi chọn độ dài vừa đủ dư, không hơn.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu hỏi "làm sao sinh short code" gần như luôn xuất hiện trong case này. Trả lời tốt đi theo thứ tự: (1) đề xuất một chiến lược mặc định (thường counter+base62 vì đơn giản), (2) tự nêu nhược điểm của nó (lộ thứ tự) trước khi bị hỏi, (3) so sánh nhanh với hash và pre-generated bằng đúng 1 câu mỗi cái, (4) chốt "khi nào đổi ý" dựa trên yêu cầu (đoán được có phải vấn đề không, write QPS cỡ nào).
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Base62", meaning: "Bảng chữ số 62 ký tự (0-9a-zA-Z) dùng để encode số nguyên thành chuỗi ngắn." },
+    { term: "Counter phân tán / range allocation", meaning: "Chia một dải id cho từng instance tự tăng riêng, giảm round-trip tới nguồn phát trung tâm." },
+    { term: "Collision", meaning: "Hai input khác nhau cho ra cùng một short code sau khi băm/cắt ngắn." },
+    { term: "Bài toán sinh nhật (birthday paradox)", meaning: "Xác suất trùng của giá trị băm ngắn tăng nhanh hơn trực giác khi số lượng bản ghi lớn dần." },
+    { term: "ON CONFLICT DO NOTHING", meaning: "Cú pháp Postgres insert atomic, bỏ qua nếu vi phạm unique constraint — tránh race condition kiểm tra-rồi-ghi." },
+    { term: "Pre-generated key pool", meaning: "Tập code đã sinh sẵn, chưa gán, được cấp phát atomic khi có request tạo link." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hệ thống dùng hash+collision retry, đang ở 4 tỷ link đã lưu với code dài 7 ký tự base62 (~3,5 nghìn tỷ tổ hợp). So với lúc chỉ có 1 triệu link, tần suất phải retry do trùng code sẽ thế nào?"
+  options={[
+    "Không đổi — SHA-256 luôn cho xác suất trùng như nhau bất kể đã có bao nhiêu link",
+    "Giảm dần vì không gian base62 vẫn còn rất nhiều chỗ trống",
+    "Tăng lên đáng kể — càng nhiều link đã lưu, xác suất một code mới trùng với code đã tồn tại càng cao (bài toán sinh nhật), dù không gian tổng vẫn còn dư",
+    "Chỉ tăng nếu hai long_url có nội dung giống hệt nhau",
+  ]}
+  answerIndex={2}
+  explanation="Xác suất collision của một giá trị băm cắt ngắn tăng theo số bản ghi đã có (bài toán sinh nhật) — không phụ thuộc vào việc input có giống nhau hay không, và không liên quan tới việc không gian tổng còn trống nhiều hay ít. Đây là lý do bước kiểm tra + retry không thể bỏ qua dù không gian base62 còn rất dư."
+/>

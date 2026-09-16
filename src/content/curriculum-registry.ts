@@ -29,6 +29,7 @@ import { sd10ConsensusCoordinationModule } from "./modules/sd10-consensus-coordi
 import { sd11ReliabilityPatternsModule } from "./modules/sd11-reliability-patterns/module-meta";
 import { sd12MicroservicesApiDesignModule } from "./modules/sd12-microservices-api-design/module-meta";
 import { sd13SloCapacityMultiRegionModule } from "./modules/sd13-slo-capacity-multi-region/module-meta";
+import { sd14CaseUrlShortenerRateLimiterModule } from "./modules/sd14-case-url-shortener-rate-limiter/module-meta";
 import { sd16CaseChatPresenceModule } from "./modules/sd16-case-chat-presence/module-meta";
 
 /** All modules of every course (order within a course comes from `module.order`). Add modules after they pass `pnpm validate:module`. */
@@ -63,5 +64,6 @@ export const curriculumModules: ModuleDefinition[] = [
   sd11ReliabilityPatternsModule,
   sd12MicroservicesApiDesignModule,
   sd13SloCapacityMultiRegionModule,
+  sd14CaseUrlShortenerRateLimiterModule,
   sd16CaseChatPresenceModule,
 ];

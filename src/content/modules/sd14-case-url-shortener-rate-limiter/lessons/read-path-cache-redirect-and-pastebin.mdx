@@ -1,0 +1,121 @@
+import { ReadPathCacheRedirectDiagram } from "../diagrams/read-path-cache-redirect-diagram";
+
+<Eli5 title="Quầy tổng đài giữ sẵn số hay gọi lại từng lần?" emoji="📞">
+
+Tưởng tượng bạn hỏi tổng đài một số điện thoại quen thuộc. Nếu tổng đài **nhớ luôn** số đó (đã có sẵn trong đầu — cache), họ trả lời ngay không cần lật sổ. Nếu là số lạ (cache miss), họ phải lật cuốn sổ dày (Postgres), tìm xong thì GHI LUÔN vào giấy nhớ để lần sau hỏi lại trả lời ngay.
+
+Còn chuyện "báo bạn tự nhớ số luôn, khỏi gọi tổng đài nữa" (redirect 301) so với "mỗi lần bạn đều phải gọi lại hỏi" (redirect 302) là một quyết định khác: nhớ luôn thì nhanh cho bạn nhưng tổng đài mất dấu bạn gọi bao nhiêu lần; bắt gọi lại mỗi lần thì chậm hơn một chút nhưng tổng đài đếm được chính xác.
+
+</Eli5>
+
+Với read:write ≈ 100:1 (bài 1), đường đọc (redirect) là nơi 99% ngân sách kỹ thuật nên dồn vào. Đây cũng là lúc case study này nối lại trực tiếp với SD04 (caching) — không có gì mới về mặt lý thuyết, chỉ là áp dụng đúng chỗ.
+
+<ReadPathCacheRedirectDiagram />
+
+<Technical>
+
+### High-level design cho read path
+
+```text
+Client → Nginx → App (Fastify)
+                   ├─ GET short:<code> từ Redis
+                   │    ├─ HIT  → trả redirect ngay
+                   │    └─ MISS → SELECT long_url FROM urls WHERE short_code = $1
+                   │              → SET short:<code> <long_url> EX 3600 (cache-aside)
+                   │              → trả redirect
+                   └─ INCR click_count (không chặn response — "ghi ẩn" như SD01 đã nói)
+```
+
+Đây là **cache-aside** (SD04): app tự quản lý việc đọc/ghi cache, Redis không phải nguồn sự thật — Postgres mới là. Nếu Redis mất dữ liệu (restart, evict), hệ thống vẫn đúng, chỉ chậm hơn tạm thời trong lúc cache "nguội" trở lại (cache warm-up).
+
+### 301 vs 302 — trade-off cốt lõi của case này
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| 301 Moved Permanently | Trình duyệt cache redirect, các lần sau nhảy thẳng — nhanh hơn cho user, giảm tải server | Server không thấy được các lần click sau — analytics/click-count thiếu chính xác; đổi đích link cũ không có tác dụng với trình duyệt đã cache | Link không đổi đích, không cần đếm click chính xác từng lần (ví dụ short link nội bộ, ít quan tâm analytics) |
+| 302 Found | Server luôn thấy request → click-count/analytics chính xác; đổi đích link có hiệu lực ngay | Luôn tốn một round-trip server mỗi lần click, kể cả link không đổi | Sản phẩm cần analytics chính xác (tính phí theo click, theo dõi campaign) — đa số sản phẩm URL shortener thương mại (bit.ly, v.v.) dùng 302 vì lý do này |
+
+**Khi nào đổi ý:** nếu ban đầu chọn 302 vì cần analytics, nhưng đo được rằng 90%+ traffic đến từ một nhóm link "tĩnh" không cần đếm chính xác (ví dụ link trong tài liệu nội bộ), có thể tách riêng một loại link "static" dùng 301 để giảm tải, giữ 302 cho link cần analytics.
+
+### Cache-aside né thundering herd cho link viral
+
+Một short link vừa tạo có thể được chia sẻ và nhận hàng nghìn click trong vài phút đầu — nếu để **lazy load** (chỉ cache khi có request đọc đầu tiên), có thể xảy ra tình huống nhiều request đầu tiên MISS cùng lúc và cùng dội vào Postgres (thundering herd/cache stampede — nối lại khái niệm SD04). Hai cách giảm nhẹ:
+
+1. **Write-through lúc tạo link:** ngay khi `INSERT` xong, `SET` luôn vào Redis — link vừa tạo đã "ấm" sẵn, không có khoảng trống MISS ban đầu.
+2. **Request coalescing:** nhiều request MISS cùng một `short_code` cùng lúc chỉ cho MỘT request đi query Postgres, các request còn lại chờ kết quả đó (cần một lock ngắn hạn trong Redis, ví dụ `SET short:<code>:lock NX EX 2`).
+
+Với quy mô case này (QPS đọc cỡ nghìn), write-through lúc tạo là đủ; request coalescing chỉ cần khi một single key nhận traffic cực lớn đồng thời.
+
+### Mở rộng: Pastebin
+
+Pastebin (dán & chia sẻ đoạn text) dùng lại gần như nguyên xi kiến trúc URL shortener — điểm khác là **nội dung**:
+
+| Khía cạnh | URL shortener | Pastebin |
+|---|---|---|
+| Kích thước "nội dung" | Một URL (~vài trăm byte) | Một đoạn text, có thể tới vài MB |
+| Nơi lưu nội dung | Trực tiếp trong bảng metadata (`long_url`) | **Object storage** (S3-like); bảng metadata chỉ giữ khoá trỏ tới object |
+| Data model | `urls(short_code, long_url, ...)` | `pastes(id, storage_key, size_bytes, content_type, expires_at, created_at)` |
+| Expiration | Tuỳ chọn | Thường là tính năng chính (paste tự xoá sau N giờ/ngày) |
+
+```sql
+CREATE TABLE pastes (
+  id           TEXT PRIMARY KEY,
+  storage_key  TEXT NOT NULL,     -- ví dụ "pastes/2025/09/ab12cd.txt" trên object storage
+  size_bytes   INTEGER NOT NULL,
+  content_type TEXT NOT NULL DEFAULT 'text/plain',
+  expires_at   TIMESTAMPTZ,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Lý do tách nội dung khỏi metadata: bảng `pastes` luôn nhỏ và nhanh để query (liệt kê, kiểm tra hết hạn), trong khi object storage tối ưu cho việc lưu blob lớn với chi phí thấp — nhét text vài MB thẳng vào một cột Postgres làm bloat bảng, chậm backup, và không tận dụng được ưu điểm chi phí của object storage. **Expiration** thực hiện bằng job định kỳ quét `expires_at < now()`, xoá object trên storage rồi xoá dòng metadata (xoá object trước để tránh rác mồ côi nếu job bị gián đoạn giữa chừng — dòng metadata trỏ tới object đã xoá vẫn còn xử lý được ở lần chạy sau, ngược lại thì mất dấu).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Quan sát cache-aside: MISS lần đầu, HIT lần sau"
+  commands={[
+    { comment: "Tạo 1 link mới (giả sử curl trả về shortCode=3F7k2Qz)", command: "curl -s -X POST localhost:8080/api/shorten -H 'Content-Type: application/json' -d '{\"longUrl\":\"https://example.com/bai-viet-dai\"}'", output: "{\"shortCode\":\"3F7k2Qz\",\"shortUrl\":\"http://localhost:8080/3F7k2Qz\"}" },
+    { comment: "Kiểm tra Redis TRƯỚC lần đọc đầu tiên — chưa có gì (trừ khi đã bật write-through)", command: "docker compose exec redis redis-cli GET short:3F7k2Qz", output: "(nil)" },
+    { comment: "Lần đọc đầu tiên — cache miss, App query Postgres rồi tự SET lại Redis", command: "curl -sD - -o /dev/null localhost:8080/3F7k2Qz | grep -i location", output: "location: https://example.com/bai-viet-dai" },
+    { comment: "Bây giờ Redis đã có — lần đọc sau sẽ là cache hit", command: "docker compose exec redis redis-cli GET short:3F7k2Qz", output: "\"https://example.com/bai-viet-dai\"" },
+    { comment: "Xác nhận click_count đã tăng (ghi ẩn phía sau một request đọc)", command: "docker compose exec postgres psql -U playground -c \"SELECT click_count FROM urls WHERE short_code='3F7k2Qz';\"", output: " click_count \n-------------\n           1\n(1 row)" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Dùng 301 "cho nhanh" mà không hỏi yêu cầu analytics. Một khi trình duyệt đã cache redirect 301, đổi `long_url` trong database không còn tác dụng với những user đã từng click — họ vẫn nhảy tới đích cũ cho tới khi tự xoá cache trình duyệt.
+</Callout>
+
+<Callout type="warning">
+  Nhét nội dung Pastebin trực tiếp vào một cột `TEXT`/`BYTEA` lớn trên Postgres "cho đơn giản, khỏi cần thêm object storage" hoạt động được ở demo nhưng không scale: bảng phình to nhanh, `VACUUM`/backup chậm hẳn, và bạn đang trả giá lưu trữ của một database OLTP cho việc lưu blob — vốn là việc object storage làm rẻ hơn.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi được hỏi "301 hay 302", đừng chọn một cái rồi dừng lại — nói rõ trade-off (browser cache vs analytics chính xác) và hỏi ngược lại "sản phẩm có cần đếm click chính xác không?". Với Pastebin, điểm interviewer thường đào sâu là "nội dung lưu ở đâu" — trả lời đúng "object storage cho blob, DB cho metadata" gần như luôn là câu trả lời được điểm.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Cache-aside", meaning: "App tự đọc/ghi cache, database vẫn là nguồn sự thật; cache có thể mất mà không mất dữ liệu." },
+    { term: "Write-through (lúc tạo)", meaning: "Ghi vào cache ngay khi ghi vào database, tránh khoảng trống cache miss ban đầu." },
+    { term: "Thundering herd / cache stampede", meaning: "Nhiều request cùng miss một key và cùng dội vào database cùng lúc." },
+    { term: "301 vs 302", meaning: "Redirect vĩnh viễn (browser cache được) vs tạm thời (browser luôn hỏi lại server)." },
+    { term: "Object storage", meaning: "Kho lưu blob (kiểu S3) tối ưu chi phí và dung lượng cho file lớn, không tối ưu cho truy vấn có cấu trúc." },
+    { term: "Orphaned object", meaning: "Blob còn tồn tại trên storage nhưng không còn dòng metadata nào trỏ tới — rác cần dọn." },
+  ]}
+/>
+
+<QuickCheck
+  question={"Một chiến dịch marketing dùng short link để đo hiệu quả (đếm chính xác số click mỗi ngày theo từng kênh quảng cáo). Đội sản phẩm định đổi sang 301 để \"giảm tải server\". Bạn nên phản hồi gì?"}
+  options={[
+    "Đồng ý ngay vì 301 luôn tốt hơn cho hiệu năng",
+    "Không nên — 301 khiến trình duyệt tự cache redirect, các lần click sau của cùng người dùng sẽ không tới được server để đếm, làm sai lệch số liệu quan trọng nhất của chiến dịch",
+    "Không liên quan — mã redirect không ảnh hưởng gì tới việc đếm click",
+    "Đồng ý, miễn tăng thêm cache TTL trên Redis",
+  ]}
+  answerIndex={1}
+  explanation="Đây đúng là trade-off cốt lõi của 301 vs 302: giảm tải bằng cách để trình duyệt tự xử lý (301) đổi lấy mất khả năng đếm chính xác ở phía server. Với yêu cầu 'đếm chính xác theo kênh', 302 là lựa chọn đúng dù tốn thêm một chút tải."
+/>

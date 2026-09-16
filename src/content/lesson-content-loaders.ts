@@ -39,4 +39,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "sd13-slo-capacity-multi-region": (lessonSlug) => import(`./modules/sd13-slo-capacity-multi-region/lessons/${lessonSlug}.mdx`),
   "sd10-consensus-coordination": (lessonSlug) => import(`./modules/sd10-consensus-coordination/lessons/${lessonSlug}.mdx`),
   "sd16-case-chat-presence": (lessonSlug) => import(`./modules/sd16-case-chat-presence/lessons/${lessonSlug}.mdx`),
+  "sd14-case-url-shortener-rate-limiter": (lessonSlug) => import(`./modules/sd14-case-url-shortener-rate-limiter/lessons/${lessonSlug}.mdx`),
 };

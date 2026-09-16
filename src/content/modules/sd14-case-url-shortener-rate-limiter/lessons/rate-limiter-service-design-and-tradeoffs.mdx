@@ -1,0 +1,113 @@
+import { RateLimiterServiceBoundaryDiagram } from "../diagrams/rate-limiter-service-boundary-diagram";
+
+<Eli5 title="Từ một anh gác cửa riêng, thành một công ty bảo vệ cho cả toà nhà" emoji="🏢">
+
+SD11 dạy bạn về "anh gác cửa" đứng trước MỘT quán — đủ nếu chỉ có một quán. Nhưng một công ty có 50 cửa hàng (50 service nội bộ) mà mỗi cửa hàng tự thuê một anh gác cửa riêng, tự nhớ luật riêng, thì tốn kém và không đồng bộ.
+
+Giải pháp: thuê MỘT công ty bảo vệ chung, đặt một trạm kiểm soát trung tâm — mọi cửa hàng hỏi trạm này "khách X có được vào không?" trước khi mở cửa. Đổi lại: nếu trạm trung tâm này gặp sự cố, ảnh hưởng lan ra CẢ 50 cửa hàng cùng lúc, không chỉ một.
+
+</Eli5>
+
+Bài này áp dụng lại thuật toán rate limit đã học ở SD11, nhưng câu hỏi trọng tâm khác hẳn: không phải "thuật toán nào", mà là "đặt nó ở đâu trong kiến trúc, và điều gì xảy ra khi chính nó gặp sự cố". Đây cũng là bài tổng kết bottleneck & trade-off cho toàn bộ case.
+
+<RateLimiterServiceBoundaryDiagram />
+
+<Technical>
+
+### Rate limiter cho case này: giới hạn tạo link theo IP
+
+Trong URL shortener, nơi cần rate limit rõ nhất là `POST /api/shorten` theo IP — chặn một client spam tạo hàng loạt link (dùng để phát tán spam/phishing qua short URL). Có thể dùng lại **fixed window counter** (SD11) vì: rẻ, đủ chính xác cho mục đích "chặn spam thô", và không cần burst tolerance tinh vi như thuật toán token bucket cho use case này.
+
+```ts
+async function checkRateLimit(redis: Redis, ip: string, limit = 10, windowSeconds = 60): Promise<boolean> {
+  const key = `ratelimit:shorten:${ip}`;
+  const count = await redis.incr(key);
+  if (count === 1) await redis.expire(key, windowSeconds); // chỉ đặt TTL lần đầu tạo key
+  return count <= limit;
+}
+```
+
+`INCR` là atomic trong Redis — không có race condition giữa nhiều request cùng lúc như bài học SD11 đã nhấn mạnh (tránh `GET` rồi `SET` tách rời).
+
+### Rate limiter như một service riêng — vì sao và đánh đổi gì
+
+Công ty có ~50 service nội bộ (không chỉ Shorten service) đều cần rate limit theo cách tương tự. Hai lựa chọn kiến trúc:
+
+1. **Nhúng logic rate limit vào từng service** (mỗi service tự gọi Redis, tự viết logic): đơn giản cho từng service, nhưng luật rate limit (thuật toán, ngưỡng, cách tính key) bị lặp lại và dễ lệch nhau giữa các team.
+2. **Tách thành Rate limiter service riêng**: các service khác gọi một API chung (`POST /check-limit { key, limit, windowSeconds }`), logic và state (Redis) tập trung một chỗ — đổi lại thêm một network hop mỗi lần check, và biến chính service này thành **hạ tầng dùng chung** mà 50 service phụ thuộc vào.
+
+### Fail-open vs fail-closed — quyết định vận hành quan trọng nhất
+
+Khi Rate limiter service (dùng chung) không phản hồi kịp (timeout, đang deploy, quá tải):
+
+- **Fail-open** (cho qua khi không chắc): ưu tiên tính sẵn sàng của các service PHỤ THUỘC — user thật vẫn dùng được Shorten service dù có tạm thời mất bảo vệ chống spam. Rủi ro: đúng lúc rate limiter down (thường là lúc hạ tầng chung quá tải) lại là lúc dễ bị lợi dụng nhất.
+- **Fail-closed** (từ chối khi không chắc): ưu tiên an toàn tuyệt đối cho từng luật giới hạn — nhưng một sự cố ở MỘT service dùng chung giờ có thể làm gián đoạn tạo link ở CẢ 50 service cùng lúc, biến rate limiter service thành single point of failure cho toàn hệ thống.
+
+### Trade-off tổng hợp: vị trí & chính sách rate limiter
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Rate limit ở edge (Nginx/API gateway) | Chặn sớm, rẻ, bảo vệ được nhiều service cùng lúc bằng 1 rule chung | Không có ngữ cảnh nghiệp vụ (không biết user thuộc gói dịch vụ nào) | Chặn abuse/DDoS thô, giới hạn chung không phân biệt user |
+| Rate limit ở tầng service (business logic) | Linh hoạt theo user/gói dịch vụ/endpoint | Request đã tốn tài nguyên network/LB trước khi bị chặn | Cần luật khác nhau theo ngữ cảnh nghiệp vụ (ví dụ free vs pro) |
+| Rate limiter service riêng, fail-open | 50 service dùng chung một luật nhất quán; sự cố limiter không làm sập service phụ thuộc | Có cửa sổ thời gian mất bảo vệ khi limiter down | Ưu tiên availability của service nghiệp vụ hơn là chặn tuyệt đối |
+| Rate limiter service riêng, fail-closed | Không bao giờ để lọt quá giới hạn | Limiter down ⇒ 50 service cùng bị ảnh hưởng | Giới hạn bảo vệ tài nguyên cực kỳ đắt/nguy hiểm nếu vượt (ví dụ gọi ra một third-party tính phí theo request) |
+
+**Khi nào đổi ý:** dùng fail-open làm mặc định cho phần lớn service (đa số trường hợp, "chặn spam" không nguy hiểm bằng "sập dịch vụ"); chuyển một luật cụ thể sang fail-closed chỉ khi vượt giới hạn đó gây hậu quả nghiêm trọng hơn việc từ chối request hợp lệ (ví dụ giới hạn gọi API thanh toán ra bên thứ ba tính phí theo lượt gọi).
+
+### Bottleneck, failure modes & mở rộng (tổng kết case)
+
+| Điểm nghẽn tiềm ẩn | Xuất hiện khi | Hướng mở rộng |
+|---|---|---|
+| Counter tập trung (sinh short code) | Write QPS tăng vượt xa 100 QPS giả định | Chia range id cho từng instance (đã nêu ở bài 2) |
+| Một node Redis cache | Read QPS vượt khả năng một instance, hoặc node đó chết | Redis replica cho đọc, hoặc Redis Cluster (SD06 — sharding) |
+| Một Postgres primary cho bảng `urls` | Write hoặc read fallback (cache miss) vượt khả năng một máy | Read replica cho fallback query (SD06); bảng `urls` gần như không cần join nên cũng dễ shard theo `short_code` nếu thật sự cần |
+| Rate limiter service (single shared dependency) | Chính nó quá tải hoặc down | Chạy nhiều instance sau load balancer riêng; cache kết quả "còn hạn mức" cục bộ vài trăm ms để giảm round-trip cho mọi request |
+
+Case này KHÔNG có bottleneck nào đòi hỏi giải pháp lạ — mọi hướng mở rộng đều là áp dụng lại building block đã học (cache, replica, sharding, distributed rate limit). Đây chính là điểm của case study đầu tiên: luyện phản xạ "map đúng vấn đề vào đúng building block" trước khi gặp case phức tạp hơn ở SD15 trở đi.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Xác nhận rate limit theo IP hoạt động đúng và reset đúng hạn"
+  commands={[
+    { comment: "Bắn 12 request tạo link liên tiếp từ cùng IP (limit đã đặt = 10/phút)", command: "for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' -X POST localhost:8080/api/shorten -H 'Content-Type: application/json' -d '{\"longUrl\":\"https://example.com\"}'; done; echo", output: "201 201 201 201 201 201 201 201 201 201 429 429" },
+    { comment: "Kiểm tra counter và TTL còn lại trong Redis", command: "docker compose exec redis redis-cli TTL ratelimit:shorten:172.19.0.1", output: "(integer) 47" },
+    { comment: "Đợi hết TTL rồi thử lại — counter phải reset về 0", command: "sleep 50 && curl -s -o /dev/null -w '%{http_code}\\n' -X POST localhost:8080/api/shorten -H 'Content-Type: application/json' -d '{\"longUrl\":\"https://example.com\"}'", output: "201" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Đặt cùng một limit (ví dụ 10 request/phút) cho MỌI endpoint và MỌI service dùng chung Rate limiter service, không phân biệt endpoint rẻ (redirect) hay đắt (tạo link, gọi third-party). Key rate limit nên gồm cả định danh endpoint (`ratelimit:<service>:<endpoint>:<ip>`), không chỉ IP.
+</Callout>
+
+<Callout type="warning">
+  Chọn fail-closed cho MỌI luật "cho chắc" mà không cân nhắc — biến một service phụ trợ (rate limiter) thành lý do khiến 50 service nghiệp vụ cùng ngừng hoạt động khi nó gặp sự cố. Mặc định nên là fail-open trừ khi có lý do cụ thể để làm khác.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi mở rộng thường gặp sau khi xong URL shortener: "giờ hãy thiết kế rate limiter dùng chung cho nhiều service nội bộ của công ty". Câu trả lời mạnh không lặp lại thuật toán SD11 (interviewer đã biết bạn biết) mà đi thẳng vào: đặt ở đâu (edge/service/service riêng), state dùng chung ở đâu (Redis, atomic), và đặc biệt là **fail-open vs fail-closed** — đây mới là phần thể hiện tư duy vận hành, thường là điểm phân biệt mid với senior.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Rate limiter service", meaning: "Dịch vụ riêng cung cấp chức năng rate limit dùng chung cho nhiều service khác, thay vì mỗi service tự cài đặt." },
+    { term: "Fail-open", meaning: "Khi không chắc (dependency lỗi/timeout), mặc định CHO QUA request." },
+    { term: "Fail-closed", meaning: "Khi không chắc, mặc định TỪ CHỐI request." },
+    { term: "Single point of failure (dùng chung)", meaning: "Một thành phần mà nhiều hệ thống khác phụ thuộc vào, nên sự cố của nó lan rộng." },
+    { term: "Rate limit key", meaning: "Định danh dùng để đếm giới hạn — nên gồm cả chủ thể (IP/user) lẫn ngữ cảnh (endpoint/service)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Rate limiter service dùng chung cho 50 service, đang chạy fail-closed. Đội hạ tầng đề xuất đổi sang fail-open để tránh sự cố dây chuyền đã từng xảy ra. Rủi ro cụ thể nào PHÁT SINH THÊM sau khi đổi?"
+  options={[
+    "Không có rủi ro nào — fail-open luôn an toàn hơn fail-closed",
+    "Trong đúng khoảng thời gian rate limiter service down/timeout, mọi request đều được cho qua không giới hạn — mất bảo vệ đúng lúc hạ tầng chung dễ tổn thương nhất",
+    "Fail-open làm chậm mọi request bình thường vì phải retry nhiều lần",
+    "Fail-open chỉ ảnh hưởng tới Shorten service, không ảnh hưởng 49 service còn lại",
+  ]}
+  answerIndex={1}
+  explanation="Fail-open đánh đổi ngược lại: đổi 'sự cố lan ra 50 service' (fail-closed) lấy 'mất bảo vệ tạm thời trong đúng lúc hạ tầng chung gặp vấn đề' (fail-open) — không có lựa chọn nào miễn phí, quyết định đúng phụ thuộc luật nào quan trọng hơn: availability của service nghiệp vụ hay tính tuyệt đối của giới hạn."
+/>
