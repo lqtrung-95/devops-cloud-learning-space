@@ -1,0 +1,154 @@
+import { BookingStateMachineRaceDiagram } from "../diagrams/booking-state-machine-race-diagram";
+
+<Eli5 title="Ghế cuối cùng trong rạp, và một hàng người đứng chờ ngoài cửa" emoji="🎟️">
+
+Rạp chỉ còn 1 ghế trống. Hai người cùng chạy tới quầy cùng lúc, cùng hỏi "còn ghế không?", cùng nghe "còn" — vì nhân viên chưa kịp cập nhật bảng sau khi trả lời người đầu. Cả hai đều mua — bán trùng một ghế. Đó là **double-booking**: hỏi rồi mới ghi (check-then-write) luôn có khe hở khi hai người hỏi gần như đồng thời.
+
+Cách đúng: nhân viên chỉ nói "còn" **đồng thời với việc gạch tên ngay lập tức** trong cùng một hành động — ai gạch trước thì ghế thuộc về người đó, người sau nhận "hết" ngay, không cần hỏi lại. Đó là **atomic conditional update**.
+
+Còn nếu người giữ ghế bỏ đi pha cà phê 10 phút không quay lại mua, ghế phải được thả ra cho người khác — đó là **TTL (time-to-live) của việc giữ chỗ**.
+
+Khi 10.000 người cùng ùa vào quầy một lúc (mở bán vé hot), rạp dựng thêm một **hàng đợi ảo** ở ngoài cửa: phát số thứ tự, mời từng đợt nhỏ vào quầy — không phải vì quầy tính sai, mà vì quầy không chịu nổi 10.000 người chen cùng lúc.
+
+</Eli5>
+
+Booking kiểu Ticketmaster là bài toán **tài nguyên có hạn, nhiều người tranh, dưới tải đột biến**. Nó dùng lại chính kỹ thuật locking đã học ở SD05 (pessimistic/optimistic, `FOR UPDATE`) — chỉ khác là ở quy mô "50.000 vé, 2 triệu người bấm trong 10 giây đầu".
+
+<BookingStateMachineRaceDiagram />
+
+<Technical>
+
+### State machine của một ghế
+
+`available → held (có TTL) → booked`, hoặc `held → available` (hết hạn/huỷ). Không có đường tắt từ `available` thẳng sang `booked` — luôn phải qua `held` để tách bước "giữ chỗ" (nhanh, atomic) khỏi bước "thanh toán" (chậm, có thể lỗi, gọi bên ngoài).
+
+### Vì sao check-then-write luôn hỏng
+
+```text
+T1: SELECT status FROM seats WHERE id=42;   -- 'available'
+T2: SELECT status FROM seats WHERE id=42;   -- 'available' (T1 chưa ghi kịp)
+T1: UPDATE seats SET status='booked' WHERE id=42;   -- OK
+T2: UPDATE seats SET status='booked' WHERE id=42;   -- OK, ghi đè — 2 vé / 1 ghế
+```
+
+Câu UPDATE của T2 không có điều kiện nào tham chiếu tới trạng thái T2 đã đọc, nên nó thành công dù dữ liệu đã đổi. Đây là **lost update** — đúng bài đã học ở SD05, chỉ đổi tên biến từ "số dư tài khoản" thành "trạng thái ghế".
+
+### Ba cách làm atomic
+
+```sql title="Cách 1: atomic conditional update (khuyên dùng khi logic đơn giản)"
+UPDATE seats
+SET status = 'held', held_by = :userId, hold_expires_at = now() + interval '2 minutes'
+WHERE id = :seatId AND status = 'available';
+-- rowCount = 1  → giữ thành công
+-- rowCount = 0  → đã có người giữ trước, trả 409 ngay, KHÔNG cần chờ
+```
+
+```sql title="Cách 2: unique constraint chặn ở tầng schema"
+CREATE TABLE bookings (
+  seat_id    int PRIMARY KEY REFERENCES seats(id), -- 1 seat_id chỉ xuất hiện đúng 1 lần
+  user_id    text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+-- INSERT trùng seat_id sẽ bị Postgres từ chối bằng lỗi unique_violation — không cần transaction phức tạp
+```
+
+```sql title="Cách 3: SELECT ... FOR UPDATE khi cần đọc nhiều điều kiện trước khi quyết định"
+BEGIN;
+SELECT * FROM seats WHERE id = :seatId FOR UPDATE;
+-- áp thêm rule nghiệp vụ (hạng vé, giới hạn mua/người...) rồi mới UPDATE
+UPDATE seats SET status = 'held', held_by = :userId, hold_expires_at = now() + interval '2 minutes' WHERE id = :seatId;
+COMMIT;
+```
+
+Cách 1 nhanh nhất (không giữ lock chủ động, không có hàng người chờ) và đủ dùng khi logic gói được trong một câu SQL — giống bài học "atomic update cho luồng trừ tiền" ở SD05.
+
+### TTL sweeper: đừng khoá ghế vĩnh viễn
+
+Người dùng bỏ ngang giữa chừng (đóng tab, hết pin, đổi ý) là chuyện bình thường, không phải lỗi. Một job nền chạy định kỳ:
+
+```sql title="Trả lại ghế bị bỏ ngang"
+UPDATE seats
+SET status = 'available', held_by = NULL, hold_expires_at = NULL
+WHERE status = 'held' AND hold_expires_at < now();
+```
+
+Chạy job này mỗi vài giây (hoặc dùng cơ chế hết hạn kiểu Redis `EXPIRE` + keyspace notification nếu muốn phản ứng ngay lập tức thay vì chờ tới lượt quét).
+
+### Virtual waiting room: vấn đề khác, không thay thế atomic update
+
+Atomic update giải quyết đúng đắn cho **những request đã tới được database**. Nhưng nếu 2 triệu người cùng gửi request trong 10 giây, chính tầng app/database có thể sập trước khi kịp xử lý bất kỳ ai — connection pool cạn, CPU nghẽn vì phần lớn request rồi cũng sẽ nhận "hết vé".
+
+Virtual waiting room chặn phía trước: cấp một token/vé số theo thứ tự tới (hoặc ngẫu nhiên để công bằng), chỉ admit một lượng nhỏ vào tầng booking mỗi giây — vừa với khả năng xử lý thật. Người trong hàng đợi thấy "vị trí xếp hàng: 145.203", không tạo tải lên booking service.
+
+```text title="Luồng tổng quát"
+Client → Waiting room (Redis: hàng đợi + token có TTL)
+       → khi tới lượt: nhận token ngắn hạn, redirect sang Booking service
+       → Booking service: atomic hold (như trên) + confirm sau thanh toán
+```
+
+### Trade-off
+
+| Lựa chọn chống double-booking | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Atomic conditional update | Nhanh nhất, không giữ lock chủ động | Chỉ khi logic gói vừa 1 câu SQL | Giữ chỗ đơn giản theo trạng thái |
+| Unique constraint | Đơn giản, database tự đảm bảo | Cần mô hình dữ liệu phù hợp (1 dòng = 1 lần chiếm) | Đặt chỗ 1-1 rõ ràng (ghế–booking) |
+| `SELECT ... FOR UPDATE` | Linh hoạt khi cần nhiều rule trước khi quyết định | Giữ lock, có thể nghẽn dưới tải cao nếu transaction dài | Logic phức tạp, nhiều điều kiện nghiệp vụ |
+| Virtual waiting room | Bảo vệ hệ thống khỏi sập ở tầng trước | Thêm độ trễ, thêm thành phần (hàng đợi) phải vận hành | Traffic đột biến vượt xa công suất bình thường (flash sale) |
+
+**Khi nào đổi ý:** nếu tỉ lệ request nhận 409 (đã bị giữ) quá cao trong điều kiện tải bình thường (không phải flash sale), có thể do TTL quá dài giữ ghế lâu không cần thiết — rút ngắn TTL hoặc thêm hiển thị đếm ngược cho người dùng để họ chủ động huỷ sớm.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Tái hiện double-booking rồi sửa"
+  prompt="$"
+  commands={[
+    { comment: "k6: 1000 VU cùng gọi endpoint buggy tranh 10 ghế", command: "k6 run --vus 1000 --iterations 1000 scripts/book-naive.js", output: "checks.........: 100.00%\nhttp_req_duration..: avg=12ms" },
+    { comment: "Đếm số booking thực tế được tạo cho event_id=1", command: "docker compose exec postgres psql -U app -d app -c \"SELECT count(*) FROM bookings WHERE event_id = 1;\"", output: " count\n-------\n    37\n(1 row)" },
+    { comment: "37 booking cho 10 ghế — double-booking rõ ràng. Chuyển sang endpoint atomic và chạy lại", command: "k6 run --vus 1000 --iterations 1000 scripts/book-atomic.js", output: "checks.........: 100.00%\nhttp_req_duration..: avg=9ms" },
+    { comment: "Đếm lại — đúng 10, không hơn không kém", command: "docker compose exec postgres psql -U app -d app -c \"SELECT count(*) FROM seats WHERE status = 'booked' AND event_id = 1;\"", output: " count\n-------\n    10\n(1 row)" },
+  ]}
+/>
+
+<Callout type="mistake" title="'Thêm kiểm tra ở app cho chắc' sau khi phát hiện bug">
+
+Thêm một lần `SELECT` kiểm tra nữa ở tầng app trước khi `UPDATE` không thu hẹp race window — hai request vẫn có thể chen vào giữa lúc kiểm tra và ghi. Phải chuyển điều kiện vào chính câu ghi (`WHERE status = 'available'`) để database đảm bảo tính atomic, không phải thêm bước kiểm tra ở nơi vốn đã không atomic.
+
+</Callout>
+
+<Callout type="warning">
+
+Giữ chỗ mà không có TTL (hoặc TTL quá dài, vd 1 giờ) trong một flash sale sẽ khoá chết phần lớn ghế vào tay những người không bao giờ quay lại thanh toán — cạn vé ảo dù vé thật vẫn còn.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+"Thiết kế hệ thống bán vé chống double-booking" là câu hỏi kinh điển. Câu trả lời mạnh đi đủ 3 lớp: **(1)** atomic conditional update hoặc unique constraint cho bước giữ chỗ, **(2)** TTL + sweeper để không khoá chết ghế bị bỏ ngang, **(3)** virtual waiting room nếu đề bài có traffic đột biến — và giải thích rõ đây là **hai vấn đề khác nhau** (đúng đắn dữ liệu vs khả năng chịu tải), không phải một giải pháp thay thế giải pháp kia.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "double-booking", meaning: "Hai (hay nhiều) người cùng được xác nhận sở hữu một tài nguyên có hạn do check-then-write không atomic." },
+    { term: "seat hold / giữ chỗ", meaning: "Trạng thái tạm thời giữ tài nguyên cho một người trong lúc họ hoàn tất thanh toán." },
+    { term: "TTL sweeper", meaning: "Job nền quét và trả lại tài nguyên bị giữ quá hạn mà không được xác nhận." },
+    { term: "atomic conditional update", meaning: "UPDATE có điều kiện theo trạng thái hiện tại, thành công/thất bại tuỳ đúng một điều kiện đó tại thời điểm ghi." },
+    { term: "virtual waiting room", meaning: "Hàng đợi ảo chặn phía trước hệ thống, admit dần request để tránh sập dưới traffic đột biến." },
+    { term: "flash sale / traffic đột biến", meaning: "Lượng request tăng vọt trong thời gian rất ngắn, vượt xa công suất xử lý bình thường." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hệ thống dùng `UPDATE seats SET status='held', hold_expires_at=now()+120 WHERE id=:id AND status='available'`. Test tải cho thấy đúng 10 request thành công trên 10 ghế — không double-booking. Nhưng 2 giờ sau, một nửa số ghế 'held' vẫn chưa ai thanh toán và không ai đặt được nữa dù sự kiện còn xa ngày diễn ra. Vấn đề?"
+  options={[
+    "Atomic update bị lỗi, cần chuyển sang FOR UPDATE",
+    "Không có TTL sweeper trả ghế 'held' quá hạn về 'available' — người bỏ ngang đang khoá chết ghế",
+    "Cần thêm virtual waiting room",
+    "Database bị deadlock",
+  ]}
+  answerIndex={1}
+  explanation="Atomic update chống double-booking đúng như thiết kế — vấn đề khác: thiếu cơ chế thu hồi ghế bị giữ nhưng không được xác nhận (TTL đã đặt nhưng không có job nào quét và trả lại). Waiting room không liên quan tới việc ghế đã held bị kẹt."
+/>

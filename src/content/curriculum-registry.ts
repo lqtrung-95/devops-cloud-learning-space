@@ -33,6 +33,7 @@ import { sd14CaseUrlShortenerRateLimiterModule } from "./modules/sd14-case-url-s
 import { sd15CaseNewsFeedNotificationModule } from "./modules/sd15-case-news-feed-notification/module-meta";
 import { sd16CaseChatPresenceModule } from "./modules/sd16-case-chat-presence/module-meta";
 import { sd17CaseVideoStreamingFileSyncModule } from "./modules/sd17-case-video-streaming-file-sync/module-meta";
+import { sd18CaseProximityBookingPaymentModule } from "./modules/sd18-case-proximity-booking-payment/module-meta";
 import { sd19MockInterviewCapstoneModule } from "./modules/sd19-mock-interview-capstone/module-meta";
 
 /** All modules of every course (order within a course comes from `module.order`). Add modules after they pass `pnpm validate:module`. */
@@ -71,5 +72,6 @@ export const curriculumModules: ModuleDefinition[] = [
   sd15CaseNewsFeedNotificationModule,
   sd16CaseChatPresenceModule,
   sd17CaseVideoStreamingFileSyncModule,
+  sd18CaseProximityBookingPaymentModule,
   sd19MockInterviewCapstoneModule,
 ];

@@ -1,0 +1,174 @@
+import { PaymentIdempotencyDedupDiagram } from "../diagrams/payment-idempotency-dedup-diagram";
+import { DoubleEntryLedgerDiagram } from "../diagrams/double-entry-ledger-diagram";
+
+<Eli5 title="Biên lai đóng dấu 1 lần, và cuốn sổ kế toán ghi hai cột" emoji="💳">
+
+Bạn chuyển khoản, mạng lag, không thấy thông báo thành công nên bấm chuyển lại. Nếu ngân hàng không có cách nào biết "đây là cùng một lệnh chuyển", họ sẽ chuyển tiền **hai lần**. Cách ngân hàng thật tránh chuyện này: mỗi lệnh chuyển có một **mã biên lai** (idempotency key) bạn giữ nguyên khi gửi lại; giao dịch viên nhìn thấy mã cũ thì trả lại đúng kết quả cũ, không làm lại từ đầu.
+
+Điều quan trọng: giao dịch viên phải **vừa nhìn thấy mã vừa đóng dấu "đã xử lý" trong cùng một động tác** — nếu tách thành "nhìn mã" rồi mới "đóng dấu" ở hai bước riêng, hai người đến cùng lúc vẫn có thể cùng lọt qua bước nhìn mã trước khi ai kịp đóng dấu.
+
+Còn sổ kế toán: mỗi khi tiền di chuyển, kế toán ghi **hai dòng** — "trừ ở đâu" và "cộng ở đâu" — không bao giờ ghi một dòng lẻ. Cuối ngày cộng hết cột trừ và cột cộng, nếu hai tổng không bằng nhau, chắc chắn có chỗ ghi thiếu hoặc ghi sai, không cần dò từng trang.
+
+</Eli5>
+
+Đây là nơi hai chủ đề trước (proximity, booking) hội tụ về cùng một nguyên tắc: **thao tác phải atomic dưới điều kiện tranh chấp** — chỉ khác đối tượng tranh chấp bây giờ là tiền, nên cái giá của một lỗi cao hơn hẳn.
+
+<PaymentIdempotencyDedupDiagram />
+
+<Technical>
+
+### Vì sao "exactly-once" ở đây không tự nhiên có
+
+Gọi PSP (payment service provider — Stripe, VNPay…) là một lời gọi mạng: request có thể tới rồi charge thành công, nhưng response bị mất trên đường về. Client không phân biệt được "thất bại thật" với "thành công nhưng mất response" — và retry là hành vi hợp lý ở cả hai trường hợp. Đây chính là vấn đề **at-least-once + cần idempotency** đã học ở SD07, áp dụng cho side effect **ngoài** hệ thống của bạn (gọi PSP), nơi không có transaction chung để đảm bảo.
+
+### Idempotency key phải atomic với việc ghi ý định charge
+
+```sql title="Bảng lưu ý định & kết quả charge"
+CREATE TABLE payment_intents (
+  idempotency_key text PRIMARY KEY,   -- do CLIENT sinh, giữ nguyên khi retry
+  order_id        text NOT NULL,
+  amount_cents    int NOT NULL,
+  status          text NOT NULL DEFAULT 'processing', -- processing | completed | failed
+  psp_charge_id   text,
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+```
+
+```ts title="src/payments/charge.ts — check + ghi ý định trong cùng transaction"
+export async function charge(pool: Pool, key: string, orderId: string, amountCents: number) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // INSERT ... ON CONFLICT atomic: hoặc mình là người đầu tiên, hoặc thấy ngay bản ghi đã có.
+    const { rows } = await client.query(
+      `INSERT INTO payment_intents (idempotency_key, order_id, amount_cents)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (idempotency_key) DO NOTHING
+       RETURNING status`,
+      [key, orderId, amountCents],
+    );
+    await client.query("COMMIT");
+
+    if (rows.length === 0) {
+      // Key đã tồn tại — đọc lại trạng thái, KHÔNG gọi PSP nữa.
+      const existing = await pool.query("SELECT status, psp_charge_id FROM payment_intents WHERE idempotency_key = $1", [key]);
+      const row = existing.rows[0] as { status: string; psp_charge_id: string | null };
+      if (row.status === "processing") throw new ConflictError("request đang xử lý, thử lại sau"); // 409/425
+      return row; // 'completed' hoặc 'failed' — trả thẳng kết quả cũ
+    }
+
+    // Ta là người đầu tiên ghi được key này — mới được phép gọi PSP thật.
+    const pspResult = await callPsp({ orderId, amountCents });
+    await pool.query("UPDATE payment_intents SET status = $1, psp_charge_id = $2 WHERE idempotency_key = $3", [
+      pspResult.ok ? "completed" : "failed",
+      pspResult.chargeId,
+      key,
+    ]);
+    return { status: pspResult.ok ? "completed" : "failed", psp_charge_id: pspResult.chargeId };
+  } finally {
+    client.release();
+  }
+}
+```
+
+Điểm mấu chốt: `INSERT ... ON CONFLICT DO NOTHING` là **một câu lệnh atomic** — hai request cùng key gửi đồng thời, chỉ một request nhận `RETURNING` có dòng, request kia nhận tập rỗng ngay lập tức và biết mình phải chờ/đọc kết quả cũ, **không ai chạm tới PSP hai lần**. Nếu tách thành `SELECT` rồi mới `INSERT` (hai câu riêng), khoảng trống giữa hai câu là race window y hệt double-booking ở bài trước.
+
+### Webhook cũng cần idempotency
+
+PSP thường gọi ngược webhook để xác nhận (`charge.succeeded`) — webhook có thể được gửi lại (PSP tự retry khi không nhận ACK). Dedup theo `event_id` của PSP bằng đúng kỹ thuật "idempotent consumer" đã học ở SD07 (bảng dedup, unique constraint, ghi trong cùng transaction với việc cập nhật trạng thái đơn hàng).
+
+</Technical>
+
+<DoubleEntryLedgerDiagram />
+
+<Technical title="Double-entry ledger & reconciliation">
+
+Một dòng `payments(amount, status)` trả lời được "đã thu bao nhiêu" nhưng không trả lời được "tiền đó hiện đang ở đâu" (đã trả tài xế chưa? đã ghi doanh thu chưa?) và không tự phát hiện được sai sót. **Double-entry**: mỗi giao dịch được ghi thành ít nhất một cặp dòng Nợ (debit)/Có (credit) trên các tài khoản khác nhau, và **tổng Nợ luôn bằng tổng Có** theo cấu trúc.
+
+```sql title="Bảng ledger tối giản"
+CREATE TABLE ledger_entries (
+  id              bigserial PRIMARY KEY,
+  transaction_id  uuid NOT NULL,       -- nhóm các dòng thuộc cùng 1 giao dịch nghiệp vụ
+  account         text NOT NULL,       -- vd 'rider_wallet:123', 'platform_clearing', 'driver_payable:456'
+  direction       text NOT NULL CHECK (direction IN ('debit', 'credit')),
+  amount_cents    bigint NOT NULL CHECK (amount_cents > 0),
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+```
+
+Với một chuyến $20 (chia $16 cho tài xế, $4 phí nền tảng), giao dịch ghi 3 cặp dòng đi qua tài khoản trung gian `platform_clearing`. Đối soát (reconciliation) hằng ngày: cộng tất cả dòng của mỗi tài khoản, tài khoản trung gian phải **về 0** nếu mọi giao dịch đã được xử lý trọn vẹn — khác 0 nghĩa là có dòng bị thiếu hoặc một job trung gian (chia tiền tài xế, ghi phí) chưa chạy xong.
+
+Reconciliation với PSP đi xa hơn: so sánh tổng tiền ghi trong ledger nội bộ với báo cáo settlement PSP gửi về (thường trễ 1–2 ngày) — chênh lệch là dấu hiệu của charge bị lỗi, hoàn tiền chưa ghi sổ, hoặc phí PSP tính khác dự kiến.
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Idempotency key + INSERT ON CONFLICT | Atomic thật sự, đơn giản với Postgres | Cần client sinh và giữ key ổn định qua các lần retry | Mọi API có side effect không tự nhiên idempotent (charge, gửi tiền) |
+| Chỉ dựa vào "PSP tự phát hiện trùng" | Không cần code thêm | PSP dedup theo heuristic riêng (thời gian, số tiền, thẻ) — không đảm bảo, không kiểm soát được | Không nên dùng làm lớp phòng vệ duy nhất |
+| Một dòng `payments` đơn giản | Nhanh để bắt đầu | Không tự phát hiện sai sót, khó audit, khó biết tiền "đang ở đâu" | Prototype, chưa có yêu cầu đối soát/audit |
+| Double-entry ledger | Tự cân bằng, audit trail đầy đủ, đối soát bằng phép cộng | Thêm độ phức tạp thiết kế schema và tư duy kế toán | Mọi hệ thống có tiền thật đi qua nhiều bên (rider, tài xế, nền tảng, PSP) |
+
+**Khi nào đổi ý:** nếu ledger chỉ phục vụ nội bộ, một số hệ thống trẻ trì hoãn double-entry đầy đủ tới khi có yêu cầu audit/kế toán thật — nhưng nợ kỹ thuật này trả giá đắt hơn nhiều nếu để tới khi đã có hàng triệu giao dịch cần backfill.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Idempotency key trong sd-playground"
+  prompt="$"
+  commands={[
+    { comment: "Gửi charge lần 1", command: "curl -s -X POST localhost:8080/payments/charge -H 'Idempotency-Key: req-abc123' -d '{\"orderId\":\"o1\",\"amountCents\":2000}'", output: "{\"status\":\"completed\",\"psp_charge_id\":\"ch_9f2\"}" },
+    { comment: "Client tưởng timeout, gửi lại y hệt key", command: "curl -s -X POST localhost:8080/payments/charge -H 'Idempotency-Key: req-abc123' -d '{\"orderId\":\"o1\",\"amountCents\":2000}'", output: "{\"status\":\"completed\",\"psp_charge_id\":\"ch_9f2\"}" },
+    { comment: "Xác nhận PSP chỉ nhận đúng 1 lệnh charge cho key này", command: "docker compose exec postgres psql -U app -d app -c \"SELECT count(*) FROM payment_intents WHERE idempotency_key='req-abc123';\"", output: " count\n-------\n     1\n(1 row)" },
+    { comment: "Đối soát: platform_clearing phải về 0 sau khi chia xong", command: "docker compose exec postgres psql -U app -d app -c \"SELECT sum(CASE WHEN direction='credit' THEN amount_cents ELSE -amount_cents END) FROM ledger_entries WHERE account='platform_clearing';\"", output: " sum\n-----\n   0\n(1 row)" },
+  ]}
+/>
+
+<Callout type="mistake" title="Sinh idempotency key mới mỗi lần retry">
+
+Nếu client tự sinh key mới (vd `uuid()` mỗi request thay vì giữ nguyên qua các lần thử) thì cơ chế này vô nghĩa — server luôn thấy key "mới", vẫn charge lại. Key phải được sinh **một lần** cho một hành động của người dùng (vd khi bấm nút "Thanh toán") và giữ nguyên nếu phải gửi lại.
+
+</Callout>
+
+<Callout type="warning">
+
+Trạng thái `processing` (khi bản ghi vừa được insert, PSP chưa trả lời) phải chặn request trùng đến giữa lúc đó bằng cách trả lỗi tạm thời (409/425 — thử lại sau), không phải để nó đi tiếp gọi PSP song song.
+
+</Callout>
+
+<Callout type="cost">
+
+Nhiều PSP tính phí theo mỗi lần gọi API charge, kể cả lần thất bại — double charge không chỉ là rủi ro hoàn tiền/khiếu nại mà còn tốn thêm phí giao dịch thật.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu "làm sao đảm bảo không trừ tiền 2 lần" cần đi đúng ba lớp: **(1)** idempotency key do client giữ nguyên qua retry, **(2)** kiểm tra và ghi ý định charge phải **atomic** (một câu SQL, không phải SELECT rồi INSERT riêng), **(3)** double-entry ledger để mọi sai sót (nếu có) lộ ra qua đối soát thay vì âm thầm mất tiền. Nhắc thêm: idempotency chỉ đúng khi key được sinh và giữ ở phía client (hoặc gateway) một cách nhất quán — server không tự đoán được request nào "giống nhau về mặt nghiệp vụ".
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "idempotency key", meaning: "Mã ổn định do client sinh một lần, giữ nguyên qua các lần retry, để server nhận diện request trùng." },
+    { term: "PSP (payment service provider)", meaning: "Bên xử lý thanh toán thật (Stripe, VNPay…) mà hệ thống của bạn gọi tới." },
+    { term: "check-and-set atomic", meaning: "Kiểm tra và ghi trong cùng một thao tác không thể chia nhỏ, vd INSERT ... ON CONFLICT." },
+    { term: "double-entry ledger", meaning: "Sổ cái ghi mỗi giao dịch thành cặp Nợ/Có trên các tài khoản, luôn cân bằng theo cấu trúc." },
+    { term: "reconciliation / đối soát", meaning: "Quá trình so sánh số liệu nội bộ với nguồn khác (PSP, tài khoản trung gian) để phát hiện sai lệch." },
+    { term: "webhook idempotency", meaning: "Dedup sự kiện PSP gửi lại (retry) bằng event_id, cùng kỹ thuật idempotent consumer của message queue." },
+  ]}
+/>
+
+<QuickCheck
+  question="Server check idempotency key bằng `SELECT ... WHERE key = :k`, nếu không thấy thì gọi PSP rồi mới `INSERT`. Trong test tải, gửi 50 request cùng key gần như đồng thời, kết quả có 3 lần charge thay vì 1. Nguyên nhân và cách sửa đúng?"
+  options={[
+    "PSP xử lý sai — cần đổi PSP khác",
+    "SELECT rồi INSERT là hai câu riêng biệt, tạo race window cho nhiều request cùng thấy 'chưa có key' và cùng gọi PSP; sửa bằng INSERT (unique constraint) atomic trước khi gọi PSP, không phải SELECT trước",
+    "50 request là quá tải, cần thêm rate limit là đủ",
+    "Cần tăng timeout của kết nối tới PSP",
+  ]}
+  answerIndex={1}
+  explanation="Đây là lost update kiểu check-then-act, y hệt double-booking: nhiều request cùng vượt qua bước kiểm tra trước khi bất kỳ ai ghi xong. Rate limit làm giảm số request đồng thời nhưng không triệt tiêu race — chỉ INSERT atomic (unique constraint) mới đảm bảo đúng một request được phép gọi PSP."
+/>

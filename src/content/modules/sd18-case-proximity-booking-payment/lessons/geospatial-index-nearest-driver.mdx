@@ -1,0 +1,124 @@
+import { GeoIndexComparisonDiagram } from "../diagrams/geo-index-comparison-diagram";
+
+<Eli5 title="Tìm nhà hàng gần nhất giống tra bản đồ giấy chia ô, không phải đọc hết cuốn sổ địa chỉ" emoji="🗺️">
+
+Bạn có một cuốn sổ 1 triệu địa chỉ và muốn tìm 3 quán ăn gần nhà nhất. Cách chậm: lật từng trang, đo khoảng cách từng quán — **quét toàn bộ**. Cách nhanh: bản đồ được chia sẵn thành các ô vuông đánh mã (A1, A2, B1…), bạn chỉ cần mở đúng ô chứa nhà mình. Đó là ý tưởng của **geohash**.
+
+Nhưng bản đồ chia ô có một lỗi kinh điển: quán ăn cách nhà bạn 10 mét nhưng nằm ngay bên kia đường biên ô — nó thuộc ô B2 trong khi nhà bạn ở ô B1. Nếu chỉ mở đúng 1 ô, bạn bỏ lỡ quán gần nhất. Phải mở luôn 8 ô xung quanh (khối 3×3) thì mới chắc chắn không bỏ sót ai ở gần biên.
+
+Có cách hay hơn: một cuốn "mục lục không gian" (GiST index trong PostGIS, hay H3 của Uber) tự biết nhảy thẳng tới vùng bán kính bạn cần, không quan tâm biên ô cứng nhắc — giống thủ thư giỏi chỉ đúng kệ sách thay vì đưa bạn cả cuốn danh mục.
+
+</Eli5>
+
+Đây là bài toán mở đầu của mọi hệ thống kiểu Uber/Grab/Yelp: **"tìm K điểm gần nhất trong hàng triệu điểm, cập nhật liên tục, trả lời trong vài chục mili-giây"**. Không giải quyết đúng bài này thì mọi thứ phía sau (matching, ETA, giá cước) đều xây trên nền cát.
+
+**Requirements nhanh:** functional — `GET /drivers/nearby?lat&lng&radius` trả về K tài xế gần nhất đang rảnh; non-functional — p99 < 100ms, chịu được hàng trăm nghìn tài xế cập nhật vị trí mỗi vài giây. **Ước lượng:** một thành phố lớn có thể có 200k–1M tài xế hoạt động cùng lúc; mỗi lượt tìm tài xế phải xong trong một request HTTP, không có thời gian cho một lần quét toàn bộ bảng.
+
+<GeoIndexComparisonDiagram />
+
+<Technical>
+
+### Ba cách biểu diễn dữ liệu không gian
+
+**1. Geohash** — mã hoá `(lat, lng)` thành một chuỗi ký tự bằng cách chia đôi liên tiếp không gian theo vĩ độ/kinh độ xen kẽ. Chuỗi càng dài, ô càng nhỏ (độ chính xác càng cao). Hai điểm gần nhau *thường* có geohash chung tiền tố — nhưng không phải luôn luôn, vì lưới có **biên cứng**: điểm cách nhau vài mét có thể rơi vào hai ô khác nhau nếu nằm sát biên. Vì vậy luôn phải query thêm 8 ô lân cận, không chỉ ô chứa điểm truy vấn.
+
+**2. Quadtree** — chia không gian thành 4 ô, ô nào có nhiều điểm quá thì chia tiếp thành 4 ô con, đệ quy. Ưu điểm: ô tự động nhỏ ở vùng đông đúc (trung tâm thành phố) và lớn ở vùng thưa (ngoại ô) — không lãng phí như geohash lưới đều. Nhược điểm: cấu trúc động, cập nhật khi điểm di chuyển liên tục tốn công hơn.
+
+**3. H3 (Uber)** — chia bề mặt Trái Đất thành lưới **lục giác** phân cấp theo *resolution* (độ phân giải), từ ô ~4,000 km² (res 0) tới ô ~1m² (res 15). Lục giác có 6 cạnh đều nhau nên "hàng xóm" của một ô luôn có khoảng cách gần bằng nhau tới tâm — đỡ lệch hơn ô vuông (ô vuông có hàng xóm cạnh gần hơn hàng xóm chéo). Vẫn cần kiểm tra vòng lục giác lân cận (`kRing`) như geohash, chỉ là hình học đều hơn.
+
+### PostGIS: index không cần tự làm
+
+PostGIS thêm kiểu dữ liệu `geometry`/`geography` và index **GiST** (Generalized Search Tree) cho Postgres — bạn không phải tự cài geohash/quadtree.
+
+```sql title="Tạo bảng và index không gian"
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+CREATE TABLE driver_locations (
+  driver_id  text PRIMARY KEY,
+  geom       geography(Point, 4326) NOT NULL, -- SRID 4326 = WGS84 (lat/lng thường dùng)
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX driver_locations_geom_gist ON driver_locations USING GIST (geom);
+```
+
+```sql title="Tìm 10 tài xế trong bán kính 2km, gần nhất trước"
+SELECT driver_id, ST_Distance(geom, :point) AS meters
+FROM driver_locations
+WHERE ST_DWithin(geom, :point, 2000)   -- lọc thô bằng index trước (mét, vì kiểu geography)
+ORDER BY geom <-> :point               -- toán tử KNN, tận dụng GiST
+LIMIT 10;
+```
+
+`ST_DWithin` dùng GiST để chỉ động tới các trang chứa điểm trong bán kính — không quét toàn bảng. `<->` là toán tử "khoảng cách gần nhất" giúp Postgres duyệt index theo đúng thứ tự gần → xa (KNN search), nên `ORDER BY ... LIMIT k` không cần sort toàn bộ tập kết quả.
+
+### Khi bán kính đầu chưa đủ điểm
+
+Vùng thưa tài xế có thể không có ai trong 2km. Chiến lược thực tế: query bán kính nhỏ trước, nếu chưa đủ K kết quả thì tăng bán kính (thường ×2–3) và query lại — thay vì luôn quét bán kính lớn "cho chắc" (tốn hơn ở vùng đông).
+
+### Trade-off
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Geohash (tự làm, lưu trong Redis/Postgres) | Đơn giản, dùng được index B-tree/hash thường có sẵn | Biên cứng — bắt buộc query ô lân cận; ô cố định không hợp mật độ không đều | Hệ thống nhỏ/vừa, muốn kiểm soát toàn bộ logic |
+| Quadtree | Ô tự thích nghi theo mật độ điểm | Cấu trúc động, cập nhật khi điểm di chuyển tốn công hơn geohash tĩnh | Phân bố điểm rất không đều (trung tâm vs ngoại ô) |
+| H3 (Uber) | Lục giác đều, nhiều resolution, thư viện tốt, hệ sinh thái lớn | Vẫn phải tự quản lý index lưu trữ (Redis/DB); học thêm khái niệm mới | Cần chuẩn hoá không gian dùng chung nhiều service, nhiều loại truy vấn (không chỉ nearest) |
+| PostGIS + GiST | Không tự cài thuật toán; SQL quen thuộc; hỗ trợ nhiều phép toán không gian (polygon, route…) | Cần cài extension, học kiểu `geometry`/`geography` và các hàm `ST_*` | Dữ liệu đã ở Postgres, muốn join trực tiếp với các bảng nghiệp vụ khác |
+
+**Khi nào đổi ý:** nếu tần suất ghi vị trí quá cao khiến GiST index bị cập nhật liên tục làm chậm cả đọc lẫn ghi (bài học tiếp theo), tách "vị trí mới nhất" sang store riêng (Redis GEO — cũng dùng geohash nội bộ) và chỉ giữ PostGIS cho các truy vấn không gian phức tạp hơn (polygon vùng phục vụ, route).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Bật PostGIS và thử ST_DWithin trong sd-playground"
+  prompt="app=#"
+  commands={[
+    { comment: "Bật extension PostGIS trong Postgres của playground", command: "docker compose exec postgres psql -U app -d app -c \"CREATE EXTENSION IF NOT EXISTS postgis;\"", output: "CREATE EXTENSION" },
+    { comment: "Tạo bảng có cột geography và index GiST", command: "docker compose exec postgres psql -U app -d app -f sql/driver-locations.sql", output: "CREATE TABLE\nCREATE INDEX" },
+    { comment: "Query 10 tài xế gần một điểm trong bán kính 2km", command: "docker compose exec postgres psql -U app -d app -c \"SELECT driver_id, ST_Distance(geom, ST_MakePoint(106.7,10.78)::geography) AS m FROM driver_locations WHERE ST_DWithin(geom, ST_MakePoint(106.7,10.78)::geography, 2000) ORDER BY geom <-> ST_MakePoint(106.7,10.78)::geography LIMIT 10;\"", output: " driver_id | m\n-----------+-------\n d_4821    | 184.2\n d_1093    | 402.7\n ... (8 more rows)" },
+  ]}
+/>
+
+<Callout type="mistake" title="Quên index GiST rồi kết luận PostGIS chậm">
+
+`ST_DWithin`/`ST_Distance` vẫn chạy đúng mà không có index — chỉ là chậm (sequential scan, tính khoảng cách cho mọi dòng). Nhiều người thử PostGIS trên bảng chưa có `CREATE INDEX ... USING GIST`, thấy chậm rồi kết luận "PostGIS không hợp quy mô lớn". Luôn kiểm tra `EXPLAIN ANALYZE` có `Index Scan` trước khi so sánh hiệu năng.
+
+</Callout>
+
+<Callout type="warning">
+
+`geometry` (phẳng, đơn vị độ) và `geography` (hình cầu, đơn vị mét) tính khoảng cách khác nhau. Dùng `geography` cho khoảng cách thực tế trên mặt đất (mét/km) — `geometry` nhanh hơn nhưng sai lệch khi vùng phủ rộng vì coi Trái Đất là phẳng.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+Câu "thiết kế tính năng tìm tài xế/cửa hàng gần nhất" thường thử xem bạn có biết **vì sao không quét toàn bộ bảng** không. Câu trả lời mạnh: nêu được ít nhất 2 trong 3 cấu trúc (geohash/quadtree/H3), giải thích đúng **vấn đề biên cứng của geohash** (phải check ô lân cận), và biết PostGIS + GiST index là lựa chọn thực tế nếu dữ liệu đã ở Postgres — kèm câu hỏi ngược "tần suất ghi vị trí cỡ nào?" vì điều đó quyết định có cần tách store riêng hay không (bài tiếp theo).
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "geohash", meaning: "Mã hoá toạ độ thành chuỗi ký tự theo lưới ô; hai điểm gần nhau thường chung tiền tố nhưng có biên cứng." },
+    { term: "quadtree", meaning: "Cấu trúc chia không gian thành 4 ô đệ quy, ô nhỏ hơn ở vùng mật độ điểm cao." },
+    { term: "H3", meaning: "Hệ lưới lục giác phân cấp theo resolution của Uber, dùng cho index không gian và phân tích." },
+    { term: "GiST index", meaning: "Generalized Search Tree — cấu trúc index của PostgreSQL hỗ trợ tra cứu không gian (và nhiều kiểu dữ liệu khác)." },
+    { term: "ST_DWithin", meaning: "Hàm PostGIS lọc các điểm trong một bán kính, tận dụng được GiST index." },
+    { term: "KNN search (k nearest neighbor)", meaning: "Tìm k điểm gần nhất; toán tử `<->` của PostGIS cho phép GiST duyệt theo đúng thứ tự gần → xa." },
+    { term: "geography vs geometry", meaning: "geography tính khoảng cách trên mặt cầu (mét), geometry tính trên mặt phẳng (đơn vị toạ độ) — nhanh hơn nhưng sai lệch ở vùng rộng." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một bảng 1 triệu điểm dùng geohash 6 ký tự (ô ~1.2km × 0.6km), chỉ query đúng 1 ô chứa điểm truy vấn. Kết quả bị thiếu một điểm cách 50m. Cách sửa đúng và rẻ nhất?"
+  options={[
+    "Chuyển toàn bộ sang PostGIS ngay lập tức",
+    "Query thêm 8 ô lân cận (khối 3×3 quanh ô hiện tại) trước khi tính khoảng cách chính xác",
+    "Tăng độ dài geohash lên 9 ký tự",
+    "Chấp nhận sai số vì 50m là không đáng kể",
+  ]}
+  answerIndex={1}
+  explanation="Vấn đề là biên cứng của lưới geohash, không phải độ chính xác của geohash. Query thêm 8 ô lân cận là cách rẻ và đúng gốc rễ nhất; tăng độ dài geohash chỉ làm ô nhỏ hơn, biên nhiều hơn, tình huống bỏ sót còn dễ xảy ra hơn."
+/>

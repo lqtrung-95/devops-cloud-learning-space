@@ -1,0 +1,116 @@
+import { DriverMatchingRadiusDiagram } from "../diagrams/driver-matching-radius-diagram";
+
+<Eli5 title="Sổ trực ban của bến taxi, không phải sổ cái kế toán" emoji="🚕">
+
+Bến taxi có một tấm bảng ghi "xe nào đang ở đâu" — nhân viên trực chỉ cần xoá và ghi lại vị trí mới nhất mỗi khi tài xế báo về, không cần giữ lại lịch sử "xe A lúc 10:00 ở đâu, lúc 10:03 ở đâu". Nếu bắt nhân viên đó vừa cập nhật bảng vừa lật sổ kế toán dày cộp để tra cứu thì việc gì cũng chậm lại.
+
+Khi khách gọi xe, nhân viên nhìn bảng tìm xe gần nhất trong khu vực gần. Nếu khu đó vắng xe, họ mở rộng ra khu xa hơn, chờ thêm chút — chứ không đứng đó bảo "không có xe" ngay khi khu gần nhất trống.
+
+</Eli5>
+
+Bài trước giải quyết "tìm ai gần ai" tại một thời điểm. Bài này là hai vấn đề tiếp theo khi hệ thống chạy thật: **hàng trăm nghìn tài xế báo vị trí liên tục** (write-heavy) và **matching phải phản ứng khi khu vực thưa tài xế** (không được trả "không tìm thấy" ngay).
+
+<DriverMatchingRadiusDiagram />
+
+<Technical>
+
+### Vị trí "mới nhất" khác lịch sử vị trí
+
+Matching chỉ cần vị trí **hiện tại** của tài xế, không cần toàn bộ lịch sử di chuyển. Đây là workload rất đặc thù: **ghi đè liên tục trên rất ít dòng** (1 dòng/tài xế) nhưng tần suất cực cao (mỗi 3–5 giây × hàng trăm nghìn tài xế). Nếu ghi thẳng vào bảng chính mà matching cũng đang đọc bằng GiST index, hai luồng cạnh tranh I/O và có thể tranh cả buffer cache — read latency của matching sẽ tăng theo tải ghi, dù về mặt SQL cả hai đều "đúng".
+
+Cách xử lý phổ biến:
+
+- **Redis GEO** (`GEOADD`, `GEOSEARCH`) — nội bộ dùng geohash trên sorted set, ghi/đọc đều là thao tác in-memory O(log N), rất hợp cho "vị trí mới nhất". Đánh đổi: Redis không phải nguồn dữ liệu bền vững — mất là mất (chấp nhận được vì vị trí cũ vài giây là vô nghĩa).
+- **Bảng riêng, ghi UPSERT theo `driver_id`** trong Postgres nhưng tách khỏi bảng nghiệp vụ khác, có thể đặt ở replica riêng cho matching đọc.
+- **Lịch sử đầy đủ** (nếu cần cho phân tích, tính lương theo km…) đẩy qua pipeline async (outbox/Kafka — SD07) ghi vào kho riêng, không nằm trên đường ghi nóng.
+
+```ts title="Ghi vị trí mới nhất vào Redis GEO"
+import type { RedisClientType } from "redis";
+
+export async function updateDriverLocation(redis: RedisClientType, driverId: string, lng: number, lat: number) {
+  // GEOADD ghi đè vị trí cũ của cùng member — không tích luỹ lịch sử.
+  await redis.geoAdd("drivers:live", { member: driverId, longitude: lng, latitude: lat });
+  await redis.hSet("drivers:meta", driverId, JSON.stringify({ updatedAt: Date.now() }));
+}
+
+export async function findNearbyDrivers(redis: RedisClientType, lng: number, lat: number, radiusMeters: number) {
+  return redis.geoSearch("drivers:live", { longitude: lng, latitude: lat }, { radius: radiusMeters, unit: "m" }, { COUNT: 20, SORT: "ASC" });
+}
+```
+
+### Matching: mở rộng bán kính khi chưa đủ
+
+1. Rider gửi yêu cầu tại vị trí `(lat, lng)`.
+2. Query bán kính mặc định `r₁` (vd 1km ở khu đông, có thể lớn hơn ở khu thưa theo cấu hình vùng).
+3. Không đủ tài xế rảnh trong `r₁` → chờ một khoảng ngắn (vài giây, vì tài xế di chuyển liên tục, có thể vừa vào vùng) rồi thử lại, hoặc mở rộng ngay lên `r₂` tuỳ độ nhạy cảm với latency của sản phẩm.
+4. Gửi lời mời (offer) cho một hoặc vài ứng viên gần nhất, kèm thời hạn chấp nhận ngắn (~10 giây).
+5. Chỉ **một** tài xế được gán cho một chuyến — đây lại là bài toán "tài nguyên có hạn, nhiều bên tranh" giống hệt ghế sự kiện ở bài sau: gán bằng **atomic conditional update** (`UPDATE drivers SET status='assigned' WHERE id=:id AND status='available'`), không phải "app tự kiểm tra rồi ghi".
+
+### Vì sao không tăng bán kính ngay từ đầu cho chắc?
+
+Bán kính lớn ở khu đông đúc trả về hàng nghìn ứng viên, tốn công tính khoảng cách/rank thêm mà không cần thiết — ngược lại với ý tưởng "lọc thô rẻ trước, lọc tinh đắt sau" (bài trước). Bán kính nên thích nghi theo mật độ đo được tại chỗ, không phải hằng số toàn cục.
+
+### Trade-off
+
+| Lựa chọn lưu vị trí "mới nhất" | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Redis GEO | Nhanh, đơn giản, tách khỏi DB nghiệp vụ | Không bền vững, cần tự xử lý tài xế offline (TTL/hết hạn key) | Đa số hệ thống proximity thời gian thực |
+| Bảng Postgres riêng (PostGIS) | Một hệ quản trị, join được với dữ liệu nghiệp vụ khác | Vẫn có write amplification lên GiST index khi tần suất rất cao | Quy mô vừa, hoặc cần truy vấn không gian phức tạp hơn nearest |
+| Ghi thẳng bảng nghiệp vụ chính | Đơn giản nhất để bắt đầu | Cạnh tranh I/O với matching đọc; không scale khi tần suất tăng | Prototype/MVP, số tài xế nhỏ |
+
+**Khi nào đổi ý:** đo p99 của matching query khi tải ghi vị trí tăng — nếu tăng tuyến tính theo QPS ghi, đó là dấu hiệu cần tách store. Đo tỉ lệ request phải mở rộng bán kính (`r₂` trở lên) theo khung giờ/khu vực để tinh chỉnh `r₁` mặc định thay vì đoán.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  title="Redis GEO trong sd-playground"
+  prompt="$"
+  commands={[
+    { comment: "Ghi vị trí 3 tài xế", command: "docker compose exec redis redis-cli GEOADD drivers:live 106.700 10.780 d1 106.705 10.782 d2 106.690 10.770 d3", output: "(integer) 3" },
+    { comment: "Tìm tài xế trong bán kính 1km quanh vị trí rider", command: "docker compose exec redis redis-cli GEOSEARCH drivers:live FROMLONLAT 106.701 10.781 BYRADIUS 1 km ASC", output: "1) \"d2\"\n2) \"d1\"" },
+    { comment: "Không đủ tài xế trong 1km → mở rộng lên 3km", command: "docker compose exec redis redis-cli GEOSEARCH drivers:live FROMLONLAT 106.701 10.781 BYRADIUS 3 km ASC", output: "1) \"d2\"\n2) \"d1\"\n3) \"d3\"" },
+  ]}
+/>
+
+<Callout type="mistake" title="Coi Redis GEO là nguồn sự thật duy nhất">
+
+Nếu Redis rớt hoặc bị flush, "toàn bộ tài xế biến mất" khỏi matching dù họ vẫn đang chạy app. Cần chiến lược tài xế tự động ghi lại vị trí định kỳ ngay khi kết nối lại (client tự retry), và cân nhắc AOF/replica cho Redis nếu downtime vài phút gây thiệt hại đáng kể — nhưng đừng biến nó thành "phải bền vững như Postgres", vì bản chất dữ liệu này vốn hết hạn sau vài giây.
+
+</Callout>
+
+<Callout type="warning">
+
+Gửi offer cho nhiều tài xế cùng lúc (để tăng tỉ lệ accept) thì bước "assign" vẫn phải atomic theo đúng 1 người thắng — không phải chặn gửi offer cho nhiều người.
+
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+
+"Thiết kế luồng cập nhật vị trí tài xế cho Uber" hay bị trả lời sai bằng cách coi nó như một bài toán CRUD bình thường. Câu trả lời mạnh nêu rõ: đây là **write-heavy, chỉ cần giá trị mới nhất** (không phải time-series đầy đủ), nên tách khỏi OLTP chính; matching cần **mở rộng bán kính thích nghi** thay vì hằng số cố định; và gán tài xế là một **race condition** cần atomic update — nối lại đúng chủ đề locking đã học ở SD05.
+
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "vị trí mới nhất (latest location)", meaning: "Chỉ giữ giá trị hiện tại, ghi đè liên tục — khác time-series lưu toàn bộ lịch sử." },
+    { term: "Redis GEO", meaning: "Cấu trúc sorted set của Redis hỗ trợ ghi/tìm kiếm theo bán kính, dùng geohash nội bộ." },
+    { term: "bán kính thích nghi", meaning: "Mở rộng phạm vi tìm kiếm khi chưa đủ ứng viên, thay vì dùng một hằng số cố định mọi nơi." },
+    { term: "offer / lời mời", meaning: "Đề nghị gửi tới tài xế, có thời hạn chấp nhận ngắn trước khi hết hiệu lực." },
+    { term: "atomic conditional update (gán tài xế)", meaning: "UPDATE có điều kiện theo trạng thái hiện tại để chỉ một request thắng khi nhiều rider cùng nhắm một tài xế." },
+    { term: "write amplification", meaning: "Chi phí ghi tăng thêm do phải cập nhật cả index (ở đây là GiST/geohash) mỗi lần ghi dữ liệu." },
+  ]}
+/>
+
+<QuickCheck
+  question="Matching service p99 tăng từ 40ms lên 300ms đúng vào giờ cao điểm, trùng lúc tần suất ping vị trí tài xế tăng gấp 5. Vị trí đang ghi thẳng vào cùng bảng Postgres mà matching query bằng PostGIS. Hướng xử lý hợp lý nhất?"
+  options={[
+    "Giảm tần suất ping xuống 1 lần/phút để giảm tải",
+    "Thêm nhiều index hơn cho bảng vị trí",
+    "Tách 'vị trí mới nhất' sang store riêng tối ưu cho ghi/đọc theo key (vd Redis GEO), giữ Postgres cho các nhu cầu không gian khác",
+    "Tăng số CPU cho Postgres là đủ",
+  ]}
+  answerIndex={2}
+  explanation="Triệu chứng khớp đúng với cạnh tranh I/O giữa ghi tần suất cao và đọc matching trên cùng bảng/index. Giảm tần suất ping làm giảm độ chính xác vị trí (ảnh hưởng trải nghiệm), thêm index chỉ làm ghi chậm hơn nữa. Giải pháp đúng là tách workload."
+/>
