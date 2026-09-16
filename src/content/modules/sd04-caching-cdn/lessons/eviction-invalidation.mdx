@@ -1,0 +1,119 @@
+import { EvictionPolicySimulatorDiagram } from "../diagrams/eviction-policy-simulator-diagram";
+
+<Eli5 title="Tủ đầy thì bỏ món nào, và hạn dùng ghi ra sao?" emoji="🗑️">
+  Tủ lạnh không phải vô hạn. Đầy tủ rồi mà mẹ mua thêm đồ thì phải **bỏ bớt một món** — bỏ món để lâu nhất chưa đụng tới (**LRU**), hay bỏ món ít khi ăn nhất (**LFU**)?
+
+  Còn **TTL** là **hạn dùng** dán trên hộp: hết hạn thì tự vứt, không cần đợi tủ đầy. Hai chuyện khác nhau: **eviction** là "tủ đầy, phải bỏ bớt"; **expiration** là "hết hạn, tự bỏ dù tủ còn chỗ".
+
+  Và khi bạn nấu món mới ngon hơn, bạn phải **tự tay vứt hộp cũ trong tủ** đi — nếu không, có ngày ai đó mở tủ ăn nhầm đồ cũ. Đó là **invalidation**.
+</Eli5>
+
+Chọn sai eviction policy hoặc quên invalidation là nguyên nhân phổ biến nhất của hai lời than: "cache không giúp gì cả" (hit-rate thấp vì đuổi nhầm món hay dùng) và "sao dữ liệu vẫn cũ" (quên xoá khi update). Bài này xử lý cả hai.
+
+<EvictionPolicySimulatorDiagram />
+
+<Technical>
+
+### TTL — luôn đặt, kể cả khi có invalidation chủ động
+
+```ts
+await redis.set(`product:${id}`, JSON.stringify(product), { EX: 300 }); // 5 phút
+```
+
+TTL là **lưới an toàn**: nếu code invalidation có bug hoặc bỏ sót một đường ghi dữ liệu, key vẫn tự hết hạn thay vì cũ vĩnh viễn. Chọn TTL theo tần suất thay đổi và mức "cũ chấp nhận được" của dữ liệu — giá sản phẩm có thể 60–300s, tồn kho lúc flash sale có thể vài giây hoặc không cache.
+
+### Eviction: khi bộ nhớ đầy
+
+Redis chỉ evict khi đạt `maxmemory` (mặc định **không giới hạn** — dễ làm sập máy nếu quên đặt).
+
+```ini title="redis.conf (trích) / hoặc CONFIG SET"
+maxmemory 512mb
+maxmemory-policy allkeys-lru
+```
+
+| Policy | Đuổi key nào | Ghi chú |
+|---|---|---|
+| `noeviction` | Không đuổi gì — ghi mới bị từ chối khi đầy | Mặc định của Redis; nguy hiểm nếu bạn tưởng nó tự dọn |
+| `allkeys-lru` | Ít dùng gần đây nhất, trong toàn bộ key | Phổ biến cho cache thuần |
+| `allkeys-lfu` | Dùng ít lần nhất | Bền hơn `lru` trước một lượt quét toàn bộ (ví dụ job nightly), vì nó nhớ *tần suất* chứ không chỉ *lần cuối* |
+| `volatile-lru` / `volatile-ttl` | Chỉ đuổi trong tập key có đặt TTL, ưu tiên gần hết hạn | Khi cùng instance Redis vừa cache vừa giữ dữ liệu quan trọng không TTL |
+
+`allkeys-lru`/`allkeys-lfu` dùng thuật toán **xấp xỉ** (sample ngẫu nhiên một số key, không quét toàn bộ) để giữ hiệu năng O(1) — đủ tốt cho hầu hết trường hợp thực tế.
+
+### Invalidation: ba cách chính
+
+1. **TTL bị động** — chỉ chờ hết hạn. Đơn giản, dữ liệu có thể cũ tới TTL giây.
+2. **Xoá chủ động khi ghi** (đã học ở bài trước): `UPDATE` DB xong rồi `DEL key`. Chính xác hơn nhưng phải nhớ xoá ở **mọi** đường ghi dữ liệu đó (API khác, batch job, admin panel...) — bỏ sót một chỗ là bug âm thầm.
+3. **Versioned key / cache tagging**: nhúng version vào key (`product:42:v7`) hoặc theo dõi nhóm key liên quan (ví dụ mọi key của một danh mục) để invalidate theo lô mà không cần biết chính xác từng key.
+
+```ts title="Versioned key — tránh sửa nhầm/giẫm key"
+const version = await redis.get(`product:${id}:version`) ?? "0";
+const key = `product:${id}:v${version}`;
+// Khi update: tăng version thay vì DEL — key cũ tự "chết" (không ai đọc nữa) rồi hết TTL tự dọn.
+await redis.incr(`product:${id}:version`);
+```
+
+### "Cache warming" — nạp trước thay vì chờ miss
+
+Với key biết chắc sẽ nóng (trang chủ, top sản phẩm), nạp sẵn cache lúc deploy hoặc theo lịch, tránh cụm miss đồng loạt ngay sau khi restart Redis hay deploy bản mới.
+
+### Trade-off: chính sách nào?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| TTL ngắn, không invalidation chủ động | Cực đơn giản, không bug quên xoá | Dữ liệu cũ tới hết TTL | Dữ liệu đổi chậm, chấp nhận trễ vài chục giây |
+| TTL dài + xoá chủ động khi ghi | Vừa nhanh vừa khá mới | Phải nhớ xoá ở mọi đường ghi | Dữ liệu đọc rất nhiều, ghi có kiểm soát (qua một service) |
+| Versioned key | Không lo giẫm/xoá nhầm, dễ rollback | Thêm một lookup version, key cũ trôi nổi tới khi TTL dọn | Nhiều tiến trình cùng ghi, cần đổi cả lô |
+| `allkeys-lru` | Đơn giản, hợp đa số workload | Dễ bị một lượt quét lớn "rửa trôi" key nóng | Không có job quét định kỳ toàn bộ dữ liệu |
+| `allkeys-lfu` | Bền trước lượt quét lớn | Key mới luôn khởi đầu bất lợi | Có job/bot quét định kỳ, hoặc top-N sản phẩm rất ổn định |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem cấu hình maxmemory hiện tại", command: "docker compose exec redis redis-cli CONFIG GET maxmemory-policy", output: "1) \"maxmemory-policy\"\n2) \"noeviction\"" },
+    { comment: "Đặt giới hạn nhỏ để dễ quan sát eviction trong lab", command: "docker compose exec redis redis-cli CONFIG SET maxmemory 25mb", output: "OK" },
+    { command: "docker compose exec redis redis-cli CONFIG SET maxmemory-policy allkeys-lru", output: "OK" },
+    { comment: "Đổ đầy cache bằng script tạo 200.000 key giả (script mẫu trong repo lab)", command: "node scripts/fill-cache.js --count 200000", output: "Đã ghi 200000 key, evicted_keys tăng dần..." },
+    { comment: "Đếm số key đã bị đuổi", command: "docker compose exec redis redis-cli INFO stats | grep evicted_keys", output: "evicted_keys:48213" },
+    { comment: "Đổi sang LFU và lặp lại để so sánh hit-rate của product:1 (bán chạy)", command: "docker compose exec redis redis-cli CONFIG SET maxmemory-policy allkeys-lfu" },
+  ]}
+/>
+
+<Callout type="mistake" title="Quên đặt maxmemory">
+  `maxmemory-policy` mặc định là `noeviction` và `maxmemory` mặc định là **0 (không giới hạn)**. Redis sẽ ăn hết RAM máy rồi bắt đầu từ chối ghi (`OOM command not allowed`) thay vì tự dọn — luôn đặt cả hai khi dùng Redis làm cache.
+</Callout>
+
+<Callout type="warning">
+  Nếu cùng một instance Redis vừa cache vừa giữ dữ liệu quan trọng (ví dụ session, hàng đợi), đừng dùng `allkeys-*` — nó có thể đuổi luôn session đang sống. Dùng `volatile-*` và chỉ đặt TTL cho key cache, không đặt TTL cho key quan trọng.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi hay gặp: *"Sau khi user đổi thông tin, cache khi nào cập nhật?"* Trả lời theo layer: TTL ngắn là baseline luôn có; nếu cần mới ngay lập tức thì xoá chủ động khi ghi (nêu đúng thứ tự ghi-DB-rồi-xoá-cache); nếu có nhiều service cùng ghi, đề xuất versioned key hoặc publish sự kiện invalidation qua message queue (SD07).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "eviction", meaning: "Đuổi bớt key khi cache đầy bộ nhớ." },
+    { term: "expiration (TTL)", meaning: "Key tự hết hạn sau một khoảng thời gian, không phụ thuộc bộ nhớ đầy hay không." },
+    { term: "invalidation", meaning: "Chủ động làm mất hiệu lực / xoá key khi dữ liệu gốc thay đổi." },
+    { term: "LRU", meaning: "Least Recently Used — đuổi key lâu nhất chưa được đọc/ghi." },
+    { term: "LFU", meaning: "Least Frequently Used — đuổi key có số lần truy cập thấp nhất." },
+    { term: "maxmemory-policy", meaning: "Cấu hình Redis quyết định đuổi key nào khi đầy bộ nhớ." },
+    { term: "versioned key", meaning: "Nhúng số phiên bản vào tên key để invalidate mà không cần DEL trực tiếp." },
+  ]}
+/>
+
+<QuickCheck
+  question="Redis dùng `allkeys-lru`. Mỗi đêm có job quét và đọc tuần tự toàn bộ 5 triệu sản phẩm để tính báo cáo. Sáng hôm sau, hit-rate của các sản phẩm bán chạy (vốn rất ổn định) giảm mạnh. Nguyên nhân và cách sửa hợp lý nhất?"
+  options={[
+    "Redis bị lỗi, cần restart",
+    "TTL đặt quá ngắn, cần tăng TTL",
+    "Job quét đêm chạm vào mọi key khiến LRU coi chúng là 'vừa dùng', đẩy các key bán chạy ra dựa trên lần dùng gần nhất; nên đổi sang allkeys-lfu hoặc chạy job quét trên một Redis/replica riêng",
+    "Cần tăng maxmemory lên gấp đôi",
+  ]}
+  answerIndex={2}
+  explanation="Ai đó đi một lượt sờ vào mọi hộp trong tủ lạnh làm LRU tưởng hộp nào cũng 'vừa dùng xong'. LFU nhớ tần suất nên bền hơn với kiểu quét này; cách chắc hơn nữa là tách hẳn workload đọc lớn sang nơi khác."
+/>

@@ -19,6 +19,7 @@ import { m17DevsecopsModule } from "./modules/m17-devsecops/module-meta";
 import { sd01SystemDesignMindsetModule } from "./modules/sd01-system-design-mindset/module-meta";
 import { sd02NetworkingCommunicationModule } from "./modules/sd02-networking-communication/module-meta";
 import { sd03ScalingLoadBalancingModule } from "./modules/sd03-scaling-load-balancing/module-meta";
+import { sd04CachingCdnModule } from "./modules/sd04-caching-cdn/module-meta";
 import { sd05DatabaseFundamentalsModule } from "./modules/sd05-database-fundamentals/module-meta";
 import { sd06ScalingDatabasesModule } from "./modules/sd06-scaling-databases/module-meta";
 import { sd07AsyncMessagingModule } from "./modules/sd07-async-messaging/module-meta";
@@ -45,6 +46,7 @@ export const curriculumModules: ModuleDefinition[] = [
   sd01SystemDesignMindsetModule,
   sd02NetworkingCommunicationModule,
   sd03ScalingLoadBalancingModule,
+  sd04CachingCdnModule,
   sd05DatabaseFundamentalsModule,
   sd06ScalingDatabasesModule,
   sd07AsyncMessagingModule,

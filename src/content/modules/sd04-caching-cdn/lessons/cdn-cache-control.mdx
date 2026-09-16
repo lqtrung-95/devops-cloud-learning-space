@@ -1,0 +1,134 @@
+import { CacheControlDecisionDiagram } from "../diagrams/cache-control-decision-diagram";
+
+<Eli5 title="Chuỗi cửa hàng gần nhà và nhãn hạn dùng" emoji="🏪">
+  **CDN** giống một chuỗi cửa hàng tiện lợi có chi nhánh khắp thành phố (**edge**), trữ sẵn hàng bán chạy gần nhà bạn thay vì bắt bạn chạy tới tận kho tổng (server gốc — **origin**) mỗi lần cần mua.
+
+  Nhưng cửa hàng phải biết **hạn dùng** của từng món để không bán đồ ế. **`Cache-Control`** chính là nhãn dán trên hộp: "dùng được 1 năm" (asset có hash), "chỉ tươi trong 30 giây rồi phải kiểm tra lại" (giá sản phẩm), hay "hàng riêng, không được bày ở cửa hàng chung" (dữ liệu cá nhân — `private`).
+
+  Dán nhãn sai là tai hoạ: dán "1 năm" cho món hay đổi thì khách ăn đồ ế mà không biết; dán "private" nhầm thành "public" thì đồ riêng của nhà này lại bị bày bán cho nhà khác.
+</Eli5>
+
+CDN và HTTP caching là lớp cache **rẻ và hiệu quả nhất**: đúng cấu hình, phần lớn traffic không bao giờ chạm tới server của bạn. Sai cấu hình thì hoặc phục vụ nội dung cũ dai dẳng, hoặc tệ hơn — rò rỉ dữ liệu riêng tư qua cache dùng chung.
+
+<CacheControlDecisionDiagram />
+
+<Technical>
+
+### Static vs dynamic content trên CDN
+
+- **Static** (JS/CSS/ảnh/font): giống nhau cho mọi user, đổi ít, hợp cache dài. Kỹ thuật chuẩn: đặt **hash nội dung vào tên file** (`app.3f9a1c.js`) rồi `max-age` cực dài + `immutable`. Muốn cập nhật thì đổi tên file (build tool làm tự động), không phải đợi cache hết hạn.
+- **Dynamic** (trang HTML SSR, API): có thể khác nhau theo user hoặc đổi thường xuyên. Vẫn cache được nếu **giống nhau cho mọi người xem** (ví dụ trang danh mục sản phẩm public) với TTL ngắn.
+
+### Các directive quan trọng của `Cache-Control`
+
+| Directive | Ý nghĩa |
+|---|---|
+| `public` | Cache dùng chung (CDN, proxy) được lưu |
+| `private` | Chỉ cache riêng của từng user (trình duyệt) được lưu; CDN/proxy không được lưu |
+| `no-store` | Không lưu ở bất cứ đâu |
+| `no-cache` | *Có thể* lưu, nhưng phải revalidate với server trước khi dùng (tên dễ gây hiểu lầm — không phải "không cache") |
+| `max-age=N` | Xem là "tươi" trong N giây kể từ khi lấy về |
+| `s-maxage=N` | `max-age` riêng cho cache dùng chung (CDN), ưu tiên hơn `max-age` ở đó |
+| `immutable` | Nội dung sẽ không đổi trong suốt `max-age` — trình duyệt bỏ qua revalidate khi user bấm reload |
+| `stale-while-revalidate=N` | Hết hạn vẫn trả bản cũ ngay trong N giây tiếp, đồng thời âm thầm lấy bản mới ở nền |
+
+### Cache key và vấn đề cache theo user
+
+CDN quyết định "hai request có phải cùng một thứ không" dựa trên **cache key** — mặc định thường là URL. Nếu response đổi theo `Cookie` hay `Authorization` nhưng cache key không tính tới header đó, **user A có thể nhận cache được tạo cho user B**. Header `Vary` khai báo thêm chiều: `Vary: Accept-Encoding` là phổ biến và an toàn; `Vary: Cookie` gần như vô hiệu hoá cache (mỗi cookie một bản). Cách an toàn hơn cho dữ liệu riêng tư: đơn giản là `private, no-store`, không cố cache ở CDN.
+
+### ETag & revalidation
+
+```http title="Response lần đầu"
+HTTP/1.1 200 OK
+Cache-Control: public, max-age=0, must-revalidate
+ETag: "5d8c72f1a9"
+```
+
+```http title="Request lần sau"
+GET /products.html HTTP/1.1
+If-None-Match: "5d8c72f1a9"
+```
+
+Nếu nội dung chưa đổi, server trả `304 Not Modified` (không có body) — vẫn tốn một round trip nhưng tiết kiệm băng thông. Kết hợp `max-age=0, must-revalidate` (luôn hỏi lại) với ETag là cách hợp lý cho nội dung đổi thường xuyên nhưng muốn tiết kiệm băng thông.
+
+### Purge — khi phải xoá gấp
+
+Đổi tên file (asset có hash) giải quyết được 99% trường hợp, nhưng đôi khi cần xoá ngay: nội dung sai cần gỡ, hoặc URL không đánh version được (trang HTML, API public). CDN cung cấp API purge theo URL hoặc theo tag/surrogate-key; purge thường mất **vài giây tới vài phút** để lan ra mọi edge — không phải tức thời, và không xoá được bản đã nằm trong cache trình duyệt của user.
+
+### Reverse proxy cache (Nginx) — CDN "tự vận hành" trong sd-playground
+
+```nginx title="nginx/default.conf (trích)"
+proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=api_cache:10m max_size=100m inactive=10m;
+
+server {
+    location /api/products/ {
+        proxy_cache api_cache;
+        proxy_cache_valid 200 30s;
+        proxy_cache_lock on;                     # gộp nhiều request trùng key khi đang MISS — chống stampede ở tầng proxy
+        add_header X-Cache-Status $upstream_cache_status always;
+        proxy_pass http://app_backend;
+    }
+}
+```
+
+`proxy_cache_lock` là bản thu nhỏ của "lock chống stampede" (bài trước) nhưng làm sẵn ở tầng Nginx cho toàn bộ request trùng URL, không cần code riêng.
+
+### Trade-off: cache HTML/API ở CDN hay không?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Static asset, hash trong tên | Cache gần như vĩnh viễn, cực rẻ | Cần build tool hỗ trợ đặt hash | Mặc định cho JS/CSS/ảnh |
+| API public, TTL ngắn ở CDN | Giảm mạnh tải origin lúc đỉnh | Dữ liệu có thể cũ vài chục giây | Nội dung công khai, đọc nhiều, đổi chậm |
+| API riêng tư, `private, no-store` | An toàn tuyệt đối, không rò rỉ | Không được hưởng lợi từ CDN | Bất cứ gì gắn với một user cụ thể |
+| Purge chủ động | Xoá được ngay khi cần | Không tức thời trên mọi edge, tốn thao tác | Nội dung không đánh version được và cần sửa gấp |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Static asset: kiểm tra header cache dài hạn", command: "curl -sI localhost:8080/static/app.3f9a1c.js | grep -i cache-control", output: "cache-control: public, max-age=31536000, immutable" },
+    { comment: "API public: MISS lần đầu", command: "curl -sI localhost:8080/api/products/7 | grep -i x-cache-status", output: "x-cache-status: MISS" },
+    { comment: "Gọi lại trong 30s: HIT, không chạm app", command: "curl -sI localhost:8080/api/products/7 | grep -i x-cache-status", output: "x-cache-status: HIT" },
+    { comment: "API riêng tư: không có Cache-Control public nào", command: "curl -sI -H 'Authorization: Bearer demo' localhost:8080/api/me | grep -i cache-control", output: "cache-control: private, no-store" },
+    { comment: "Kiểm tra revalidation bằng ETag — trang HTML", command: "curl -sI localhost:8080/ | grep -i etag", output: "etag: \"5d8c72f1a9\"" },
+    { command: "curl -s -o /dev/null -w '%{http_code}\\n' -H 'If-None-Match: \"5d8c72f1a9\"' localhost:8080/", output: "304" },
+  ]}
+/>
+
+<Callout type="mistake" title="`Vary: Cookie` hoặc thiếu Vary trên nội dung theo user">
+  Bật `proxy_cache`/CDN cho một endpoint mà response thực ra khác nhau theo cookie đăng nhập, nhưng cache key không phân biệt — user sau đăng nhập có thể thấy **dữ liệu của user trước đó** đã được cache. Đây là lỗi bảo mật nghiêm trọng, không chỉ là "dữ liệu cũ". Bất cứ response nào đổi theo danh tính user: dùng `private, no-store`, không cache ở tầng dùng chung.
+</Callout>
+
+<Callout type="cost">
+  CDN thường tính phí theo băng thông egress và số request. Cache-Control cấu hình tốt (đặc biệt static asset dài hạn) trực tiếp giảm hoá đơn CDN lẫn tải origin — đây là một trong số ít tối ưu vừa nhanh hơn vừa rẻ hơn.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi vẽ CDN trong kiến trúc, nói rõ: asset tĩnh cache dài hạn nhờ hash tên file; API public cache ngắn hạn ở edge để hứng đỉnh tải (ví dụ trang sản phẩm trong sự kiện); dữ liệu riêng tư tuyệt đối không cache dùng chung. Nhắc `Vary`/cache key sai gây rò rỉ dữ liệu là chi tiết ít người nói tới nhưng gây ấn tượng tốt.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "origin", meaning: "Server gốc mà CDN lấy dữ liệu về khi cache miss." },
+    { term: "edge", meaning: "Máy chủ CDN đặt gần người dùng, giữ bản sao cache." },
+    { term: "cache key", meaning: "Cách CDN/proxy xác định hai request có 'cùng một thứ' để dùng chung cache hay không." },
+    { term: "Vary", meaning: "Header khai báo thêm chiều phân biệt cache key (ví dụ theo Accept-Encoding)." },
+    { term: "ETag", meaning: "Định danh phiên bản nội dung, dùng để revalidate bằng 304 thay vì tải lại toàn bộ." },
+    { term: "stale-while-revalidate", meaning: "Trả bản cũ ngay khi hết hạn, đồng thời âm thầm làm mới ở nền." },
+    { term: "purge", meaning: "Chủ động xoá nội dung khỏi cache CDN trước khi TTL hết hạn." },
+  ]}
+/>
+
+<QuickCheck
+  question="Endpoint `/api/cart` trả giỏ hàng riêng của từng user, và team bật `proxy_cache` ở Nginx cho nó để 'giảm tải' mà không đổi cache key. Hậu quả khả dĩ nhất là gì?"
+  options={[
+    "Không có vấn đề gì, cache luôn an toàn",
+    "Chỉ làm chậm hơn một chút",
+    "User A có thể nhận được giỏ hàng đã cache của user B — rò rỉ dữ liệu riêng tư",
+    "Nginx sẽ tự động phát hiện và bỏ qua cache cho endpoint này",
+  ]}
+  answerIndex={2}
+  explanation="Đồ riêng của nhà A bị bày nhầm lên kệ chung khiến nhà B lấy đúng đồ đó. Bất cứ response nào khác nhau theo user phải dùng `private, no-store`, không cache dùng chung theo URL đơn thuần."
+/>

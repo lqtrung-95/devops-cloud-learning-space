@@ -31,4 +31,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "sd01-system-design-mindset": (lessonSlug) => import(`./modules/sd01-system-design-mindset/lessons/${lessonSlug}.mdx`),
   "sd02-networking-communication": (lessonSlug) => import(`./modules/sd02-networking-communication/lessons/${lessonSlug}.mdx`),
   "sd03-scaling-load-balancing": (lessonSlug) => import(`./modules/sd03-scaling-load-balancing/lessons/${lessonSlug}.mdx`),
+  "sd04-caching-cdn": (lessonSlug) => import(`./modules/sd04-caching-cdn/lessons/${lessonSlug}.mdx`),
 };

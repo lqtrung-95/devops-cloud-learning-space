@@ -1,0 +1,131 @@
+import { CacheIncidentScenarioDiagram } from "../diagrams/cache-incident-scenario-diagram";
+
+<Eli5 title="Ba sự cố tủ lạnh kinh điển" emoji="🚨">
+  **Cache stampede**: đúng lúc tủ lạnh hết trứng, **cả xóm cùng lúc chạy ra chợ** mua trứng — chợ sập vì quá đông, dù thật ra chỉ cần một người đi mua rồi chia lại cho cả xóm.
+
+  **Cache penetration**: có kẻ nghịch cứ hỏi cửa hàng "còn bán *con khủng long*" không — món không tồn tại, chưa từng có trong tủ lạnh, nên hỏi bao nhiêu lần cũng phải chạy vào kho xem cho chắc.
+
+  **Hot key**: một món hot hit toàn thành phố ai cũng hỏi (**celebrity item**) — dù đã có sẵn trong tủ, một cửa hàng vẫn có thể sập tiệm vì đứng ra phục vụ một mình cả triệu người.
+</Eli5>
+
+Ba sự cố này là những câu hỏi "gãy hệ thống" kinh điển trong phỏng vấn system design, và cũng là nguyên nhân thật của nhiều sự cố production. Cache giúp hệ thống nhanh hơn 99% thời gian — 1% còn lại (key hết hạn, id không tồn tại, một item viral) mới là lúc thiết kế cache bị kiểm tra thật sự.
+
+<CacheIncidentScenarioDiagram />
+
+<Technical>
+
+### Cache stampede (thundering herd)
+
+Một key rất nóng hết hạn đúng lúc tải cao ⇒ hàng trăm/nghìn request cùng miss cùng lúc, tất cả cùng query DB để nạp lại **cùng một giá trị**.
+
+**Sửa bằng lock (mutex):**
+
+```ts title="app/src/stampede-lock.ts"
+import { randomUUID } from "node:crypto";
+
+async function getWithLock(key: string, loader: () => Promise<unknown>, ttlSeconds: number) {
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
+  const lockKey = `lock:${key}`;
+  const token = randomUUID();
+  const gotLock = await redis.set(lockKey, token, { NX: true, PX: 3000 }); // giữ lock tối đa 3s
+
+  if (gotLock) {
+    try {
+      const value = await loader();
+      await redis.set(key, JSON.stringify(value), { EX: ttlSeconds });
+      return value;
+    } finally {
+      await releaseLockIfOwner(lockKey, token); // script Lua: chỉ DEL nếu token khớp
+    }
+  }
+
+  // Không lấy được lock: chờ ngắn rồi thử đọc lại cache (bản mà request kia vừa nạp)
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const retried = await redis.get(key);
+  return retried ? JSON.parse(retried) : loader(); // fallback: tự query nếu vẫn chưa có
+}
+```
+
+`SET key val NX PX ms` là lệnh **atomic**: chỉ đúng một client thấy `OK`, số còn lại thấy `nil`. Giải phóng lock phải kiểm tra đúng chủ sở hữu (token) bằng script Lua atomic — tránh việc request A giải phóng nhầm lock của request B (đã lấy được lock sau khi lock của A hết hạn PX).
+
+**Sửa bằng làm mới sớm (early recomputation):** thay vì đợi hết hạn hẳn, một job nền hoặc chính request đầu tiên sau một ngưỡng (ví dụ còn 10% TTL) chủ động làm mới cache **trước khi** nó hết hạn thật — hầu như không ai gặp miss.
+
+### Cache penetration
+
+Truy vấn liên tục vào key **không bao giờ tồn tại** trong cache lẫn nguồn — do bot dò id, hoặc bug ở client gửi id sai. Vì kết quả rỗng thường không được cache ("không có gì để cache"), mỗi request đều chạm DB.
+
+- **Cache cả kết quả rỗng**, TTL ngắn hơn dữ liệu thật (ví dụ 30s thay vì 5 phút) để tránh giữ "không tồn tại" quá lâu nếu dữ liệu được tạo ra sau đó.
+- **Validate input** trước khi chạm cache/DB (id phải đúng định dạng, đúng khoảng).
+- **Bloom filter**: cấu trúc xác suất trả lời "chắc chắn không có" hoặc "có thể có" cho một tập id hợp lệ đã biết trước — chặn phần lớn truy vấn rác ngay ở tầng đầu, trước cả cache.
+
+### Hot key (celebrity key)
+
+Một key đơn lẻ nhận lượng truy cập vượt xa phần còn lại — ví dụ sản phẩm trong livestream, tin tức nóng. Vấn đề **không phải hit-rate thấp** (thường vẫn HIT gần 100%) mà là **một node/kết nối duy nhất giữ key đó bị bão hoà** dù cụm Redis còn dư tài nguyên ở các node khác.
+
+- **Nhân bản key** (`key:copy0`..`key:copyN`), client chọn ngẫu nhiên một bản để đọc, rải tải ra nhiều node.
+- **Local in-process cache** với TTL rất ngắn (1–2 giây) đặt trước Redis cho đúng những key đang hot — hấp thụ phần lớn tải mà chấp nhận độ trễ nhất quán vài giây.
+- Theo dõi **hot key** bằng công cụ như `redis-cli --hotkeys` (cần bật `maxmemory-policy` có LFU) hoặc log ở tầng ứng dụng.
+
+### Trade-off
+
+| Sự cố | Cách sửa | Đánh đổi |
+|---|---|---|
+| Stampede | Lock `SET NX PX` | Request "chờ" tăng nhẹ độ trễ; cần xử lý lock hết hạn khi loader chậm hơn PX |
+| Stampede | Làm mới sớm | Tốn thêm việc nền dù không ai đọc; cần lịch/ngưỡng hợp lý |
+| Penetration | Cache kết quả rỗng | Chiếm thêm bộ nhớ cho các key "không tồn tại"; phải TTL ngắn |
+| Penetration | Bloom filter | Thêm hạ tầng, có tỉ lệ false positive nhỏ (chấp nhận được) |
+| Hot key | Nhân bản key | Đọc rẻ hơn nhưng ghi/invalidate phải cập nhật mọi bản sao |
+| Hot key | Local cache ngắn hạn | Các instance có thể thấy giá trị khác nhau trong 1–2 giây |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo tải liên tục vào endpoint nặng (0.5s/query), TTL cache 10s", command: "k6 run --vus 300 --duration 90s k6/stampede-test.js" },
+    { comment: "Đếm số lần THỰC SỰ query DB trong lúc chạy (số minh hoạ, chưa sửa)", command: "docker compose exec redis redis-cli GET stats:db_queries", output: "\"47\"" },
+    { comment: "Bật lock rồi chạy lại — reset counter trước", command: "docker compose exec redis redis-cli SET stats:db_queries 0" },
+    { command: "k6 run --vus 300 --duration 90s k6/stampede-test.js" },
+    { comment: "Số query DB giảm mạnh vì chỉ 1 request/chu kỳ hết hạn được đi tiếp", command: "docker compose exec redis redis-cli GET stats:db_queries", output: "\"9\"" },
+    { comment: "Kiểm tra hành vi SET NX thủ công", command: "docker compose exec redis redis-cli SET demo-lock A NX PX 5000", output: "OK" },
+    { comment: "Lần hai trong 5s: bị từ chối vì đã có chủ", command: "docker compose exec redis redis-cli SET demo-lock B NX PX 5000", output: "(nil)" },
+  ]}
+/>
+
+<Callout type="mistake" title="Giải phóng lock không kiểm tra chủ sở hữu">
+  Nếu loader chạy lâu hơn `PX` (ví dụ DB chậm bất thường), lock tự hết hạn và request khác lấy được lock mới. Khi request đầu tiên chạy xong và gọi `DEL` **không điều kiện**, nó xoá nhầm lock của request thứ hai. Luôn giải phóng bằng script kiểm tra token trước khi xoá.
+</Callout>
+
+<Callout type="warning">
+  Cache cả kết quả rỗng cho penetration nhưng dùng TTL bằng với dữ liệu thật là sai: một sản phẩm vừa được tạo có thể bị "kẹt" ở trạng thái không tồn tại tới hết TTL dài đó. TTL rỗng nên ngắn hơn hẳn.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi thiết kế một hệ thống đọc nhiều (feed, trang chủ), chủ động nhắc tới cả ba sự cố này trước khi được hỏi — đó là dấu hiệu bạn từng vận hành cache thật, không chỉ học lý thuyết. Với case study có "một sản phẩm hot trong 5 phút flash sale", hot key gần như luôn xuất hiện làm điểm đào sâu.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "cache stampede", meaning: "Nhiều request cùng miss một key nóng cùng lúc, dồn tải vào nguồn." },
+    { term: "cache penetration", meaning: "Truy vấn liên tục vào dữ liệu không tồn tại, không bao giờ được cache." },
+    { term: "hot key / celebrity key", meaning: "Một key nhận lượng truy cập vượt trội, làm quá tải node giữ nó dù hit-rate cao." },
+    { term: "SET NX PX", meaning: "Ghi key chỉ khi chưa tồn tại, kèm thời gian sống — dùng làm distributed lock đơn giản." },
+    { term: "early recomputation", meaning: "Chủ động làm mới cache trước khi hết hạn để tránh miss đồng loạt." },
+    { term: "Bloom filter", meaning: "Cấu trúc xác suất trả lời nhanh 'chắc chắn không có' hoặc 'có thể có'." },
+  ]}
+/>
+
+<QuickCheck
+  question="Trong một sự kiện flash sale, một sản phẩm duy nhất nhận 80.000 request/giây. Cache hit-rate đo được là 99,8% nhưng node Redis giữ key đó vẫn bị timeout hàng loạt. Đây là sự cố gì và hướng sửa hợp lý?"
+  options={[
+    "Cache penetration — cần cache kết quả rỗng",
+    "Cache stampede — cần thêm lock SET NX PX",
+    "Hot key — cần nhân bản key ra nhiều bản hoặc thêm cache local ngắn hạn trước Redis",
+    "Eviction sai chính sách — đổi sang allkeys-lfu",
+  ]}
+  answerIndex={2}
+  explanation="Hit-rate cao chứng tỏ dữ liệu vẫn còn trong cache — vấn đề là MỘT cửa hàng (node) phải phục vụ một mình cả triệu khách cho đúng một món hot. Rải tải bằng nhân bản key hoặc chặn bớt ở tầng local mới đúng bệnh."
+/>

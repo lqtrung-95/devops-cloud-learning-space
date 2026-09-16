@@ -1,0 +1,134 @@
+import { WriteStrategyComparisonDiagram } from "../diagrams/write-strategy-comparison-diagram";
+
+<Eli5 title="Ai đi chợ, ai cất tủ, ai chờ ai?" emoji="🛒">
+  **Cache-aside**: bạn tự mở tủ lạnh, hết thì **tự** chạy ra chợ mua rồi **tự** cất vào tủ. Tủ lạnh "vô tri" — không biết chợ ở đâu.
+
+  **Read-through**: bạn chỉ nói với tủ lạnh "cho tôi trứng", còn **tủ lạnh tự sai người đi chợ** khi hết, bạn không cần biết chợ ở đâu.
+
+  **Write-through**: mua đồ mới thì đưa cho tủ lạnh, tủ lạnh **tự chạy đi cất vào kho chợ luôn rồi mới báo bạn xong** — chắc chắn nhưng bạn phải đợi cả hai việc.
+
+  **Write-behind**: đưa đồ cho tủ lạnh là xong ngay, tủ lạnh **hẹn cuối ngày gom đồ mang ra kho** — nhanh, nhưng tủ lạnh hỏng giữa chừng thì đồ chưa kịp mang đi cũng mất luôn.
+</Eli5>
+
+Hầu hết hệ thống web dùng **cache-aside** vì đơn giản và không cần thư viện đặc biệt — Redis chỉ là key-value store "vô tri". Biết ba chiến lược còn lại giúp bạn nhận ra khi nào cache-aside không đủ và trả lời tốt câu hỏi trade-off trong phỏng vấn.
+
+<WriteStrategyComparisonDiagram />
+
+<Technical>
+
+### Cache-aside (lazy loading) — mặc định
+
+```ts title="app/src/products-cache.ts"
+import { createClient } from "redis";
+import { pool } from "./db";
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+const TTL_SECONDS = 60;
+
+export async function getProduct(id: number) {
+  const key = `product:${id}`;
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
+  const { rows } = await pool.query("SELECT id, name, price FROM products WHERE id = $1", [id]);
+  if (rows.length === 0) return null;
+
+  await redis.set(key, JSON.stringify(rows[0]), { EX: TTL_SECONDS });
+  return rows[0];
+}
+
+export async function updateProductPrice(id: number, price: number) {
+  await pool.query("UPDATE products SET price = $1 WHERE id = $2", [price, id]);
+  await redis.del(`product:${id}`); // xoá SAU khi ghi DB thành công
+}
+```
+
+- Đơn giản, chỉ cache đúng thứ được đọc (lazy).
+- Miss đầu tiên luôn chậm (cold start) — "cache warm-up" cho key quan trọng bằng cách nạp trước lúc deploy nếu cần.
+- Xoá key **sau** khi ghi DB thành công, không phải trước — nếu app crash giữa hai bước, thà cache giữ dữ liệu cũ (rồi tự hết TTL) còn hơn cache trống khiến mọi request dồn vào DB.
+
+### Read-through
+
+Về bản chất giống cache-aside nhưng logic "khi miss thì lấy ở đâu" nằm **trong tầng cache** (một thư viện/proxy có cấu hình loader), không nằm trong code nghiệp vụ. Redis tự thân không hỗ trợ read-through; cần thêm lớp trung gian (ví dụ Redis Functions gọi ra ngoài, hoặc cache library có "loader function" như một số ORM cache layer). Lợi ích: code gọi cache gọn hơn; đánh đổi: thêm một tầng phải hiểu và debug.
+
+### Write-through
+
+```ts title="Ý tưởng — không phải Redis tự làm được, cần code bọc lại"
+async function writeThroughSet(key: string, value: unknown, id: number) {
+  await pool.query("UPDATE products SET price = $1 WHERE id = $2", [value, id]); // 1. ghi DB, chờ xong
+  await redis.set(key, JSON.stringify(value));                                    // 2. rồi mới cập nhật cache
+  // Chỉ trả 'ok' cho client sau khi CẢ HAI xong.
+}
+```
+
+Đảm bảo cache không bao giờ có dữ liệu mà DB chưa có — đọc ngay sau ghi luôn thấy giá trị mới (tránh được vấn đề *read-after-write* trong cùng tiến trình). Cái giá là **độ trễ ghi** = thời gian ghi DB + thời gian ghi cache, luôn luôn, kể cả khi không ai đọc lại ngay.
+
+### Write-behind (write-back)
+
+Ghi vào cache/queue trước, một worker nền **flush** xuống DB sau (theo thời gian hoặc theo batch). Nhanh cho client, giảm số lần ghi DB (gộp nhiều update thành một), nhưng:
+
+- Cache/queue chết trước khi flush ⇒ **mất ghi**. Cần đánh giá "mất được bao nhiêu giây dữ liệu" trước khi chọn.
+- Thứ tự ghi phải giữ đúng nếu có nhiều update trên cùng key.
+- Hợp cho: đếm lượt xem, like, tích điểm — sai lệch nhỏ chấp nhận được. Không hợp cho: số dư, tồn kho, đơn hàng.
+
+### Trade-off: chọn chiến lược ghi nào?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Cache-aside | Đơn giản, không cần thư viện đặc biệt, dễ debug | Miss đầu luôn chậm; logic rải trong code | Mặc định cho hầu hết object/API đọc nhiều |
+| Read-through | Code gọi cache gọn, tách logic loader riêng | Cần thư viện/lớp hỗ trợ; thêm tầng trừu tượng | Nhiều nơi trong codebase cùng đọc một loại dữ liệu |
+| Write-through | Cache không bao giờ "đi trước" DB; đọc sau ghi luôn đúng | Ghi chậm hơn (chờ cả hai); vẫn cần xử lý khi bước 2 lỗi | Dữ liệu cần đọc lại ngay sau ghi, ghi không quá thường xuyên |
+| Write-behind | Ghi rất nhanh, gộp được nhiều ghi | Có thể mất dữ liệu khi crash; phức tạp vận hành | Đếm lượt xem/like, metric, dữ liệu chấp nhận mất một khoảng ngắn |
+
+Đổi ý khi: sản phẩm yêu cầu "user sửa xong phải thấy ngay" trên mọi thiết bị ⇒ cân nhắc write-through hoặc bỏ cache cho đúng field đó; đo thấy DB quá tải vì ghi lắt nhắt ⇒ cân nhắc write-behind cho phần chấp nhận mất mát.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chưa có cache: gọi endpoint sản phẩm, luôn ~50ms", command: "curl -s -o /dev/null -w '%{time_total}s\\n' localhost:8080/api/products/7", output: "0.057123s" },
+    { comment: "Sau khi thêm cache-aside: lần đầu (miss) vẫn chậm", command: "curl -s -o /dev/null -w '%{time_total}s\\n' localhost:8080/api/products/7", output: "0.056871s" },
+    { comment: "Lần hai (hit) — nhanh hẳn", command: "curl -s -o /dev/null -w '%{time_total}s\\n' localhost:8080/api/products/7", output: "0.002014s" },
+    { comment: "Xem TTL còn lại của key", command: "docker compose exec redis redis-cli TTL product:7", output: "(integer) 47" },
+    { comment: "Sửa giá rồi kiểm tra key đã bị xoá", command: "curl -s -X PATCH localhost:8080/api/products/7 -d '{\"price\":499}' -H 'Content-Type: application/json'", output: "{\"ok\":true}" },
+    { command: "docker compose exec redis redis-cli EXISTS product:7", output: "(integer) 0" },
+  ]}
+/>
+
+<Callout type="mistake" title="Xoá cache trước khi ghi DB">
+  Nếu `DEL` chạy trước `UPDATE`, một request đọc chen vào giữa hai bước sẽ query DB (thấy giá cũ) rồi **ghi giá cũ đó vào cache** — sau khi `UPDATE` đã chạy xong. Cache kẹt ở giá cũ cho tới hết TTL kế tiếp. Luôn ghi DB xong rồi mới xoá cache.
+</Callout>
+
+<Callout type="tip">
+  `redis-cli MONITOR` (chỉ dùng ở môi trường dev/lab, không phải production vì tốn CPU) cho bạn xem trực tiếp mọi lệnh Redis app đang gửi — hữu ích để kiểm tra đúng thứ tự `GET`/`SET`/`DEL`.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi được hỏi "cache thế nào cho endpoint X", nói rõ bạn chọn **cache-aside** (mặc định) và giải thích thứ tự ghi DB-rồi-xoá-cache. Nếu đề bài nhấn mạnh "user phải thấy thay đổi ngay lập tức" (ví dụ giỏ hàng), đó là gợi ý cân nhắc write-through hoặc không cache field đó — chỉ ra sự khác biệt là điểm cộng.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "cache-aside", meaning: "App tự đọc/ghi cache và database, cache không tự biết database." },
+    { term: "read-through", meaning: "Cache tự lấy dữ liệu từ nguồn khi miss, qua một loader." },
+    { term: "write-through", meaning: "Ghi đồng thời/đồng bộ vào cache và database trước khi xác nhận." },
+    { term: "write-behind", meaning: "Ghi cache trước, flush xuống database sau theo lô." },
+    { term: "cold start (cache)", meaning: "Lần đọc đầu tiên của một key luôn miss và chậm." },
+    { term: "TTL", meaning: "Thời gian sống của key trước khi tự hết hạn." },
+  ]}
+/>
+
+<QuickCheck
+  question="App xoá key cache TRƯỚC khi gọi UPDATE database. Giữa hai bước đó, một request khác đọc cùng key. Kết quả tệ nhất có thể xảy ra là gì?"
+  options={[
+    "Request đọc bị lỗi 500",
+    "Request đọc query DB (thấy giá trị cũ) và ghi lại giá trị cũ đó vào cache — cache mắc kẹt với dữ liệu cũ tới hết TTL",
+    "Redis tự chặn ghi trong lúc DB đang update",
+    "Không có vấn đề gì vì TTL sẽ tự sửa ngay lập tức",
+  ]}
+  answerIndex={1}
+  explanation="Dọn tủ trước khi hàng mới về nhà: người khác ghé qua đúng lúc tủ trống sẽ tự đi chợ lấy hàng cũ rồi... cất vào tủ hộ bạn. Luôn ghi DB xong mới xoá cache."
+/>

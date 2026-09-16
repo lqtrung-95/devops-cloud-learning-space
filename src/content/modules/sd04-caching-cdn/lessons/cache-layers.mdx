@@ -1,0 +1,121 @@
+import { CacheLayersRequestPathDiagram } from "../diagrams/cache-layers-request-path-diagram";
+
+<Eli5 title="Cache giống tủ lạnh, CDN giống cửa hàng đầu ngõ" emoji="🧊">
+  Muốn ăn trứng, bạn **mở tủ lạnh nhà mình** trước (browser cache) — không phải đi đâu. Hết thì chạy ra **cửa hàng tiện lợi đầu ngõ** (CDN edge): vài phút là có. Cửa hàng hết nữa thì họ lấy từ **kho của chuỗi** (reverse proxy cache), và cuối cùng mới tới **chợ đầu mối** ở tận ngoại thành (database) — chậm nhất nhưng luôn có hàng đúng giá.
+
+  Mỗi chỗ trữ hàng gần bạn hơn giúp **tiết kiệm một đoạn đường** và giảm người chen ở chợ đầu mối. Đổi lại: hàng trữ càng nhiều nơi, khi chợ **đổi giá** thì càng khó báo cho tất cả tủ lạnh và cửa hàng cập nhật.
+
+  Tủ lạnh chỉ đáng tiền khi bạn **hay ăn lại cùng một món**. Món nào mỗi ngày chỉ ăn một lần rồi thôi, trữ vào tủ chỉ tốn chỗ.
+</Eli5>
+
+Cache là đòn bẩy hiệu năng rẻ nhất trong system design: một dòng `redis.get` có thể cắt latency từ 50 ms xuống 1 ms và giảm tải database hàng chục lần. Nó cũng là nguồn gốc của rất nhiều bug "sao tôi sửa rồi mà vẫn thấy dữ liệu cũ?". Bài này giúp bạn biết **đặt cache ở tầng nào** trước khi bàn cách ghi/xoá.
+
+<CacheLayersRequestPathDiagram />
+
+<Technical>
+
+### Các tầng cache
+
+| Tầng | Ví dụ | Ai kiểm soát | Xoá khi dữ liệu đổi |
+|---|---|---|---|
+| Browser | HTTP cache theo `Cache-Control`, `ETag` | Header server gửi, nhưng nằm trên máy user | Khó nhất — chỉ chờ hết hạn hoặc đổi URL |
+| CDN edge | Cloudflare, CloudFront, Fastly | Header + cấu hình CDN | Purge qua API (mất vài giây tới vài phút tuỳ CDN) hoặc đổi URL |
+| Reverse proxy | Nginx `proxy_cache`, Varnish | Bạn | Chờ TTL ngắn, hoặc xoá file cache/key |
+| Application | Map/LRU trong process; Redis/Memcached dùng chung | Bạn, trong code | Xoá key chủ động (`DEL`), TTL |
+| Database | Postgres `shared_buffers` + page cache của OS | Database tự lo | Tự động, nhưng không tránh được chi phí chạy query |
+
+### In-process cache vs cache phân tán
+
+- **In-process** (một `Map`/LRU trong RAM của app): nhanh nhất (không có mạng), nhưng mỗi instance một bản ⇒ 3 instance có thể trả 3 giá khác nhau trong vài giây; mất khi restart.
+- **Phân tán** (Redis): mọi instance thấy cùng một bản, xoá một lần là xong; thêm cỡ một round trip trong datacenter (~0,5 ms theo cheat-sheet) và một thành phần cần vận hành.
+- Thường kết hợp: in-process TTL rất ngắn (vài giây) cho vài key cực nóng, Redis cho phần còn lại.
+
+### Vì sao cache hiệu quả: phân bố truy cập lệch
+
+Truy cập thực tế thường lệch mạnh (gần với phân bố Zipf): một phần nhỏ sản phẩm/bài viết nhận phần lớn lượt xem. Vì vậy chỉ cần trữ phần nóng là đạt hit-rate cao. Nếu truy cập **đều** trên hàng tỉ key (ví dụ tra cứu theo id ngẫu nhiên), cache khó đạt hit-rate tốt.
+
+### Ước lượng: trang chi tiết sản phẩm
+
+Giả định: **10M DAU**, mỗi user xem **20** trang sản phẩm/ngày, peak = **3×** trung bình, **1M** sản phẩm nóng, mỗi object JSON cỡ **2 KB**, hit-rate mục tiêu **95%**.
+
+- Lượt đọc/ngày: 10⁷ × 20 = 2 × 10⁸ ⇒ ÷ 10⁵ giây ≈ **2.000 QPS** trung bình, **~6.000 QPS** đỉnh
+- DB chỉ nhận phần miss: 5% × 6.000 ≈ **300 QPS** đỉnh (thay vì 6.000)
+- Bộ nhớ Redis: 10⁶ × 2 KB = 2 GB dữ liệu; cộng overhead key/cấu trúc (giả định ×1,5–2) ⇒ cỡ **3–4 GB**, chừa thêm cho phân mảnh và tăng trưởng
+
+Latency trung bình ≈ hit × t_cache + (1 − hit) × (t_cache + t_db). Với t_cache = 1 ms, t_db = 50 ms:
+
+- hit 90% ⇒ 0,9 × 1 + 0,1 × 51 ≈ **6 ms**
+- hit 50% ⇒ 0,5 × 1 + 0,5 × 51 ≈ **26 ms**
+
+Nhưng **p99 vẫn là latency của miss** — cache làm trung bình đẹp, không tự sửa đuôi latency.
+
+### Khi nào không nên cache
+
+- Dữ liệu phải chính xác tuyệt đối tại thời điểm quyết định: số dư, tồn kho lúc thanh toán, quyền truy cập vừa bị thu hồi.
+- Ghi nhiều hơn đọc, hoặc mỗi request một kết quả khác nhau (hit-rate thấp, chỉ tốn RAM).
+- Tính lại rẻ hơn round trip tới cache.
+- Chưa đo: chưa biết query nào chậm thì chưa biết cache cái gì.
+
+### Trade-off: đặt cache ở đâu?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| In-process (Map/LRU) | Nhanh nhất, không thêm hạ tầng | Mỗi instance một bản, lệch nhau; mất khi restart | Config, dữ liệu gần như bất biến, key cực nóng TTL ngắn |
+| Redis dùng chung | Nhất quán giữa instance, xoá chủ động được | Thêm round trip, thêm dependency cần HA | Object/kết quả query theo key, session |
+| Nginx `proxy_cache` | App không chạy khi hit, cấu hình đơn giản | Cache theo URL, khó xoá chủ động, dễ cache nhầm dữ liệu riêng | API public, TTL vài giây, chống đỉnh tải |
+| CDN | Gần user, giảm băng thông origin | Purge chậm hơn, trả phí egress/request, cần header đúng | Static asset, nội dung public |
+
+Đổi ý khi: hit-rate đo được thấp (dưới cỡ 50–60%) trong khi bộ nhớ tốn nhiều — xem lại key, TTL, hoặc bỏ cache ở tầng đó.
+
+</Technical>
+
+## Thực hành
+
+Đo nhanh "một đoạn đường" tốn bao nhiêu trong `sd-playground` trước khi viết cache.
+
+<Terminal
+  commands={[
+    { comment: "Độ trễ tới Redis từ trong mạng Docker (Ctrl+C để dừng; số minh hoạ)", command: "docker compose exec redis redis-cli --latency", output: "min: 0, max: 2, avg: 0.18 (2143 samples)" },
+    { comment: "Thời gian một request đọc sản phẩm chưa có cache", command: "curl -s -o /dev/null -w 'total=%{time_total}s\\n' localhost:8080/api/products/42", output: "total=0.058912s" },
+    { comment: "Query giả lập chậm trong Postgres", command: "docker compose exec postgres psql -U postgres -c '\\timing on' -c 'SELECT p.*, pg_sleep(0.05) FROM products p WHERE id = 42;'", output: "Timing is on.\n id |    name    | price | pg_sleep\n----+------------+-------+----------\n 42 | Product 42 |   731 |\n(1 row)\n\nTime: 51.204 ms" },
+    { comment: "Postgres đang đọc từ RAM được bao nhiêu? (tỉ lệ blks_hit)", command: "docker compose exec postgres psql -U postgres -c \"SELECT round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 1) AS buffer_hit_pct FROM pg_stat_database WHERE datname = 'postgres';\"", output: " buffer_hit_pct\n----------------\n           99.2\n(1 row)" },
+  ]}
+/>
+
+Buffer hit 99% nghĩa là Postgres đã đọc từ RAM gần hết — query vẫn tốn 50 ms vì *công việc tính toán*, không phải vì đọc đĩa. Cache ở tầng app tiết kiệm được chính phần công việc đó.
+
+<Callout type="mistake" title="Cache mọi thứ cho chắc">
+  Thêm cache cho mọi endpoint mà không đo: hit-rate thấp, tốn RAM, và mỗi cache là thêm một nơi có thể trả dữ liệu cũ. Bắt đầu từ endpoint đọc nhiều nhất và chậm nhất, đo hit-rate, rồi mới mở rộng.
+</Callout>
+
+<Callout type="warning">
+  Cache in-process với 3 instance sau load balancer round robin: user refresh trang có thể thấy giá nhảy qua lại giữa bản cũ và bản mới cho tới khi mọi instance hết TTL. Nếu điều đó không chấp nhận được, dùng cache dùng chung.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Đừng chỉ nói "thêm Redis". Câu trả lời mạnh nêu: dữ liệu nào cache ở tầng nào (asset → CDN, object → Redis), hit-rate kỳ vọng dựa trên phân bố truy cập, DB còn nhận bao nhiêu QPS sau cache, bộ nhớ cần bao nhiêu, và **dữ liệu nào không cache** vì cần chính xác.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "cache hit / miss", meaning: "Tìm thấy dữ liệu trong cache / phải đi lấy từ nguồn." },
+    { term: "hit-rate", meaning: "hits ÷ (hits + misses) — thước đo cache có đáng tiền không." },
+    { term: "in-process cache", meaning: "Cache nằm trong RAM của từng instance app." },
+    { term: "distributed cache", meaning: "Cache dùng chung qua mạng cho mọi instance, ví dụ Redis." },
+    { term: "CDN edge", meaning: "Máy chủ cache của CDN đặt gần người dùng." },
+    { term: "buffer cache", meaning: "Vùng RAM database dùng để giữ các trang dữ liệu hay đọc." },
+    { term: "Zipf distribution", meaning: "Phân bố lệch: vài phần tử phổ biến chiếm phần lớn lượt truy cập." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn thêm Redis cho endpoint tra cứu mã vận đơn. Sau một tuần hit-rate chỉ 4%, RAM Redis tăng đều. Giải thích hợp lý nhất?"
+  options={[
+    "Redis bị lỗi cấu hình persistence",
+    "Mỗi mã vận đơn thường chỉ được tra vài lần và rải đều trên hàng triệu mã — truy cập không đủ lệch để cache hiệu quả",
+    "TTL quá dài nên hit-rate thấp",
+    "Cần chuyển sang CDN",
+  ]}
+  answerIndex={1}
+  explanation="Tủ lạnh chỉ đáng tiền khi hay ăn lại cùng món. Mỗi mã chỉ tra một hai lần thì hầu như lần nào cũng miss; cần xem lại có nên cache không (hoặc chỉ cache mã đang giao)."
+/>
