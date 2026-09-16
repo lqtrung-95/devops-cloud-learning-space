@@ -1,0 +1,90 @@
+import { ServiceBoundaryDataOwnershipDiagram } from "../diagrams/service-boundary-data-ownership-diagram";
+
+<Eli5 title="Mỗi quầy có tủ nguyên liệu riêng — không ai thò tay qua tủ quầy bên cạnh" emoji="🧊">
+  Trong khu ẩm thực, quầy phở có tủ riêng đựng bánh phở, thịt, nước lèo. Quầy nước ép có tủ riêng đựng trái cây. Nếu quầy phở hết bánh phở giữa giờ đông khách mà tự ý mở tủ quầy nước ép lấy đồ thay, hai quầy sẽ **loạn kiểm kê** — cuối ngày không ai biết còn bao nhiêu nguyên liệu thật.
+
+  Ranh giới đúng không phải "quầy dao, quầy nồi, quầy bát" (chia theo công cụ) mà là "quầy phở, quầy nước ép, quầy chè" (chia theo **món ăn trọn vẹn** — mỗi quầy tự đủ để phục vụ 1 loại nhu cầu của khách từ đầu tới cuối). Đó là **bounded context**. Và mỗi quầy khoá tủ riêng — không quầy nào đọc/sửa tủ của quầy khác — đó là **database-per-service**.
+</Eli5>
+
+Ranh giới service là quyết định khó sửa nhất trong cả module: sai ranh giới ở bước này, mọi bước sau (gateway, saga, API) đều phải vá lỗi thay vì giải quyết gốc. Ranh giới đúng theo **domain** giúp mỗi service tự chứa đủ logic cho 1 nghiệp vụ hoàn chỉnh, thay vì phải gọi 3 service khác cho mỗi request.
+
+<ServiceBoundaryDataOwnershipDiagram />
+
+<Technical>
+
+### Bounded context: chia theo domain, không theo layer
+
+Sai lầm phổ biến: chia theo tầng kỹ thuật (`controllers-service`, `business-logic-service`, `data-access-service`). Kết quả: **mọi** tính năng đều phải đi qua cả 3 service theo chuỗi — coupling còn chặt hơn monolith, chỉ khác là giờ qua network.
+
+Chia đúng theo **bounded context** (khái niệm từ Domain-Driven Design): mỗi context là 1 khu vực nghiệp vụ có ngôn ngữ và mô hình dữ liệu riêng — `Order`, `Inventory`, `Payment`, `Shipping`. Mỗi context trở thành 1 service, tự chứa đủ logic để xử lý trọn vẹn 1 nhóm use case.
+
+### Database-per-service: hệ quả bắt buộc, không phải tuỳ chọn
+
+Nếu 2 service cùng đọc/ghi 1 database, chúng **không thực sự độc lập** — đổi schema ở service A có thể vỡ service B mà không ai biết cho tới khi deploy. Vì vậy microservices thật sự đi kèm nguyên tắc: **mỗi bảng chỉ có đúng 1 service được ghi (và thường chỉ 1 service được đọc trực tiếp)**.
+
+Hệ quả trực tiếp:
+
+- **Không còn cross-service JOIN.** `SELECT * FROM orders o JOIN inventory i ON o.sku = i.sku` không chạy được nếu `orders` và `inventory` ở 2 database khác nhau.
+- **Không còn cross-service transaction (2PC không thực tế ở quy mô lớn).** Không thể `BEGIN; UPDATE orders...; UPDATE inventory...; COMMIT;` xuyên 2 service — đây chính là lý do cần **saga** (bài 4).
+- **Dữ liệu cần cho báo cáo/hiển thị phải lấy qua API hoặc bản sao đồng bộ (denormalization có chủ đích)**, không lấy bằng JOIN thẳng.
+
+### Hai cách lấy dữ liệu của service khác
+
+| Cách | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Gọi API đồng bộ (`GET /inventory/{sku}`) | Luôn thấy dữ liệu mới nhất | Thêm latency mạng; nếu Inventory chết, Order cũng bị ảnh hưởng (cần timeout/circuit breaker — SD11) | Cần dữ liệu tức thời, tần suất gọi vừa phải |
+| Giữ bản sao cục bộ, đồng bộ qua event | Đọc nhanh, không phụ thuộc service khác lúc đọc | Dữ liệu có độ trễ (eventual consistency); phải xử lý outbox/event như SD07 | Đọc rất nhiều, chấp nhận độ trễ vài giây, hoặc cần chống lỗi dây chuyền |
+
+**Khi nào đổi ý:** nếu một service phải gọi đồng bộ tới 4-5 service khác chỉ để trả lời 1 request đơn giản, đó là dấu hiệu ranh giới bị vẽ sai (context quá nhỏ) — cân nhắc gộp lại các context luôn cần dữ liệu của nhau.
+
+### Chia sẻ code dùng chung: cẩn thận "shared kernel"
+
+Một thư viện dùng chung (vd định nghĩa kiểu `Money`, `OrderStatus`) là hợp lý nếu ổn định và hiếm đổi. Nhưng nếu team liên tục sửa thư viện dùng chung để phục vụ riêng 1 service, nó trở thành **shared kernel** ngầm — thay đổi ở đây lại buộc mọi service phải deploy lại cùng lúc, xoá mất lợi ích "deploy độc lập" mà bạn vừa tách ra.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo schema riêng cho từng service ngay trong 1 Postgres instance của sd-playground", command: "docker compose exec postgres psql -U app -d app -c \"CREATE SCHEMA order_svc; CREATE SCHEMA inventory_svc; CREATE SCHEMA payment_svc;\"", output: "CREATE SCHEMA\nCREATE SCHEMA\nCREATE SCHEMA" },
+    { comment: "Tạo user riêng cho mỗi service, chỉ cấp quyền đúng 1 schema (enforce ownership ở tầng DB)", command: "docker compose exec postgres psql -U app -d app -c \"CREATE USER order_user WITH PASSWORD 'x'; GRANT USAGE, CREATE ON SCHEMA order_svc TO order_user; REVOKE ALL ON SCHEMA inventory_svc, payment_svc FROM order_user;\"", output: "CREATE ROLE\nGRANT\nREVOKE" },
+    { comment: "order_user thử đọc bảng của inventory_svc — phải bị từ chối", command: "docker compose exec postgres psql -U order_user -d app -c \"SELECT * FROM inventory_svc.inventory LIMIT 1;\"", output: "ERROR:  permission denied for schema inventory_svc" },
+    { comment: "Chuyển orders sang schema riêng và xác nhận JOIN chéo schema vẫn kỹ thuật CÒN chạy được — đây là bẫy cần tự kỷ luật, không dựa vào hạ tầng chặn hộ", command: "docker compose exec postgres psql -U app -d app -c \"ALTER TABLE orders SET SCHEMA order_svc;\"", output: "ALTER TABLE" },
+  ]}
+/>
+
+<Callout type="mistake" title="'Vẫn chung 1 Postgres nên JOIN cho nhanh, sau tách database thật sau'">
+  Nếu 2 schema còn nằm chung 1 instance Postgres, JOIN chéo schema **vẫn chạy được về mặt kỹ thuật** — không có gì chặn bạn viết `order_svc.orders JOIN inventory_svc.inventory`. Nhưng làm vậy là xoá sạch lợi ích ranh giới: đổi cột ở `inventory_svc.inventory` sẽ âm thầm làm vỡ code của Order service. Enforce ownership bằng quyền DB (như lab trên) và kỷ luật code review, đừng đợi tới lúc tách database vật lý mới bắt đầu tuân thủ.
+</Callout>
+
+<Callout type="tip" title="Denormalize có chủ đích, không phải 'sao chép bừa'">
+  Giữ bản sao `sku_snapshot(sku, name, price)` ở Order service để hiển thị đơn hàng nhanh là hợp lý — miễn là ghi rõ **Inventory service vẫn là nguồn sự thật** cho giá/tên, và Order chấp nhận dữ liệu có thể trễ vài giây so với Inventory.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Câu hỏi kinh điển: "Order và Inventory database riêng, làm sao check tồn kho khi tạo đơn mà không JOIN?" Câu trả lời mạnh nêu cả 2 lựa chọn (gọi API đồng bộ có timeout, hoặc cache cục bộ đồng bộ qua event) và chọn dựa trên yêu cầu freshness — đồng thời chỉ ra vì sao *không* nên gộp lại 1 database "cho tiện".
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "bounded context", meaning: "Ranh giới nghiệp vụ có mô hình dữ liệu và ngôn ngữ riêng; nền tảng để vẽ ranh giới service." },
+    { term: "database-per-service", meaning: "Mỗi service sở hữu database riêng; không service khác được ghi trực tiếp." },
+    { term: "cross-service join", meaning: "JOIN xuyên 2 database của 2 service — không khả thi sau khi tách database thật." },
+    { term: "shared kernel", meaning: "Code/thư viện dùng chung giữa nhiều service; rủi ro nếu đổi thường xuyên vì buộc deploy đồng thời." },
+    { term: "denormalization có chủ đích", meaning: "Giữ bản sao dữ liệu của service khác để đọc nhanh, chấp nhận độ trễ đồng bộ." },
+    { term: "source of truth", meaning: "Service duy nhất được coi là đúng cho một loại dữ liệu; các bản sao khác chỉ là cache." },
+  ]}
+/>
+
+<QuickCheck
+  question="Order service và Inventory service đã có database riêng. Một dev đề xuất: 'Cho Order service kết nối trực tiếp vào Postgres của Inventory bằng một connection string chỉ-đọc, để lấy tồn kho nhanh hơn gọi API.' Vấn đề chính?"
+  options={[
+    "Không có vấn đề, đọc thôi thì an toàn",
+    "Order giờ phụ thuộc thẳng vào SCHEMA nội bộ của Inventory — Inventory đổi tên cột/cấu trúc bảng nội bộ sẽ âm thầm làm vỡ Order mà không ai biết cho tới khi lỗi ở production",
+    "Kết nối chỉ-đọc luôn nhanh hơn API nên nên làm",
+    "Vấn đề duy nhất là tốn thêm 1 connection pool",
+  ]}
+  answerIndex={1}
+  explanation="Giống việc quầy phở tự ý mở tủ quầy nước ép để 'chỉ nhìn, không lấy' — quầy nước ép vẫn có thể sắp xếp lại tủ (đổi schema nội bộ) bất cứ lúc nào vì họ không biết ai đó bên ngoài đang dựa vào cách sắp xếp cũ. API là hợp đồng công khai, ổn định; schema DB nội bộ thì không — đó là lý do database-per-service nghĩa là không ai bên ngoài được đọc thẳng DB, kể cả chỉ-đọc."
+/>

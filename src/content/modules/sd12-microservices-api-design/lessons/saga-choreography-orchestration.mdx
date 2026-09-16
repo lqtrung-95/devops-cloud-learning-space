@@ -1,0 +1,90 @@
+import { SagaOrchestrationCompensationDiagram } from "../diagrams/saga-orchestration-compensation-diagram";
+
+<Eli5 title="Combo phở + nước ép + chè lỡ hết nguyên liệu giữa chừng — ai hoàn tiền?" emoji="🧧">
+  Khách đặt combo 3 món ở 3 quầy khác nhau. Quầy phở đã nấu xong, quầy nước ép đã ép xong, nhưng quầy chè báo hết đậu xanh. Ở 1 bếp chung, chuyện này dễ: huỷ cả đơn trước khi bắt đầu nấu (transaction, tất cả hoặc không gì cả). Nhưng 3 quầy độc lập thì phở và nước ép **đã làm xong rồi** — không "rollback" nồi phở đã nấu được nữa.
+
+  Cách duy nhất: **hoàn tiền/trả nguyên liệu ngược lại** — quầy phở trả lại nguyên liệu vào tủ, hoàn tiền phần đó cho khách. Đó là **compensating transaction**. Câu hỏi còn lại là: ai đứng ra điều phối việc hoàn tiền này — có 1 "quản lý tầng" cầm sổ theo dõi (**orchestration**), hay mỗi quầy tự nghe loa thông báo và tự quyết định hoàn tiền phần mình (**choreography**)?
+</Eli5>
+
+Đây là hệ quả trực tiếp của bài trước: khi mỗi service có database riêng, không còn transaction ACID xuyên service. Saga là cách chuẩn để giữ dữ liệu nhất quán khi một chuỗi hành động trải dài qua nhiều service — bằng cách chấp nhận mỗi bước là 1 transaction cục bộ đã commit, và chuẩn bị sẵn bước "bù trừ" nếu có bước sau lỗi.
+
+<SagaOrchestrationCompensationDiagram />
+
+<Technical>
+
+### Saga là gì, và KHÔNG phải là gì
+
+Saga = một chuỗi transaction cục bộ, mỗi transaction commit ngay khi service của nó xử lý xong, và publish 1 sự kiện/lệnh để bước tiếp theo chạy. Nếu một bước lỗi, saga chạy các **compensating transaction** để bù lại tác dụng của các bước đã thành công trước đó.
+
+Saga **không** có tính **isolation** như ACID transaction: giữa lúc Inventory đã giữ hàng và Payment chưa charge xong, một request khác có thể đọc thấy trạng thái "nửa vời" đó (vd tồn kho đã giảm dù đơn có thể bị huỷ sau). Xử lý bằng cách gắn cờ trạng thái rõ ràng (`PENDING`, `RESERVED`) và để phía đọc biết cách diễn giải, hoặc dùng semantic lock (khoá theo nghiệp vụ, không phải khoá DB).
+
+### Orchestration: có người điều phối trung tâm
+
+Một **saga orchestrator** giữ state machine cho mỗi saga instance (`order-1: CREATED → INVENTORY_RESERVED → PAYMENT_CHARGED → SHIPPED`), và chủ động ra lệnh cho từng service (`ReserveInventory`, `ChargePayment`…) qua topic lệnh riêng. Service trả lời bằng sự kiện, orchestrator quyết định bước tiếp theo hoặc gọi compensation.
+
+### Choreography: mỗi service tự nghe, tự quyết
+
+Không có nhạc trưởng — mỗi service publish sự kiện khi xong việc, và các service khác **tự đăng ký nghe** sự kiện chúng quan tâm rồi tự quyết định hành động. Order publish `OrderCreated`, Inventory tự nghe và tự publish `InventoryReserved`, Payment tự nghe và tự xử lý tiếp.
+
+| Tiêu chí | Choreography | Orchestration |
+|---|---|---|
+| Decoupling | Cao — service không biết ai nghe event của mình | Thấp hơn — orchestrator biết và gọi tên từng service |
+| Nhìn thấy toàn cảnh 1 saga | Khó — phải lần theo log của nhiều service | Dễ — state nằm ở 1 nơi (bảng state của orchestrator) |
+| Thêm bước mới vào quy trình | Phải sửa logic của service đang nghe event liên quan | Chỉ sửa orchestrator, service khác không đổi |
+| Rủi ro | Cyclic dependency ngầm giữa các event, khó debug khi nhiều bước | Orchestrator có thể phình to thành "God service" nếu ôm cả business logic |
+| Dùng khi | Quy trình ngắn (2-3 bước), ít khi đổi | Quy trình nhiều bước, cần audit/nhìn trạng thái rõ, hay thay đổi |
+
+**Khi nào đổi ý:** nếu choreography có >4-5 loại event nối nhau và không ai còn vẽ nổi sơ đồ luồng, chuyển sang orchestration để lấy lại khả năng nhìn thấy toàn cảnh — kể cả khi phải chấp nhận thêm 1 điểm phối hợp trung tâm.
+
+### Reliable saga = outbox từ SD07
+
+Saga đưa lệnh/sự kiện qua broker, nên gặp đúng vấn đề "dual-write" đã học ở SD07: nếu service ghi DB (vd `orders.status = 'INVENTORY_RESERVED'`) rồi mới publish sự kiện, crash giữa hai bước làm mất sự kiện. Giải pháp giống hệt: mỗi service tham gia saga có bảng `outbox` riêng, ghi thay đổi trạng thái và sự kiện saga trong cùng 1 transaction, để relay publish sau — **không phát minh cơ chế mới, dùng lại outbox + relay đã dựng ở SD07**.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo outbox riêng cho từng service tham gia saga (schema giống hệt SD07)", command: "docker compose exec postgres psql -U app -d app -f /sql/saga-outboxes.sql", output: "CREATE TABLE\nCREATE TABLE\nCREATE TABLE\nCREATE TABLE" },
+    { comment: "Chạy 20 đơn hàng bình thường, xem đủ 4 sự kiện mỗi đơn theo thứ tự", command: "docker compose exec redpanda rpk topic consume order-saga-events -o start -n 10 -f '%k %v\\n'", output: "order-1 {\"type\":\"OrderCreated\"}\norder-1 {\"type\":\"InventoryReserved\"}\norder-1 {\"type\":\"PaymentCharged\"}\norder-1 {\"type\":\"Shipped\"}" },
+    { comment: "Bật kịch bản lỗi thanh toán cho 1 sku cụ thể", command: "docker compose exec payment-svc sh -c \"export PAYMENT_FAIL_SKU=sku-42\"" },
+    { comment: "Đặt đơn với sku-42, xác nhận orchestrator publish lệnh bù trừ thay vì ShipOrder", command: "docker compose exec redpanda rpk topic consume order-saga-commands -o end -n 1 -f '%v\\n' & curl -s -X POST localhost:8080/orders -d '{\"sku\":\"sku-42\",\"qty\":1}'", output: "{\"type\":\"ReleaseInventory\",\"orderId\":\"order-21\"}" },
+    { comment: "Xác nhận trạng thái cuối và tồn kho đã trả lại đúng — không còn hàng bị giữ treo", command: "docker compose exec postgres psql -U app -d app -c \"SELECT status FROM orders WHERE id = 'order-21'; SELECT reserved_qty FROM inventory WHERE sku = 'sku-42';\"", output: " status\n-------------\n COMPENSATED\n(1 row)\n\n reserved_qty\n--------------\n            0\n(1 row)" },
+  ]}
+/>
+
+<Callout type="mistake" title="Nghĩ saga có thể 'rollback' như transaction DB">
+  Không có `ROLLBACK` xuyên service. Mỗi bước saga đã COMMIT thật ở database của service đó — thứ duy nhất bạn có là chạy thêm 1 transaction MỚI để bù lại tác dụng (trả hàng, hoàn tiền), không phải xoá đi transaction cũ như chưa từng xảy ra.
+</Callout>
+
+<Callout type="warning" title="Compensation cũng cần idempotent">
+  Nếu orchestrator crash sau khi gửi `ReleaseInventory` nhưng trước khi ghi nhận đã gửi, nó có thể gửi lại lần hai (đúng bài học delivery semantics ở SD07). Inventory service xử lý `ReleaseInventory` phải idempotent theo `order_id` — trả hàng 2 lần cho cùng 1 đơn sẽ làm tồn kho sai theo hướng ngược lại.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  "Thiết kế luồng đặt hàng nhiều bước qua nhiều service, xử lý khi 1 bước lỗi giữa chừng" gần như luôn cần nhắc tới saga. Câu trả lời mạnh: gọi tên **saga** (không nói "dùng 2PC" — không thực tế ở quy mô lớn), chọn **orchestration** cho quy trình có nhiều bước cần audit, mô tả rõ **compensating transaction** cho bước lỗi, và nhấn mạnh saga chỉ đảm bảo *eventual* consistency, không có isolation của ACID.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "saga", meaning: "Chuỗi transaction cục bộ nối bằng sự kiện/lệnh, có compensating transaction khi 1 bước lỗi." },
+    { term: "compensating transaction", meaning: "Transaction mới bù lại tác dụng của 1 bước đã commit, không phải rollback." },
+    { term: "orchestration", meaning: "Saga có 1 orchestrator trung tâm giữ state và ra lệnh từng bước." },
+    { term: "choreography", meaning: "Saga không có điều phối trung tâm; mỗi service tự nghe event và tự quyết định hành động." },
+    { term: "isolation (thiếu ở saga)", meaning: "Saga không đảm bảo không ai đọc thấy trạng thái 'nửa vời' giữa các bước." },
+    { term: "semantic lock", meaning: "Đánh dấu trạng thái nghiệp vụ (vd PENDING) để phía đọc biết dữ liệu chưa hoàn tất, thay cho khoá DB." },
+  ]}
+/>
+
+<QuickCheck
+  question="Saga orchestration cho luồng đặt hàng: Inventory đã giữ hàng, Payment đã charge thành công, nhưng Shipping báo lỗi 'không có tài xế khả dụng'. Hành động đúng của orchestrator?"
+  options={[
+    "Bỏ qua lỗi Shipping, coi như đơn đã hoàn tất vì tiền đã thu",
+    "Gọi compensating transaction để hoàn tiền (`RefundPayment`) và trả hàng (`ReleaseInventory`), rồi đánh dấu đơn COMPENSATED — không thể ép Shipping 'thành công' bằng cách rollback DB của Payment/Inventory",
+    "Thử lại Shipping vô hạn lần cho tới khi có tài xế",
+    "Xoá đơn khỏi hệ thống để không ai thấy lỗi",
+  ]}
+  answerIndex={1}
+  explanation="Combo đã nấu xong phở và ép xong nước nhưng chè thì không giao được — phải hoàn tiền phở và nước ép lại cho khách, không thể giả vờ combo đã hoàn tất. Compensation phải chạy NGƯỢC theo đúng các bước đã thành công (RefundPayment rồi ReleaseInventory), và orchestrator biết chính xác cần bù trừ gì nhờ state machine đang giữ."
+/>

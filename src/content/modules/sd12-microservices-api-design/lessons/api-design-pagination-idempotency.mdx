@@ -1,0 +1,102 @@
+import { OffsetVsCursorPaginationDiagram } from "../diagrams/offset-vs-cursor-pagination-diagram";
+
+<Eli5 title="Tờ menu rõ ràng, mã phiếu chống gọi trùng, và cách lật trang menu dài triệu món" emoji="📋">
+  Một quán ngon còn cần tờ menu dễ đọc: tên món rõ ràng theo danh mục (không viết tắt khó hiểu), có ghi "menu mùa hè 2026" khi đổi món (versioning). Phiếu order có **mã số riêng** — nếu chạy bàn đưa nhầm phiếu số 42 xuống bếp hai lần, bếp nhìn mã là biết đã nấu rồi, không nấu thêm lần hai (**idempotent POST**).
+
+  Còn khi khách muốn xem hết 5 triệu món trong catalogue, đừng bắt khách "đếm từ món số 1 tới món số 4.999.980 rồi mới cho xem 20 món tiếp" (**offset pagination** — càng lật sâu càng chậm). Thay vào đó, đánh dấu "tôi đang đọc dở tới món có mã XYZ", lần sau đưa đúng mã đó ra là biết đọc tiếp từ đâu (**cursor pagination** — luôn nhanh như nhau dù đọc tới đâu).
+</Eli5>
+
+Đây là bài cuối của module, và cũng là bài áp dụng trực tiếp nhất: những nguyên tắc API design tốt giúp mọi service (dù tách hay chưa tách) dễ dùng, dễ tiến hoá và an toàn khi client retry.
+
+<OffsetVsCursorPaginationDiagram />
+
+<Technical>
+
+### Resource naming & versioning
+
+- Dùng **danh từ số nhiều** cho resource: `/orders`, `/orders/{id}/items`, không phải `/getOrder` hay `/order-service/fetch`.
+- Lồng resource khi có quan hệ sở hữu rõ ràng: `/orders/{id}/items`, nhưng đừng lồng quá 2 cấp — `/users/{id}/orders/{id}/items/{id}/notes` khó dùng.
+- **Versioning:** đặt version ở URI (`/v1/orders`) đơn giản, dễ thấy khi debug; đặt ở header (`Accept: application/vnd.api+json;version=1`) "sạch" hơn về mặt REST nhưng khó grep log hơn. Chọn 1 cách và nhất quán toàn hệ thống — đổi version là **breaking change**, không đổi ngầm field cũ.
+
+### Offset vs cursor (keyset) pagination
+
+`OFFSET n LIMIT m` yêu cầu Postgres **đọc và bỏ qua n dòng** trước khi trả về m dòng — kể cả khi có index trên cột sắp xếp, `OFFSET` không "nhảy thẳng" tới vị trí. Trang càng sâu, chi phí quét càng lớn.
+
+`WHERE id > $lastId ORDER BY id LIMIT m` (cursor/keyset) dùng index seek để nhảy thẳng tới vị trí sau `$lastId`, luôn quét cỡ đúng `m` dòng bất kể đang ở "trang" nào.
+
+| Tiêu chí | Offset pagination | Cursor (keyset) pagination |
+|---|---|---|
+| Chi phí ở trang sâu | Tăng tuyến tính theo độ sâu — `OFFSET 5.000.000` vẫn phải quét ~5 triệu dòng | Gần như hằng số nhờ index seek trên cột cursor |
+| Nhảy thẳng tới "trang N" | Có (`OFFSET (N-1)*limit`) | Không — chỉ đi tiếp/lùi tuần tự từ cursor hiện có |
+| Dữ liệu bị chèn/xoá giữa các lần đọc | Có thể bị trùng/bỏ sót dòng (dòng dịch chuyển vị trí offset) | Ổn định hơn — cursor bám theo giá trị cột, không bám theo vị trí |
+| Dùng khi | UI cần hiện số trang, dữ liệu nhỏ/vừa | Infinite scroll, feed, dataset lớn, API công khai cho bên thứ ba |
+
+**Khi nào đổi ý:** nếu UI thực sự cần "nhảy tới trang 500" và dữ liệu đủ lớn để offset chậm, cân nhắc đánh index vật lý theo trang định kỳ (partition/pre-compute) thay vì ép dùng offset trên bảng sống.
+
+### Idempotent POST bằng idempotency key
+
+HTTP định nghĩa `GET`/`PUT`/`DELETE` là idempotent (gọi lại nhiều lần cho kết quả như gọi 1 lần), nhưng `POST` thì **không** — gọi lại `POST /orders` mặc định tạo thêm 1 đơn mới. Khi client cần retry an toàn (timeout, mất kết nối giữa lúc server đã xử lý xong), giải pháp chuẩn: client tự sinh 1 `Idempotency-Key` (thường là UUID) gửi kèm header, server lưu `(key, request_hash, response)` vào bảng riêng; nếu thấy key đã tồn tại, trả lại đúng response cũ thay vì xử lý lại. Nếu cùng key nhưng payload khác, trả lỗi `409 Conflict` — tránh trường hợp key bị dùng sai cho 2 request khác nhau.
+
+### Error format nhất quán
+
+Trả lỗi theo 1 format cố định trên toàn hệ thống, không phải chuỗi tự do:
+
+```json
+{
+  "error": {
+    "code": "INVENTORY_INSUFFICIENT",
+    "message": "Không đủ hàng cho sku-42",
+    "requestId": "req-8f2a1c"
+  }
+}
+```
+
+`code` để client code xử lý theo logic (switch/case), `message` để hiển thị/debug, `requestId` để nối với distributed tracing khi cần tra log. RFC 7807 (`application/problem+json`) là một chuẩn tham khảo tốt nếu muốn thứ gì đó được công nhận rộng rãi.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Seed 5 triệu dòng vào bảng orders để đo pagination ở dữ liệu lớn thật", command: "docker compose exec postgres psql -U app -d app -c \"INSERT INTO orders (user_id, total, created_at) SELECT 'user-' || (g % 50000), (g % 500000), now() - (g || ' seconds')::interval FROM generate_series(1, 5000000) g;\"", output: "INSERT 0 5000000" },
+    { comment: "Đo offset pagination ở trang sâu", command: "docker compose exec postgres psql -U app -d app -c \"EXPLAIN ANALYZE SELECT * FROM orders ORDER BY id OFFSET 4999980 LIMIT 20;\"", output: "Limit  (cost=... rows=20)\n  ->  Index Scan using orders_pkey on orders\nPlanning Time: 0.412 ms\nExecution Time: 812.347 ms" },
+    { comment: "Đo cursor pagination ở đúng vị trí tương đương", command: "docker compose exec postgres psql -U app -d app -c \"EXPLAIN ANALYZE SELECT * FROM orders WHERE id > 4999980 ORDER BY id LIMIT 20;\"", output: "Limit  (cost=... rows=20)\n  ->  Index Scan using orders_pkey on orders\nPlanning Time: 0.298 ms\nExecution Time: 1.129 ms" },
+    { comment: "Bắn 200 request POST /orders với CÙNG idempotency key, xác nhận chỉ tạo đúng 1 đơn", command: "for i in $(seq 1 200); do curl -s -o /dev/null -X POST localhost:8080/orders -H 'Idempotency-Key: demo-key-1' -d '{\"sku\":\"sku-1\",\"qty\":1}'; done; docker compose exec postgres psql -U app -d app -c \"SELECT count(*) FROM orders WHERE idempotency_key = 'demo-key-1';\"", output: " count\n-------\n     1\n(1 row)" },
+  ]}
+/>
+
+<Callout type="mistake" title="Tưởng POST đã idempotent sẵn vì có unique constraint trên sku+timestamp">
+  Unique constraint đúng cho 1 lần chèn, nhưng nếu request retry có timestamp khác (do client tạo lại object trước khi gửi lại) thì constraint không bắt được — vẫn tạo đơn trùng. Idempotency key phải do CLIENT sinh một lần duy nhất cho cả vòng đời của thao tác đó (kể cả khi retry), không phải sinh mới mỗi lần gọi.
+</Callout>
+
+<Callout type="warning" title="OFFSET giả vờ nhanh khi test với dữ liệu nhỏ">
+  `EXPLAIN ANALYZE` với 1.000 dòng thì offset trang sâu vẫn nhanh — bẫy phổ biến là test pagination với dataset nhỏ rồi kết luận "không sao". Chi phí `OFFSET n` chỉ lộ rõ khi n đủ lớn (hàng trăm nghìn tới hàng triệu), đúng như lab seed 5 triệu dòng ở trên.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  "Thiết kế API list resource cho dataset lớn, hỗ trợ infinite scroll" gần như luôn kỳ vọng bạn đề xuất cursor pagination thay vì offset, và giải thích được TẠI SAO offset chậm (`OFFSET` vẫn phải quét/bỏ qua n dòng) chứ không chỉ nói "cursor nhanh hơn". Thêm điểm nếu bạn tự nêu đánh đổi: cursor không hỗ trợ nhảy thẳng tới số trang bất kỳ.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "resource naming", meaning: "Đặt tên endpoint theo danh từ số nhiều, phản ánh resource chứ không phải hành động." },
+    { term: "API versioning", meaning: "Đánh dấu phiên bản API (URI hoặc header) để thay đổi breaking không phá client cũ." },
+    { term: "offset pagination", meaning: "Phân trang bằng OFFSET/LIMIT; chi phí quét tăng theo độ sâu trang." },
+    { term: "cursor (keyset) pagination", meaning: "Phân trang bằng điều kiện so sánh trên cột có index; chi phí gần như hằng số." },
+    { term: "idempotency key", meaning: "Khoá do client sinh, gắn với 1 lần gọi POST, để server nhận diện và trả lại kết quả cũ khi retry." },
+    { term: "RFC 7807 (problem+json)", meaning: "Chuẩn format lỗi HTTP có type, title, status, detail — tham khảo tốt cho error format nhất quán." },
+  ]}
+/>
+
+<QuickCheck
+  question="API `GET /orders?page=5000&limit=20` chạy chậm dần khi số trang tăng, dù `EXPLAIN ANALYZE` cho thấy vẫn dùng đúng index trên `id`. Nguyên nhân và cách sửa đúng nhất?"
+  options={[
+    "Do thiếu index — cần thêm index mới trên cột `total`",
+    "Do OFFSET vẫn phải quét/bỏ qua (page-1)*limit dòng trước khi lấy 20 dòng — chuyển sang cursor pagination (`WHERE id > $lastId`) để chi phí không phụ thuộc độ sâu trang",
+    "Do LIMIT 20 quá nhỏ, tăng LIMIT lên sẽ nhanh hơn",
+    "Do bảng orders cần được vacuum lại",
+  ]}
+  answerIndex={1}
+  explanation="Index đúng không cứu được OFFSET — engine vẫn phải đếm qua từng dòng bị bỏ để biết đã tới vị trí offset, y hệt việc phải đếm qua 4.999 món trong menu trước khi cho xem 20 món tiếp. Cursor pagination né hoàn toàn việc đếm này bằng cách nhảy thẳng qua index seek tới ngay sau giá trị cursor cuối."
+/>

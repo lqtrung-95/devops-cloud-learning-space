@@ -1,0 +1,89 @@
+import { MonolithToMicroservicesSpectrumDiagram } from "../diagrams/monolith-to-microservices-spectrum-diagram";
+
+<Eli5 title="Khu ẩm thực đông khách không tự nhiên tốt hơn quán 1 bếp" emoji="🍜">
+  Quán phở nhỏ có 1 bếp chung: đầu bếp tự nấu phở, pha nước ép, làm chè. Ít khách thì rất ổn — 1 người quản lý hết, đổi công thức món nào cũng chỉ cần sửa 1 chỗ.
+
+  Khi khách đông gấp 100 lần, chủ quán mở khu ẩm thực nhiều quầy: quầy phở, quầy nước ép, quầy chè — mỗi quầy có đầu bếp và tủ nguyên liệu riêng, nấu song song, không đụng nhau. Nhanh hơn thật, nhưng giờ có **N tủ nguyên liệu phải kiểm kê riêng, N đầu bếp phải điều phối, và khách đặt combo phải chờ đủ 3 quầy trả lời**. Không phải quán nào cũng cần mở khu ẩm thực — nhiều quán chỉ cần sắp xếp lại 1 bếp cho gọn (modular monolith) là đủ.
+</Eli5>
+
+Đây là câu hỏi quan trọng nhất của cả module: **không phải "tách thế nào" mà là "có nên tách không, và tách bây giờ hay để sau"**. Microservices là công cụ giải quyết vấn đề tổ chức (nhiều team làm việc độc lập) và vấn đề scale khác nhau giữa các phần hệ thống — không phải "kiến trúc hiện đại nên có". Đổi lại một service độc lập deploy được, bạn trả giá bằng network call thay cho hàm gọi trong process, và một núi công cụ vận hành mới (service discovery, distributed tracing, retry/circuit breaker đã học ở SD11).
+
+<MonolithToMicroservicesSpectrumDiagram />
+
+<Technical>
+
+### Ba điểm trên một phổ, không phải hai lựa chọn
+
+- **Monolith:** 1 codebase, 1 process, 1 database, 1 lần deploy. Gọi giữa các phần là gọi hàm trong process — cỡ micro giây, không thể lỗi mạng.
+- **Modular monolith:** vẫn 1 process, 1 lần deploy, nhưng code được chia theo **bounded context** (Order, Inventory, Payment…) với interface rõ ràng giữa các module — như đã chuẩn bị ranh giới trước khi cần tách thật. Martin Fowler gọi hướng đi này là **MonolithFirst**: bắt đầu monolith, tách khi có bằng chứng cần tách.
+- **Microservices:** mỗi bounded context thành 1 service riêng, deploy riêng, database riêng (bài sau). Gọi giữa các service là network call — có thể chậm, có thể lỗi, cần timeout/retry.
+
+### Chi phí vận hành thật khi tách (không phải lý thuyết)
+
+| Chi phí | Monolith | Microservices |
+|---|---|---|
+| Gọi giữa các phần | Gọi hàm, cỡ µs, không lỗi mạng | HTTP/gRPC, cỡ ms, có thể timeout/lỗi giữa chừng |
+| Triển khai | 1 pipeline CI/CD | N pipeline, N registry image, N version phải tương thích nhau |
+| Quan sát hệ thống | 1 process log, 1 stack trace | Cần distributed tracing để nối request đi qua nhiều service |
+| Transaction | 1 transaction DB bao trọn nghiệp vụ | Không còn transaction chung — cần saga (bài 4) |
+| Đội ngũ tối thiểu | 1 team nhỏ vẫn quản được | Mỗi service cần người on-call riêng, dễ quá tải nếu team nhỏ mà tách nhiều |
+
+### Khi nào lý do tách là thật
+
+- **Scale khác nhau rõ rệt:** endpoint tìm kiếm nhận 1000 QPS, endpoint đổi mật khẩu nhận 1 QPS — tách ra để scale riêng, không kéo cả monolith theo phần ít tải.
+- **Ranh giới team theo Conway's Law:** 5 team độc lập cùng sửa 1 codebase, merge conflict và release train làm chậm tất cả — tách theo team để mỗi team tự quyết nhịp deploy.
+- **Yêu cầu reliability/compliance khác nhau:** service thanh toán cần audit log, mã hoá, uptime SLA khác hẳn service gợi ý sản phẩm — tách để không kéo theo compliance nặng cho phần không cần.
+- **Công nghệ khác nhau thật sự cần thiết:** service xử lý ảnh cần GPU, phần còn lại chỉ cần CPU thường.
+
+### Khi nào lý do tách là giả (anti-pattern)
+
+- "Microservices là chuẩn hiện đại" — không phải lý do kỹ thuật.
+- "Để mỗi người viết 1 service cho dễ" khi cả team chỉ có 3 người — network call giữa 3 service do 3 người viết không rẻ hơn gọi hàm trong 1 codebase.
+- "Resume-driven development" — muốn ghi Kubernetes + service mesh vào CV.
+- Monolith **đã** chậm/khó bảo trì vì code lộn xộn — sửa bằng modular monolith (dọn ranh giới) trước, tách hạ tầng không sửa được code rối.
+
+**Khi nào đổi ý:** nếu sau khi tách, phần lớn thời gian đội ngũ dành cho hạ tầng (tracing, retry, CI/CD) thay vì tính năng, và service không thật sự scale/deploy độc lập, cân nhắc gộp lại — microservices không phải quyết định một chiều, dù việc gộp lại tốn công hơn tách ra.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem cấu trúc route của app monolith trong sd-playground", command: "docker compose exec app ls src/routes/", output: "orders.ts\ninventory.ts\npayments.ts\nusers.ts" },
+    { comment: "Đếm số dòng — orders.ts đã phình to vì gánh cả logic inventory và payment", command: "docker compose exec app wc -l src/routes/orders.ts", output: "612 src/routes/orders.ts" },
+    { comment: "Tìm bằng chứng coupling: orders.ts đang gọi thẳng logic của 2 domain khác", command: "docker compose exec app grep -n \"inventory\\.\\|payment\\.\" src/routes/orders.ts | head -5", output: "88:  const stock = inventory.checkStock(sku);\n134:  await payment.charge(userId, total);\n201:  inventory.reserve(sku, qty);" },
+    { comment: "Đếm bao nhiêu chỗ trong toàn bộ codebase đụng tới bảng payments — ước lượng 'bán kính nổ' nếu đổi schema", command: "docker compose exec app grep -rln \"FROM payments\\|INTO payments\" src/ | wc -l", output: "7" },
+  ]}
+/>
+
+<Callout type="mistake" title="Tách microservices để 'sửa' code lộn xộn">
+  Tách hạ tầng không sửa được logic rối — 3 service viết cẩu thả vẫn rối như 1 monolith viết cẩu thả, chỉ khác là giờ rối **qua network** nên khó debug hơn. Dọn code (module hoá, đặt interface rõ) trước; nếu sau khi dọn vẫn còn lý do tổ chức/scale để tách, lúc đó tách mới đáng.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  Khi được giao đề "thiết kế hệ thống X", đừng mở đầu bằng sơ đồ 6 microservices. Người phỏng vấn muốn thấy bạn **hỏi yêu cầu và quy mô trước** (Phase 0), rồi mới quyết định monolith hay tách — và nếu tách, giải thích được cái giá cụ thể (latency, vận hành) chứ không chỉ vẽ hộp. Câu trả lời mạnh luôn kèm ít nhất 1 lý do KHÔNG tách hoặc điều kiện để tách sau.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "monolith", meaning: "1 codebase, 1 process, 1 database, deploy cùng lúc." },
+    { term: "modular monolith", meaning: "1 process nhưng code chia theo bounded context với ranh giới rõ, chưa tách hạ tầng." },
+    { term: "microservices", meaning: "Mỗi bounded context là 1 service deploy độc lập, thường có database riêng." },
+    { term: "MonolithFirst", meaning: "Nguyên tắc của Martin Fowler: bắt đầu monolith, chỉ tách khi có bằng chứng cụ thể cần tách." },
+    { term: "Conway's Law", meaning: "Kiến trúc hệ thống có xu hướng phản chiếu cấu trúc giao tiếp của tổ chức làm ra nó." },
+    { term: "resume-driven development", meaning: "Chọn công nghệ vì muốn ghi vào CV, không vì nhu cầu kỹ thuật thật." },
+  ]}
+/>
+
+<QuickCheck
+  question="Startup 6 người vừa fundraise, sản phẩm chưa có 100 người dùng đầu tiên. CTO muốn tách ngay thành 10 microservices theo mô hình của một unicorn để 'sẵn sàng scale'. Lời khuyên đúng nhất?"
+  options={[
+    "Đồng ý — càng sớm càng đỡ phải refactor sau",
+    "Bắt đầu (hoặc giữ) modular monolith; tách khi có bằng chứng cụ thể về scale khác nhau hoặc số team đủ lớn để cần deploy độc lập",
+    "Tách nhưng dùng chung 1 database cho đỡ phức tạp",
+    "Không cần cấu trúc gì cả, viết code trong 1 file cho nhanh",
+  ]}
+  answerIndex={1}
+  explanation="6 người mở 10 quầy thì mỗi người phải trông gần 2 quầy — quản lý còn mệt hơn 1 bếp chung. Chi phí vận hành 10 service (10 pipeline, 10 process, tracing, retry) không có gì đánh đổi lại khi chưa có tải hay đội ngũ cần tách. MonolithFirst: dọn ranh giới rõ trong 1 process, tách khi có lý do thật."
+/>

@@ -1,0 +1,92 @@
+import { ApiGatewayServiceDiscoveryDiagram } from "../diagrams/api-gateway-service-discovery-diagram";
+
+<Eli5 title="Quầy lễ tân dẫn khách tới đúng quầy đang mở" emoji="🚪">
+  Khu ẩm thực 20 quầy sẽ hỗn loạn nếu khách phải tự đi dò từng quầy xem quầy nào đang mở, ở vị trí nào hôm nay. Giải pháp: đặt 1 **quầy lễ tân** ở cổng vào — khách chỉ cần nói "tôi muốn phở", lễ tân tra **bảng thông báo** (vị trí quầy nào đang mở, quầy nào đang dọn dẹp) rồi dẫn khách tới đúng chỗ.
+
+  Lễ tân đó là **API gateway**. Bảng thông báo cập nhật liên tục vị trí các quầy là **service discovery**. Nếu khu ẩm thực có 2 khu riêng cho khách ăn tại chỗ và khách đặt app — mỗi khu có lễ tân riêng phục vụ đúng nhu cầu của khu đó, đó là **BFF (Backend For Frontend)**.
+</Eli5>
+
+Khi đã có nhiều service, client không thể (và không nên) biết địa chỉ, số lượng instance, hay việc instance nào vừa restart của từng service. Gateway và service discovery là lớp gián tiếp giải quyết đúng vấn đề đó — nhưng thêm 1 lớp gián tiếp nghĩa là thêm 1 điểm có thể chậm hoặc lỗi, nên phải biết khi nào thật sự cần thêm lớp tiếp theo (service mesh).
+
+<ApiGatewayServiceDiscoveryDiagram />
+
+<Technical>
+
+### API gateway: một cửa vào, nhiều việc
+
+Gateway đứng giữa client và các service, thường lo:
+
+- **Routing:** map path/host tới đúng service (`/orders/*` → Order service).
+- **Auth tập trung:** xác thực token 1 lần ở cửa vào, service phía sau tin tưởng header đã được xác thực.
+- **Rate limiting & timeout mặc định** cho toàn hệ thống (nối với SD11).
+- **Aggregation (đôi khi):** gộp kết quả từ nhiều service thành 1 response cho client — nhưng cẩn thận, gateway aggregation nhiều sẽ biến gateway thành "monolith ẩn" chứa business logic.
+
+### BFF: gateway riêng cho từng loại client
+
+App mobile cần response gọn nhẹ (ít field, đã tổng hợp sẵn); dashboard admin web cần dữ liệu chi tiết, nhiều field hơn. Thay vì 1 gateway chung cố làm hài lòng cả hai (đầy `if (clientType === 'mobile')`), **Backend For Frontend** tách riêng 1 gateway mỏng cho mỗi loại client, mỗi BFF gọi xuống cùng 1 tầng service. Đánh đổi: thêm 1 tầng để bảo trì, chỉ đáng khi nhu cầu các client khác nhau đủ nhiều.
+
+### Service discovery: ai biết instance nào đang khoẻ, ở đâu
+
+Instance của 1 service đổi địa chỉ liên tục — restart, scale, deploy. Service discovery là lớp tra cứu "tên service → địa chỉ instance đang khoẻ", có 2 kiểu:
+
+| Kiểu | Cách hoạt động | Ví dụ | Dùng khi |
+|---|---|---|---|
+| Server-side discovery | Client chỉ gọi 1 địa chỉ cố định (load balancer/gateway); load balancer tự tra registry và route | Kubernetes `Service` + kube-proxy, AWS ALB + target group | Mặc định cho hầu hết hệ thống — client đơn giản, logic discovery tập trung |
+| Client-side discovery | Client tự tra registry rồi tự chọn instance, gọi thẳng | Netflix Eureka + Ribbon (kiểu cũ) | Cần chọn instance theo logic riêng của client (vd sticky theo latency), chấp nhận client phức tạp hơn |
+
+Registry cần **health check chủ động** (ping định kỳ) hoặc **passive health check** (đếm lỗi liên tiếp, như `max_fails` của Nginx) để loại instance chết ra khỏi danh sách route — nếu không, gateway vẫn route tới instance đã chết cho tới khi client timeout.
+
+### Service mesh: thêm 1 tầng, chỉ đáng khi traffic nội bộ phức tạp
+
+Service mesh (Istio, Linkerd) gắn 1 **sidecar proxy** cạnh mỗi service, lo mTLS, retry, observability cho traffic **giữa các service** (service-to-service, gọi là east-west) — khác với gateway lo traffic từ ngoài vào (north-south). Chi phí: mỗi service chạy thêm 1 proxy, thêm độ trễ nhỏ mỗi hop, thêm 1 hệ thống phải vận hành (control plane). Chỉ đáng đầu tư khi có nhiều service gọi chéo nhau và cần mTLS/observability đồng nhất — không phải bước mặc định khi mới có 3-5 service.
+
+**Khi nào đổi ý:** gateway trở nên khó bảo trì vì chứa quá nhiều business logic đặc thù từng service — dấu hiệu ranh giới bị lẫn, nên đẩy logic đó về lại service sở hữu.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem cấu hình routing hiện tại của Nginx trong sd-playground", command: "docker compose exec nginx cat /etc/nginx/conf.d/default.conf | head -15", output: "upstream app_upstream {\n    server app:3000;\n}\nserver {\n    listen 8080;\n    location / {\n        proxy_pass http://app_upstream;\n    }\n}" },
+    { comment: "Scale app lên 2 instance để mô phỏng nhiều instance của 1 service", command: "docker compose up -d --scale app=2", output: "Creating sd-playground_app_2 ... done" },
+    { comment: "Nginx tự round-robin giữa 2 instance — xác nhận bằng header instance id trong response", command: "for i in 1 2 3 4; do curl -s localhost:8080/health | jq -r '.instanceId'; done", output: "app-1\napp-2\napp-1\napp-2" },
+    { comment: "Dừng 1 instance, xác nhận Nginx (sau vài lần fail) chỉ còn route tới instance sống", command: "docker compose stop app_1 && sleep 6 && for i in 1 2 3 4; do curl -s localhost:8080/health | jq -r '.instanceId'; done", output: "app-2\napp-2\napp-2\napp-2" },
+  ]}
+/>
+
+<Callout type="mistake" title="Gateway tự chứa business logic đặc thù của từng service">
+  Thêm `if (path.startsWith('/orders') && user.tier === 'vip') { applyDiscount(); }` vào gateway là dấu hiệu logic nghiệp vụ bị lẫn vào lớp routing. Gateway nên chỉ route/auth/rate-limit; logic khuyến mãi thuộc về Order service. Nếu không, gateway trở thành 1 monolith mới mà không ai coi là monolith.
+</Callout>
+
+<Callout type="warning" title="Không có health check = route vào chỗ chết">
+  Nếu registry/load balancer không loại instance đã chết, client sẽ liên tục nhận timeout thay vì được route sang instance khoẻ. Luôn cấu hình health check chủ động (probe định kỳ) hoặc passive (đếm lỗi liên tiếp như lab trên) — thiếu cả hai là nguyên nhân phổ biến của "outage cục bộ" dù hệ thống thật ra vẫn có instance sống.
+</Callout>
+
+<Callout type="info" title="Góc phỏng vấn">
+  "API gateway và service mesh khác nhau thế nào?" là câu hỏi hay bị trả lời lẫn lộn. Câu trả lời mạnh: gateway lo traffic **north-south** (ngoài vào), thường 1 lớp; service mesh lo traffic **east-west** (giữa các service), qua sidecar proxy ở mỗi service — và mesh chỉ đáng chi phí khi số lượng gọi chéo giữa service đủ lớn để cần mTLS/observability đồng nhất.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "API gateway", meaning: "Điểm vào duy nhất lo routing, auth, rate limit cho traffic từ client vào hệ thống." },
+    { term: "BFF (Backend For Frontend)", meaning: "Gateway riêng cho từng loại client (mobile, web), tối ưu response theo nhu cầu client đó." },
+    { term: "service discovery", meaning: "Lớp tra cứu tên service ra địa chỉ instance đang khoẻ." },
+    { term: "server-side vs client-side discovery", meaning: "Load balancer tự tra registry (server-side) so với client tự tra rồi gọi thẳng (client-side)." },
+    { term: "health check chủ động/thụ động", meaning: "Ping định kỳ để biết instance còn sống, hoặc đếm lỗi liên tiếp để loại instance khỏi vòng route." },
+    { term: "service mesh", meaning: "Sidecar proxy ở mỗi service lo mTLS/retry/observability cho traffic giữa các service." },
+    { term: "north-south vs east-west traffic", meaning: "Traffic từ ngoài vào hệ thống, so với traffic giữa các service nội bộ." },
+  ]}
+/>
+
+<QuickCheck
+  question="Hệ thống có 4 service, chủ yếu nhận request từ app mobile và website, các service hiếm khi gọi chéo nhau. Team đang cân nhắc giữa 'chỉ thêm API gateway' và 'thêm cả API gateway + service mesh'. Lựa chọn hợp lý?"
+  options={[
+    "Cả hai luôn — càng nhiều lớp bảo vệ càng an toàn",
+    "Chỉ API gateway — vấn đề chính là traffic north-south (client vào); service mesh giải quyết traffic east-west (giữa service) vốn chưa phức tạp ở đây, thêm vào chỉ tốn chi phí vận hành không cần thiết",
+    "Chỉ service mesh, bỏ gateway vì mesh làm được mọi việc",
+    "Không cần cái nào, để client gọi thẳng 4 service",
+  ]}
+  answerIndex={1}
+  explanation="Chưa cần thuê thêm đội an ninh tuần tra hành lang giữa các quầy (service mesh) khi vấn đề thật sự chỉ là dẫn khách từ cổng vào đúng quầy (gateway). Thêm mesh khi chưa có nhiều gọi chéo phức tạp giữa service chỉ cộng thêm sidecar proxy, độ trễ và 1 control plane phải vận hành mà không giải quyết vấn đề nào đang có."
+/>
