@@ -1,0 +1,107 @@
+import { SyncBlockingVsAsyncQueuedDiagram } from "../diagrams/sync-blocking-vs-async-queued-diagram";
+
+<Eli5 title="Quán ăn hô 'đã nhận order!' rồi mới vào bếp nấu" emoji="🍽️">
+  Bạn gọi món ở quán ăn. Nhân viên không đứng im tại quầy chờ bếp nấu xong rồi mới quay lại nói "đã nhận order" — họ hô ngay câu đó, ghi order vào hệ thống, rồi bạn ngồi xuống bàn chờ. Món ăn (việc tốn thời gian) được xử lý **song song**, không chặn việc bạn được xác nhận đã đặt món thành công.
+
+  `taskflow-api` cũng có những việc giống "nấu món": gửi notification, ghi log hoạt động. Nếu bắt request đợi hết những việc đó mới trả response, khách hàng (client gọi API) phải đứng chờ ở quầy lâu hơn cần thiết.
+</Eli5>
+
+Từ B04, mỗi khi một task đổi trạng thái, `taskflow-api` nên ghi lại "ai vừa làm gì" (`activity_logs`) và báo cho người liên quan biết (`notifications`). Đây là lúc câu hỏi "làm ngay trong request hay đẩy ra nền?" trở nên quan trọng.
+
+<SyncBlockingVsAsyncQueuedDiagram />
+
+<Technical>
+
+### Việc nào nên chặn response, việc nào không
+
+Không phải mọi việc phụ đều nên đẩy ra hàng đợi. Câu hỏi cần tự trả lời cho từng bước xử lý trong request:
+
+| Câu hỏi | Nếu "có" | Nếu "không" |
+|---|---|---|
+| Client có **cần biết ngay** kết quả của việc này để quyết định bước tiếp theo không? | Giữ lại trong request (ví dụ: kiểm tra trùng email khi đăng ký) | Có thể đẩy ra nền |
+| Việc này có phụ thuộc **I/O chậm hoặc không ổn định** (email, SMS, service ngoài) không? | Cân nhắc đẩy ra nền để lỗi/độ trễ của nó không lây sang response chính | Có thể giữ lại nếu đủ nhanh |
+| Nếu việc này **thất bại**, request chính có nên fail theo không? | Giữ lại trong transaction chính | Đẩy ra nền — dùng retry riêng thay vì làm fail cả request |
+
+Với `PATCH /api/v1/tasks/:id`: việc **bắt buộc** là `UPDATE tasks SET status = ...` — client cần biết ngay update có thành công không. Việc ghi `activity_logs` và tạo `notifications` là hệ quả phụ — client gọi PATCH task không cần đợi notification đã "gửi xong" mới biết task đã đổi trạng thái.
+
+### Chi phí thật của việc "tiện thể làm luôn"
+
+```ts title="src/routes/tasks.ts (CÁCH CHƯA TỐI ƯU — chặn response)"
+fastify.patch("/api/v1/tasks/:id", async (request, reply) => {
+  const [before] = await db.select().from(tasks).where(eq(tasks.id, request.params.id));
+
+  const task = await db.transaction(async (tx) => {
+    const [updated] = await tx.update(tasks).set({ status: request.body.status }).where(eq(tasks.id, request.params.id)).returning();
+
+    await tx.insert(activityLogs).values({
+      organizationId: updated.organizationId,
+      actorId: request.user.id,
+      action: "task.status_changed",
+      entityType: "task",
+      entityId: updated.id,
+      metadata: { oldStatus: before.status, newStatus: updated.status },
+    });
+
+    await sendPushNotification(updated.assigneeId, "Task vừa đổi trạng thái"); // I/O ra ngoài, có thể chậm/lỗi
+    return updated;
+  });
+
+  return task; // response chỉ được gửi SAU KHI sendPushNotification xong (hoặc throw)
+});
+```
+
+Ba vấn đề với đoạn code trên:
+
+1. **Độ trễ của response phụ thuộc vào một dịch vụ bên ngoài** (push notification) mà client không hề quan tâm tới.
+2. **Nếu `sendPushNotification` throw**, toàn bộ transaction rollback — kể cả `UPDATE tasks` hợp lệ ban đầu cũng bị huỷ, dù lỗi không liên quan gì tới việc đổi status.
+3. **Không retry được riêng lẻ.** Nếu notification lỗi do mạng chập chờn, cách duy nhất là bắt client gọi lại toàn bộ request PATCH.
+
+Bài học tiếp theo dùng BullMQ để tách phần "ghi `activity_logs` + `notifications`" ra khỏi request chính, chạy trong một `worker` riêng.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Đo thời gian response của PATCH task khi còn xử lý đồng bộ",
+      command: "curl -s -o /dev/null -w 'time_total: %{time_total}s\\n' -X PATCH http://localhost:3000/api/v1/tasks/3f9e.../status -H 'Authorization: Bearer ...' -d '{\"status\":\"done\"}'",
+      output: "time_total: 0.842s",
+    },
+    {
+      comment: "Xem log để thấy thứ tự: update DB xong sớm, nhưng response bị giữ lại chờ bước gửi notification",
+      command: "docker compose logs -f api",
+      output: "[api] UPDATE tasks status=done — 8ms\n[api] sendPushNotification(...) — 820ms\n[api] PATCH /api/v1/tasks/:id 200 — 834ms total",
+    },
+  ]}
+/>
+
+<Callout type="mistake" title="Đừng đẩy MỌI THỨ ra queue">
+  Không phải cứ có I/O là nên đẩy ra hàng đợi. Kiểm tra email trùng khi đăng ký (B05) vẫn nên chạy trong request — client cần biết ngay để hiển thị lỗi `409`. Chỉ đẩy ra nền những việc mà kết quả của nó **không ảnh hưởng tới response cần trả cho client ngay lúc đó**.
+</Callout>
+
+<Callout type="tip">
+  Một cách tự kiểm tra nhanh: nếu xoá hẳn một bước xử lý mà client vẫn nhận được response đúng và hữu ích, bước đó là ứng viên tốt để đẩy ra nền — miễn là nó vẫn được xử lý sau đó, không phải bị bỏ luôn.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "background job", meaning: "Công việc chạy tách rời khỏi vòng đời request/response, thường trong một process riêng." },
+    { term: "blocking (đồng bộ)", meaning: "Request phải đợi một bước xử lý xong mới tiếp tục — response bị trễ theo bước đó." },
+    { term: "hàng đợi (queue)", meaning: "Nơi lưu tạm các việc cần làm, để một tiến trình khác lấy ra xử lý dần, không chặn nơi tạo ra việc." },
+    { term: "I/O bên ngoài", meaning: "Thao tác phụ thuộc hệ thống khác (email, push notification, service ngoài) — thường chậm và kém ổn định hơn thao tác nội bộ." },
+  ]}
+/>
+
+<QuickCheck
+  question="Endpoint `POST /api/v1/auth/register` (B05) kiểm tra email đã tồn tại chưa trước khi tạo user. Đây có phải ứng viên tốt để đẩy ra background job không?"
+  options={[
+    "Có — mọi query database đều nên chạy nền để response nhanh hơn",
+    "Không — client cần biết ngay kết quả (email trùng hay không) để quyết định hiển thị lỗi hay chuyển bước tiếp theo; đẩy ra nền sẽ khiến response không còn ý nghĩa",
+    "Có — vì đây là I/O nên luôn chậm",
+    "Không quan trọng, đẩy ra nền hay giữ lại cũng không ảnh hưởng gì",
+  ]}
+  answerIndex={1}
+  explanation="Tiêu chí quan trọng nhất không phải 'có phải I/O không' mà là 'client có cần kết quả này ngay để tiếp tục không'. Kiểm tra email trùng quyết định trực tiếp việc request có thành công hay không — phải giữ trong request chính."
+/>

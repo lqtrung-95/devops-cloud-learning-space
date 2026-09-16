@@ -1,0 +1,132 @@
+import { RetryBackoffAttemptsTimelineDiagram } from "../diagrams/retry-backoff-attempts-timeline-diagram";
+
+<Eli5 title="Gọi ship hàng: thử lại vài lần cách quãng, rồi mới báo 'không giao được'" emoji="🛵">
+  Tài xế gọi điện cho khách mà không bắt máy. Ứng dụng ship hàng không gọi liên tục dồn dập ngay lập tức (khách có thể đang bận thật) — nó đợi một chút rồi thử lại, đợi lâu hơn rồi thử lại lần nữa. Sau vài lần vẫn không được, đơn hàng được đánh dấu "cần nhân viên hỗ trợ xử lý tay" thay vì cứ gọi mãi vô ích.
+
+  Job trong `worker` cũng vậy: lỗi tạm thời (mất kết nối DB, timeout mạng) đáng để thử lại — nhưng thử lại có kiểm soát, và biết dừng đúng lúc để chuyển cho con người.
+</Eli5>
+
+Bài trước đã có job `notifications` chạy khi task đổi trạng thái. Nhưng nếu Postgres tạm thời quá tải đúng lúc worker đang insert `activity_logs`, job đó nên được thử lại — không nên mất luôn.
+
+<RetryBackoffAttemptsTimelineDiagram />
+
+<Technical>
+
+### Cấu hình `attempts` + `backoff` khi enqueue
+
+```ts title="src/queues/notifications-queue.ts"
+await notificationsQueue.add(
+  "task-status-changed",
+  { taskId, organizationId, actorId, oldStatus, newStatus },
+  {
+    attempts: 3, // thử tối đa 3 lần, kể cả lần đầu
+    backoff: {
+      type: "exponential",
+      delay: 1000, // lần retry đầu đợi ~1000ms, lần sau nhân đôi: ~2000ms, ~4000ms...
+    },
+  },
+);
+```
+
+`type: "exponential"` khiến khoảng chờ **nhân đôi** sau mỗi lần thất bại, thay vì `type: "fixed"` (luôn đợi đúng `delay`). Đây là điểm quan trọng cho hệ thống thật: nếu nguyên nhân lỗi là downstream (Postgres, service khác) đang quá tải, backoff cố định khiến một loạt job cùng dồn về đúng nhịp độ, có thể làm downstream chưa kịp hồi phục đã bị dội tiếp. Backoff tăng dần giãn các lần thử ra xa nhau hơn theo thời gian.
+
+<Callout type="info" title="Backoff cần có trần">
+  Nhân đôi liên tục không có giới hạn sẽ khiến lần retry thứ 10 phải đợi hàng giờ — vô lý với hầu hết use case. Số lần `attempts` nhỏ (ở đây là `3`) tự nhiên giới hạn việc này, nhưng nếu bạn tăng `attempts` lên nhiều hơn, hãy kiểm tra tài liệu BullMQ đang dùng để biết cách đặt trần tối đa cho delay (tên option có thể khác nhau giữa các phiên bản — luôn đối chiếu changelog thay vì đoán).
+</Callout>
+
+### Khi hết `attempts`: dead-letter thủ công
+
+BullMQ không có khái niệm "dead-letter queue" tích hợp sẵn như một số message broker khác (ví dụ SQS). Cách phổ biến là tự lắng nghe sự kiện `failed` trên `Worker` và kiểm tra `attemptsMade`:
+
+```ts title="src/worker.ts"
+import { Worker } from "bullmq";
+import { db } from "./db/client.js";
+import { activityLogs } from "./db/schema.js";
+
+const worker = new Worker("notifications", processTaskStatusChanged, { connection: redisConnection });
+
+worker.on("failed", async (job, error) => {
+  if (!job) return;
+
+  const maxAttempts = job.opts.attempts ?? 1;
+  if (job.attemptsMade >= maxAttempts) {
+    // Hết lượt retry — ghi lại để con người xem, KHÔNG throw tiếp (job đã kết thúc vòng đời của nó)
+    await db.insert(activityLogs).values({
+      organizationId: job.data.organizationId,
+      actorId: job.data.actorId,
+      action: "job.dead_letter",
+      entityType: "job",
+      entityId: job.id ?? "unknown",
+      metadata: { queueName: job.queueName, jobName: job.name, error: error.message, attemptsMade: job.attemptsMade },
+    });
+  }
+});
+```
+
+`job.attemptsMade` tăng dần mỗi lần processor throw. So sánh với `job.opts.attempts` (số lần tối đa đã cấu hình lúc `add()`) cho biết đây có phải lần thất bại cuối cùng hay còn cơ hội retry tiếp — BullMQ tự lo phần lên lịch retry, code của bạn chỉ cần phản ứng đúng ở lần thất bại **cuối cùng**.
+
+### Rủi ro thật: retry có thể tạo dữ liệu trùng
+
+Giả sử attempt 1 insert `notifications` thành công, nhưng process `worker` bị kill (deploy, OOM...) trước khi BullMQ kịp đánh dấu job `completed`. BullMQ coi đây là job chưa hoàn tất và sẽ thử lại ở attempt 2 — chạy lại **toàn bộ** processor, có thể insert thêm một dòng `notifications` thứ hai cho cùng một sự kiện.
+
+Đây là đặc điểm "**at-least-once**" của hầu hết hệ thống queue (kể cả BullMQ): job được đảm bảo chạy **ít nhất một lần**, không phải **đúng một lần** (exactly-once). Vài hướng giảm thiểu (chưa cần implement đầy đủ ở module này):
+
+- Truyền `jobId` cố định, suy ra được từ dữ liệu nghiệp vụ (ví dụ `taskId-oldStatus-newStatus-timestamp`) khi `add()` — BullMQ dùng `jobId` để chống enqueue trùng job y hệt còn đang chờ/chạy.
+- Thêm ràng buộc unique ở tầng DB nếu nghiệp vụ cho phép (ví dụ unique theo `(entity_id, action, created_at trong 1 khoảng)`).
+- Thiết kế processor theo hướng "kiểm tra đã làm chưa trước khi ghi" (idempotency key riêng).
+
+Việc dedup ở tầng consumer sâu hơn (kèm trade-off hiệu năng) sẽ được đào lại kỹ ở B15 (security cho backend) và ở phần message queue của course System Design — module này chỉ cần bạn **nhận diện đúng rủi ro**, không cần giải quyết triệt để.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Bật biến môi trường giả lập lỗi để quan sát retry (chỉ dùng khi test cục bộ)",
+      command: "SIMULATE_JOB_FAILURE=true docker compose up -d worker",
+    },
+    {
+      comment: "Gửi 1 request đổi status để enqueue job, rồi theo dõi log worker",
+      command: "curl -X PATCH http://localhost:3000/api/v1/tasks/3f9e.../status -d '{\"status\":\"done\"}' && docker compose logs -f worker",
+      output:
+        "[worker] job 42 active (attempt 1)\n[worker] job 42 failed: Simulated failure — retry in ~1000ms\n[worker] job 42 active (attempt 2)\n[worker] job 42 failed: Simulated failure — retry in ~2000ms\n[worker] job 42 active (attempt 3)\n[worker] job 42 failed: Simulated failure — no attempts left\n[worker] job 42 → dead-letter (activity_logs action=job.dead_letter)",
+    },
+    {
+      comment: "Xác nhận dòng dead-letter đã được ghi",
+      command: "docker compose exec postgres psql -U taskflow -c \"select action, metadata from activity_logs where action = 'job.dead_letter' order by created_at desc limit 1;\"",
+      output: " action          | metadata\n-----------------+-------------------------------------------\n job.dead_letter | {\"attemptsMade\": 3, \"error\": \"Simulated failure\"}",
+    },
+  ]}
+/>
+
+<Callout type="warning" title="Đừng throw lại lỗi trong handler failed">
+  Hàm gắn vào `worker.on("failed", ...)` không nên `throw` — nó không chạy trong ngữ cảnh có thể retry lại được nữa (job đã kết thúc vòng đời của nó). Nếu việc ghi dead-letter thất bại (ví dụ Postgres đang down), tối thiểu phải log lỗi ra console/observability tool, không được để lỗi rơi mất âm thầm.
+</Callout>
+
+<Callout type="mistake">
+  Đặt `attempts` quá lớn (ví dụ `10`) mà không nghĩ tới tổng thời gian chờ. Với exponential backoff bắt đầu từ 1s, lần thử thứ 10 có thể phải đợi hơn 8 phút kể từ lần đầu — với việc nghiệp vụ cần phản hồi trong vài phút, đây là quá chậm để còn hữu ích.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "attempts", meaning: "Số lần tối đa BullMQ sẽ thử chạy một job trước khi coi là thất bại hẳn." },
+    { term: "backoff", meaning: "Khoảng thời gian chờ giữa các lần retry — `fixed` (cố định) hoặc `exponential` (tăng dần)." },
+    { term: "attemptsMade", meaning: "Số lần job đã thực sự được thử chạy tính tới thời điểm hiện tại." },
+    { term: "dead-letter", meaning: "Nơi lưu lại job đã hết lượt retry mà vẫn lỗi, để con người xem và xử lý thủ công." },
+    { term: "at-least-once", meaning: "Đảm bảo job chạy tối thiểu một lần — có thể chạy nhiều hơn một lần do retry, khác với exactly-once." },
+  ]}
+/>
+
+<QuickCheck
+  question="Job `task-status-changed` được cấu hình `attempts: 3`. Ở attempt 2, processor throw lỗi. `job.attemptsMade` lúc này bằng bao nhiêu, và job có bị coi là dead-letter ngay không?"
+  options={[
+    "`attemptsMade = 2`, và job dead-letter ngay vì đã thất bại 2 lần",
+    "`attemptsMade = 2`, nhưng vẫn còn 1 lượt thử nữa (`attempts = 3`) nên BullMQ sẽ lên lịch retry lần 3 sau backoff, chưa phải dead-letter",
+    "`attemptsMade = 3`, và job dead-letter ngay lập tức",
+    "`attemptsMade` không tăng cho tới khi hết hẳn attempts",
+  ]}
+  answerIndex={1}
+  explanation="attemptsMade phản ánh đúng số lần đã thử tính tới hiện tại. Chỉ khi attemptsMade đạt đúng giá trị attempts đã cấu hình (ở đây là 3) mà vẫn lỗi thì BullMQ mới dừng retry — code dead-letter phải so sánh đúng hai giá trị này."
+/>

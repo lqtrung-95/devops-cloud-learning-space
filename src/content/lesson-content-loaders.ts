@@ -51,4 +51,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "b04-database-orm-drizzle-postgresql": (lessonSlug) => import(`./modules/b04-database-orm-drizzle-postgresql/lessons/${lessonSlug}.mdx`),
   "b06-authorization-multi-tenant-rbac": (lessonSlug) => import(`./modules/b06-authorization-multi-tenant-rbac/lessons/${lessonSlug}.mdx`),
   "b08-file-upload-object-storage": (lessonSlug) => import(`./modules/b08-file-upload-object-storage/lessons/${lessonSlug}.mdx`),
+  "b09-background-jobs-scheduling": (lessonSlug) => import(`./modules/b09-background-jobs-scheduling/lessons/${lessonSlug}.mdx`),
 };

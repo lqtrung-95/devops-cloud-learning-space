@@ -1,0 +1,190 @@
+import { JobLifecycleStateDiagram } from "../diagrams/job-lifecycle-state-diagram";
+
+<Eli5 title="Queue là tờ order dán lên giá bếp, Worker là đầu bếp lấy order xuống nấu" emoji="🧑‍🍳">
+  Nhân viên phục vụ (route handler) ghi order lên một tờ giấy rồi dán lên giá gọi món (**queue**) — xong việc của họ ngay tại đó. Một đầu bếp (**worker**) đứng cạnh giá, thấy có order mới thì gỡ xuống, nấu, rồi bỏ vào khay trả món. Nhân viên phục vụ không cần biết đầu bếp nào nấu, nấu bao lâu — họ chỉ cần biết order đã được dán lên giá.
+
+  BullMQ hoạt động y hệt: `Queue` là nơi bạn "dán order" (`queue.add(...)`), `Worker` là "đầu bếp" chạy trong process riêng, liên tục lấy job ra xử lý.
+</Eli5>
+
+Bài trước đã xác định: `PATCH /api/v1/tasks/:id` chỉ cần `UPDATE tasks` xong là trả response; việc ghi `activity_logs` và tạo `notifications` chuyển cho một `worker` riêng.
+
+<JobLifecycleStateDiagram />
+
+<Technical>
+
+### Thêm service `worker` vào `docker-compose.yml`
+
+Theo mục 3 curriculum, `worker` dùng **cùng image** với `api`, chỉ đổi lệnh khởi động:
+
+```yaml title="docker-compose.yml"
+services:
+  api:
+    build: .
+    ports: ["3000:3000"]
+    depends_on: [postgres, redis]
+    environment:
+      DATABASE_URL: postgres://taskflow:taskflow@postgres:5432/taskflow
+      REDIS_URL: redis://redis:6379
+
+  worker:
+    build: . # cùng Dockerfile với api, không build lại image riêng
+    command: ["npm", "run", "worker"]
+    depends_on: [postgres, redis]
+    environment:
+      DATABASE_URL: postgres://taskflow:taskflow@postgres:5432/taskflow
+      REDIS_URL: redis://redis:6379
+    # không cần "ports" — worker không nhận HTTP request nào cả
+```
+
+`npm run worker` chạy `tsx src/worker.ts` — một entrypoint hoàn toàn khác `src/app.ts` (entrypoint của `api`), nhưng cùng nằm trong cùng codebase `taskflow-api`.
+
+### Queue: nơi enqueue job
+
+```ts title="src/queues/redis-connection.ts"
+import IORedis from "ioredis";
+import { env } from "../lib/env.js";
+
+// maxRetriesPerRequest: null là khuyến nghị của BullMQ cho connection dùng chung với Queue/Worker
+export const redisConnection = new IORedis(env.REDIS_URL, { maxRetriesPerRequest: null });
+```
+
+```ts title="src/queues/notifications-queue.ts"
+import { Queue } from "bullmq";
+import { redisConnection } from "./redis-connection.js";
+
+export interface TaskStatusChangedJobData {
+  taskId: string;
+  organizationId: string;
+  actorId: string;
+  oldStatus: string;
+  newStatus: string;
+}
+
+export const notificationsQueue = new Queue<TaskStatusChangedJobData>("notifications", {
+  connection: redisConnection,
+});
+```
+
+Trong route handler, chỉ cần `add` — **không đợi job chạy xong**:
+
+```ts title="src/routes/tasks.ts"
+fastify.patch("/api/v1/tasks/:id", async (request, reply) => {
+  const [before] = await db.select().from(tasks).where(eq(tasks.id, request.params.id));
+  const [updated] = await db.update(tasks).set({ status: request.body.status }).where(eq(tasks.id, request.params.id)).returning();
+
+  await notificationsQueue.add("task-status-changed", {
+    taskId: updated.id,
+    organizationId: updated.organizationId,
+    actorId: request.user.id,
+    oldStatus: before.status,
+    newStatus: updated.status,
+  }); // chỉ ghi vào Redis — thao tác này rất nhanh, không phải "gửi notification xong"
+
+  return updated; // response đi ngay sau dòng trên, không chờ worker
+});
+```
+
+### Worker: nơi xử lý job thật sự
+
+```ts title="src/worker.ts"
+import { Worker } from "bullmq";
+import { redisConnection } from "./queues/redis-connection.js";
+import { db } from "./db/client.js";
+import { activityLogs, notifications } from "./db/schema.js";
+import type { TaskStatusChangedJobData } from "./queues/notifications-queue.js";
+
+new Worker<TaskStatusChangedJobData>(
+  "notifications",
+  async (job) => {
+    const { taskId, organizationId, actorId, oldStatus, newStatus } = job.data;
+
+    await db.transaction(async (tx) => {
+      await tx.insert(activityLogs).values({
+        organizationId,
+        actorId,
+        action: "task.status_changed",
+        entityType: "task",
+        entityId: taskId,
+        metadata: { oldStatus, newStatus },
+      });
+
+      await tx.insert(notifications).values({
+        userId: actorId, // đơn giản hoá: thông báo cho chính actor; thực tế có thể là assignee
+        type: "task_status_changed",
+        payload: { taskId, oldStatus, newStatus },
+      });
+    });
+  },
+  { connection: redisConnection },
+);
+```
+
+`processTaskStatusChanged` (hàm callback truyền vào `Worker`) chỉ chạy khi có một job ở trạng thái `active` — đúng lúc một job được lấy ra khỏi hàng đợi `waiting`.
+
+### Bảng `notifications` và `activity_logs` (mục 3 curriculum — không đổi tên cột)
+
+```ts title="src/db/schema.ts"
+export const notifications = pgTable("notifications", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id),
+  type: text("type").notNull(),
+  payload: jsonb("payload").notNull(),
+  readAt: timestamp("read_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const activityLogs = pgTable("activity_logs", {
+  id: bigserial("id", { mode: "number" }).primaryKey(),
+  organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+  actorId: uuid("actor_id").notNull().references(() => users.id),
+  action: text("action").notNull(),
+  entityType: text("entity_type").notNull(),
+  entityId: uuid("entity_id").notNull(),
+  metadata: jsonb("metadata"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài BullMQ và Redis client", command: "pnpm add bullmq ioredis" },
+    { comment: "Sinh migration cho notifications + activity_logs", command: "pnpm drizzle-kit generate", output: "✓ 1 migration created: drizzle/0006_add_notifications_activity_logs.sql" },
+    { comment: "Chạy migration", command: "pnpm drizzle-kit migrate", output: "✓ Migrations applied" },
+    { comment: "Dựng thêm service worker", command: "docker compose up -d worker", output: "[+] Running 1/1\n ✔ Container taskflow-api-worker-1  Started" },
+    { comment: "Xác nhận worker đã kết nối Redis và sẵn sàng nhận job", command: "docker compose logs worker", output: "[worker] Connected to Redis\n[worker] Worker \"notifications\" is ready" },
+  ]}
+/>
+
+<Callout type="warning" title="Đừng await kết quả xử lý job trong route handler">
+  `await notificationsQueue.add(...)` chỉ đợi thao tác ghi vào Redis — cực nhanh. Đừng nhầm với việc chờ job chạy xong (ví dụ bằng cách tự chế một `Promise` đợi worker báo hoàn tất trong cùng request) — làm vậy sẽ triệt tiêu hoàn toàn lý do dùng queue.
+</Callout>
+
+<Callout type="mistake">
+  Quên thêm `depends_on: [redis]` cho service `worker`. Nếu Compose khởi động `worker` trước `redis` sẵn sàng, `IORedis` sẽ liên tục lỗi kết nối lúc mới start — vẫn tự kết nối lại được (do `IORedis` retry mặc định), nhưng gây log lỗi gây nhiễu không cần thiết lúc `docker compose up`.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Queue", meaning: "Đối tượng BullMQ dùng để enqueue job (`queue.add()`) — job được lưu trong Redis." },
+    { term: "Worker", meaning: "Process/đối tượng BullMQ liên tục lấy job từ queue ra xử lý bằng một hàm processor." },
+    { term: "job", meaning: "Một đơn vị công việc kèm dữ liệu (`job.data`), có id, trạng thái, và lịch sử số lần thử." },
+    { term: "waiting / active / completed / failed", meaning: "Các trạng thái chính trong vòng đời một job trong BullMQ." },
+    { term: "connection dùng chung", meaning: "Queue và Worker nên dùng chung một `IORedis` instance thay vì mỗi cái tự mở connection riêng." },
+  ]}
+/>
+
+<QuickCheck
+  question="Route handler gọi `await notificationsQueue.add('task-status-changed', data)`. Ngay sau dòng này, `activity_logs` và `notifications` đã chắc chắn được ghi vào Postgres chưa?"
+  options={[
+    "Chắc chắn rồi — `add()` chỉ resolve sau khi worker xử lý xong job",
+    "Chưa — `add()` chỉ đảm bảo job đã nằm trong Redis ở trạng thái `waiting`; việc ghi Postgres xảy ra sau đó, trong `worker`, có thể mất thêm vài mili-giây tới vài giây tuỳ tải hệ thống",
+    "Có, vì BullMQ tự động đồng bộ Redis và Postgres",
+    "Không bao giờ được ghi, vì `add()` chỉ dùng để log",
+  ]}
+  answerIndex={1}
+  explanation="Đây là bản chất của xử lý bất đồng bộ: `add()` hoàn tất công việc của NÓ (đưa job vào hàng đợi) rất nhanh, nhưng việc ghi DB thật sự do worker làm ở một thời điểm sau đó, độc lập với request đã trả response từ lâu."
+/>

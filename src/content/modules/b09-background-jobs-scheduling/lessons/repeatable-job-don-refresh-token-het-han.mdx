@@ -1,0 +1,126 @@
+import { RepeatableCronJobTimelineDiagram } from "../diagrams/repeatable-cron-job-timeline-diagram";
+
+<Eli5 title="Nhân viên vệ sinh đến dọn đúng giờ, kể cả khi không ai gọi" emoji="🧹">
+  Một nhà hàng không đợi khách phàn nàn bàn bẩn mới cử người dọn — họ có lịch cố định: cứ 30 phút, nhân viên vệ sinh đi một vòng dọn dẹp, bất kể có khách yêu cầu hay không. Lịch đó được ghi vào sổ trực (không phải trí nhớ của một nhân viên cụ thể) — nếu ca này nghỉ, ca sau nhìn sổ vẫn biết đúng giờ cần dọn.
+
+  `refresh_tokens` (B05) tích luỹ dần các dòng đã hết hạn hoặc đã bị revoke — không ai gọi API nào để "dọn" chúng cả. Cần một job tự chạy định kỳ.
+</Eli5>
+
+<RepeatableCronJobTimelineDiagram />
+
+<Technical>
+
+### Repeatable job: lịch sống trong Redis, không phải trong RAM
+
+BullMQ hỗ trợ thêm một job "lặp lại" theo lịch cron hoặc theo chu kỳ cố định khi `add()`:
+
+```ts title="src/queues/cleanup-queue.ts"
+import { Queue } from "bullmq";
+import { redisConnection } from "./redis-connection.js";
+
+export const cleanupQueue = new Queue("cleanup", { connection: redisConnection });
+```
+
+```ts title="src/queues/scheduler.ts"
+import { cleanupQueue } from "./cleanup-queue.js";
+
+export async function registerRepeatableJobs() {
+  await cleanupQueue.add(
+    "cleanup-expired-refresh-tokens",
+    {},
+    {
+      repeat: { pattern: "*/30 * * * *" }, // cron: mỗi 30 phút
+    },
+  );
+}
+```
+
+<Callout type="info" title="Tên option có thể đã đổi ở phiên bản BullMQ bạn đang dùng">
+  API `repeat` mô tả ở đây là cách kinh điển để tạo repeatable job và vẫn là khái niệm cốt lõi cần hiểu. Các phiên bản BullMQ gần đây giới thiệu "Job Schedulers" (`queue.upsertJobScheduler(...)`) như một cách thay thế, tường minh hơn, cho cùng ý tưởng. Luôn đối chiếu tài liệu đúng phiên bản `bullmq` trong `package.json` trước khi copy nguyên văn — tên hàm có thể khác, nhưng bản chất "lịch chạy được lưu ở Redis, không phải trong process" là không đổi.
+</Callout>
+
+Khác biệt quan trọng so với `setInterval(fn, 30 * 60 * 1000)` viết tay:
+
+| | `setInterval` tự viết | BullMQ repeatable job |
+|---|---|---|
+| Nơi lưu lịch | Bộ nhớ (RAM) của đúng process gọi `setInterval` | Redis — bên ngoài mọi process |
+| Khi process restart | Mất lịch hoàn toàn, phải tự gọi lại `setInterval` lúc khởi động | Lịch vẫn còn nguyên trong Redis, worker mới kết nối lại là thấy tiếp |
+| Chạy nhiều instance worker | Mỗi instance tự chạy `setInterval` riêng → job chạy trùng nhiều lần | BullMQ đảm bảo chỉ một worker lấy được job ở mỗi lần lặp (dựa trên cơ chế lock của Redis) |
+| Theo dõi lịch sử chạy | Tự viết log riêng | Có sẵn trong Redis, xem được qua `redis-cli` hoặc UI như Bull Board |
+
+### Processor: idempotent theo thiết kế
+
+```ts title="src/worker.ts"
+import { lt, or, isNotNull } from "drizzle-orm";
+import { refreshTokens } from "./db/schema.js";
+
+new Worker(
+  "cleanup",
+  async (job) => {
+    if (job.name !== "cleanup-expired-refresh-tokens") return;
+
+    const deleted = await db
+      .delete(refreshTokens)
+      .where(or(lt(refreshTokens.expiresAt, new Date()), isNotNull(refreshTokens.revokedAt)))
+      .returning({ id: refreshTokens.id });
+
+    console.log(`cleanup-expired-refresh-tokens: đã xoá ${deleted.length} dòng`);
+  },
+  { connection: redisConnection },
+);
+```
+
+Job này **an toàn khi chạy trùng lặp** mà không cần cơ chế idempotency-key riêng như job `task-status-changed` ở bài trước: `DELETE ... WHERE <điều kiện>` chỉ xoá đúng những dòng còn thoả điều kiện tại đúng thời điểm chạy. Nếu job này lỡ chạy hai lần liên tiếp (ví dụ do trùng lịch, hoặc do retry), lần thứ hai đơn giản là không tìm thấy gì để xoá — không có tác dụng phụ nào chồng lên nhau. Đây là lý do các thao tác dạng "dọn dẹp theo điều kiện" (cleanup, xoá cache hết hạn...) thường là ứng viên tốt cho repeatable job hơn các thao tác dạng "tạo mới vô điều kiện" (như insert notification).
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Đăng ký repeatable job khi worker khởi động (gọi 1 lần, BullMQ tự nhớ lịch)", command: "pnpm exec tsx -e \"import('./src/queues/scheduler.js').then(m => m.registerRepeatableJobs())\"" },
+    {
+      comment: "Xác nhận lịch đã nằm trong Redis dù chưa tới giờ chạy",
+      command: "docker compose exec redis redis-cli KEYS 'bull:cleanup:*'",
+      output: "1) \"bull:cleanup:repeat:cleanup-expired-refresh-tokens:...\"\n2) \"bull:cleanup:meta\"",
+    },
+    {
+      comment: "Chèn thủ công một refresh token đã hết hạn để kiểm tra job",
+      command: "docker compose exec postgres psql -U taskflow -c \"insert into refresh_tokens (id, user_id, token_hash, expires_at) values (gen_random_uuid(), '3f9e...', 'fakehash', now() - interval '1 day');\"",
+    },
+    {
+      comment: "Sau lần chạy tiếp theo (hoặc gọi thủ công processor để test nhanh), xác nhận dòng đó đã biến mất",
+      command: "docker compose exec postgres psql -U taskflow -c \"select count(*) from refresh_tokens where expires_at < now();\"",
+      output: " count\n-------\n     0",
+    },
+  ]}
+/>
+
+<Callout type="warning" title="Đăng ký repeatable job đúng một lần, không phải mỗi lần worker khởi động lại vô tội vạ">
+  Gọi `cleanupQueue.add(...)` với cùng `repeat.pattern` nhiều lần là an toàn (BullMQ nhận diện và không tạo lịch trùng cho cùng tên job + pattern), nhưng vẫn nên gọi `registerRepeatableJobs()` ở một nơi rõ ràng (lúc `worker` khởi động) thay vì rải rác nhiều chỗ trong code — dễ quên đang có bao nhiêu lịch đang chạy.
+</Callout>
+
+<Callout type="mistake">
+  Viết processor cleanup theo kiểu "lấy hết rồi lặp qua từng dòng để xoá" (`SELECT * ... FOR EACH row DELETE`) thay vì một câu `DELETE ... WHERE` duy nhất. Với bảng `refresh_tokens` tích luỹ hàng chục nghìn dòng hết hạn, cách lặp từng dòng vừa chậm vừa tốn round-trip DB không cần thiết.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "repeatable job", meaning: "Job BullMQ tự động được enqueue lại theo lịch (cron pattern hoặc chu kỳ cố định), lịch lưu trong Redis." },
+    { term: "cron pattern", meaning: "Chuỗi mô tả lịch chạy định kỳ, ví dụ `*/30 * * * *` nghĩa là mỗi 30 phút." },
+    { term: "idempotent", meaning: "Chạy lại nhiều lần cho cùng một trạng thái đầu vào vẫn cho kết quả tương đương, không gây tác dụng phụ chồng chất." },
+    { term: "in-memory state", meaning: "Trạng thái chỉ tồn tại trong RAM của một process — mất khi process đó restart hoặc crash." },
+  ]}
+/>
+
+<QuickCheck
+  question="Container `worker` bị Docker restart giữa chừng (ví dụ do deploy phiên bản mới). Repeatable job `cleanup-expired-refresh-tokens` có bị mất lịch không?"
+  options={[
+    "Có — mọi cấu hình job đều mất khi process khởi động lại, phải gọi lại `registerRepeatableJobs()` thủ công mỗi lần restart",
+    "Không — lịch được BullMQ lưu trong Redis (bên ngoài process `worker`); khi worker mới khởi động và kết nối lại đúng Redis, lịch vẫn còn nguyên và tiếp tục chạy đúng giờ",
+    "Có, trừ khi bạn dùng `setInterval` thay vì `repeat`",
+    "Không thể biết được — phụ thuộc vào hệ điều hành host",
+  ]}
+  answerIndex={1}
+  explanation="Đây là khác biệt cốt lõi so với setInterval tự viết: trạng thái lịch nằm ở Redis, không phải RAM của process worker. Miễn là Redis không bị xoá dữ liệu, bất kỳ worker nào kết nối lại đều thấy đúng lịch đã đăng ký trước đó."
+/>
