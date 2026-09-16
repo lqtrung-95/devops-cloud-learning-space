@@ -1,0 +1,93 @@
+import { SseVsWebsocketComparisonDiagram } from "../diagrams/sse-vs-websocket-comparison-diagram";
+
+<Eli5 title="SSE giống loa phường, WebSocket giống bộ đàm hai chiều" emoji="📻">
+  Loa phường chỉ có một chiều: phường phát thông báo, cả xóm nghe, không ai bấm nút nói ngược lại vào loa được. Nếu bạn có việc cần báo cho phường, bạn đi ra ủy ban nói trực tiếp — một kênh hoàn toàn khác, không liên quan tới cái loa.
+
+  Bộ đàm thì khác: cả hai đầu đều có nút bấm để nói, ai cũng chủ động gửi được bất cứ lúc nào trên cùng một kênh.
+
+  `taskflow-api` cần đẩy notification (task đổi trạng thái, có người mention mình) từ server xuống client — đúng một chiều, giống loa phường. Client không cần "nói ngược" qua kênh đó; nếu client cần làm gì (comment, đổi status), nó gọi một API request bình thường khác.
+</Eli5>
+
+Từ B09, `worker` đã ghi được notification vào Postgres khi task đổi trạng thái. Nhưng client vẫn phải tự bấm F5 hoặc poll `GET /notifications` liên tục để biết có gì mới. Module này nối nốt đoạn cuối: đẩy thẳng xuống client ngay khi có, không cần hỏi lại.
+
+<SseVsWebsocketComparisonDiagram />
+
+<Technical>
+
+### Hai lựa chọn cho một chiều: SSE và WebSocket
+
+| Tiêu chí | Server-Sent Events (SSE) | WebSocket |
+|---|---|---|
+| Chiều dữ liệu | Một chiều: server → client | Hai chiều, cả hai phía tự gửi được |
+| Giao thức nền | HTTP/1.1 bình thường (`Content-Type: text/event-stream`) | Bắt tay `Upgrade: websocket` rồi chuyển sang giao thức riêng |
+| Client API | `EventSource` — có sẵn trong mọi trình duyệt | `WebSocket` — cũng có sẵn, nhưng "nặng" hơn cho việc chỉ cần một chiều |
+| Reconnect khi mất mạng | **Tự động**, trình duyệt tự retry, hỗ trợ `Last-Event-ID` để server biết client đã nhận tới đâu | Phải tự viết logic reconnect + resubscribe |
+| Giới hạn kết nối | HTTP/1.1: **tối đa 6 kết nối đồng thời tới cùng một domain** trên mỗi trình duyệt — nhiều tab cùng mở stream tới `taskflow-api` có thể chạm giới hạn này | Không bị giới hạn theo cùng cơ chế đó (kết nối WebSocket không tính vào hạn mức HTTP/1.1 request đồng thời) |
+| Hạ tầng cần thêm | Không — Fastify xử lý như một response HTTP giữ mở lâu | Cần plugin riêng (`@fastify/websocket`), quản lý vòng đời frame/ping-pong |
+| Định dạng dữ liệu | Chỉ text (UTF-8) | Text hoặc binary |
+
+### Vì sao SSE là lựa chọn hợp lý hơn cho notification, không phải WebSocket-mặc-định
+
+Nhiều người mới làm real-time cứ nghe "cần đẩy dữ liệu real-time" là phản xạ chọn WebSocket — vì nó là cái tên quen thuộc nhất. Nhưng WebSocket giải quyết bài toán **hai chiều**: chat, game, collaborative editing — nơi cả client lẫn server đều chủ động gửi. Notification của `taskflow-api` chỉ cần server đẩy xuống; client không bao giờ cần gửi gì ngược lại qua chính kênh đó.
+
+Dùng WebSocket cho một việc vốn chỉ cần một chiều nghĩa là:
+
+- Tự viết thêm code xử lý reconnect (SSE có sẵn miễn phí).
+- Tự nghĩ cách biết client còn "sống" hay không (ping/pong thủ công — SSE dùng heartbeat comment đơn giản hơn nhiều).
+- Không tận dụng được gì từ khả năng hai chiều mà WebSocket cung cấp — đó là độ phức tạp trả thêm mà không đổi lấy lợi ích nào.
+
+**Ngoại lệ đáng nhớ:** nếu sau này `taskflow-api` cần một tính năng thật sự hai chiều qua kênh real-time (ví dụ presence "ai đang gõ", collaborative cursor trên cùng task) thì WebSocket mới là lựa chọn đúng — nhưng đó là một bài toán khác, không phải notification một chiều của module này.
+
+### Giới hạn 6 kết nối HTTP/1.1 mỗi domain — rủi ro thật, không phải lý thuyết
+
+Nếu người dùng mở `taskflow-api` trên 7 tab trình duyệt, mỗi tab tự mở một `EventSource` riêng, trình duyệt sẽ giữ tối đa 6 kết nối HTTP/1.1 đồng thời tới cùng domain — tab thứ 7 phải **đợi** một trong 6 kết nối kia rảnh. Đây là giới hạn có thật của HTTP/1.1 (không phải của SSE hay `taskflow-api`), và là lý do một số hệ thống lớn chuyển stream sang HTTP/2 (multiplexing nhiều stream trên một connection TCP, không còn giới hạn 6) hoặc dùng một service worker dùng chung một kết nối cho toàn bộ tab. Module này chưa cần giải quyết việc đó — chỉ cần biết giới hạn tồn tại để không ngạc nhiên khi test với nhiều tab.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    {
+      comment: "Xem trình duyệt tự động thêm header Accept khi mở EventSource (thử trong DevTools > Network)",
+      command: "curl -i http://localhost:3000/api/v1/notifications/stream",
+      output: "HTTP/1.1 401 Unauthorized\nContent-Type: application/json\n\n{\"error\":{\"code\":\"UNAUTHORIZED\",\"message\":\"Thiếu token xác thực\"}}",
+    },
+    {
+      comment: "Đếm số kết nối SSE đang mở tới taskflow-api (sau khi implement ở bài sau)",
+      command: "curl -s http://localhost:3000/api/v1/notifications/stream?token=$TOKEN --max-time 2 -N",
+      output: "retry: 3000\n\n: ping\n\n",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Chọn WebSocket chỉ vì "nghe real-time là nghĩ tới WebSocket ngay". Trước khi chọn công nghệ, luôn hỏi lại: dữ liệu có thật sự cần đi hai chiều trên cùng một kênh không? Nếu câu trả lời là không, SSE thường đơn giản hơn để build và vận hành.
+</Callout>
+
+<Callout type="tip" title="EventSource không cần thư viện ngoài">
+  Không giống WebSocket đôi khi cần thư viện wrapper để xử lý reconnect/heartbeat, `EventSource` là API chuẩn có sẵn trong mọi trình duyệt hiện đại — `new EventSource(url)` là đủ để có reconnect tự động.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "SSE (Server-Sent Events)", meaning: "Chuẩn HTTP cho phép server đẩy chuỗi sự kiện văn bản xuống client qua một response giữ mở, một chiều." },
+    { term: "EventSource", meaning: "API trình duyệt để kết nối SSE — tự động reconnect khi mất kết nối, không cần code thêm." },
+    { term: "WebSocket", meaning: "Giao thức hai chiều full-duplex, bắt đầu bằng bắt tay `Upgrade: websocket` trên nền TCP." },
+    { term: "HTTP/1.1 connection limit", meaning: "Giới hạn tối đa ~6 kết nối đồng thời tới cùng một domain mà trình duyệt cho phép trên HTTP/1.1." },
+    { term: "Last-Event-ID", meaning: "Header `EventSource` tự gửi khi reconnect, cho server biết sự kiện cuối cùng client đã nhận (nếu server có gửi `id:`)." },
+    { term: "full-duplex", meaning: "Cả hai phía của kết nối có thể gửi dữ liệu độc lập, cùng lúc — đặc trưng của WebSocket, không có ở SSE." },
+  ]}
+/>
+
+<QuickCheck
+  question="`taskflow-api` chỉ cần đẩy notification từ server xuống client, client không bao giờ cần gửi gì ngược lại qua cùng kênh đó. Vì sao SSE thường là lựa chọn hợp lý hơn WebSocket cho đúng bài toán này?"
+  options={[
+    "Vì WebSocket không chạy được trên HTTP",
+    "Vì SSE nhanh hơn WebSocket về tốc độ truyền dữ liệu",
+    "Vì bài toán chỉ cần một chiều, và SSE cung cấp đúng một chiều đó kèm auto-reconnect có sẵn, không phải trả thêm độ phức tạp của khả năng gửi hai chiều mà mình không dùng tới",
+    "Vì trình duyệt không hỗ trợ WebSocket trên localhost",
+  ]}
+  answerIndex={2}
+  explanation="Chọn công cụ nên khớp với nhu cầu thật. WebSocket không sai — nó chỉ đang cung cấp nhiều hơn mức cần thiết cho một luồng dữ liệu một chiều, và phần dư đó (viết tay reconnect, ping/pong) là chi phí kỹ thuật trả thêm không cần thiết ở đây."
+/>

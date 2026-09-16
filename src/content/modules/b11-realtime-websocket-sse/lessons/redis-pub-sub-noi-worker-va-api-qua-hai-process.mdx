@@ -1,0 +1,152 @@
+import { WorkerRedisPubsubApiSequenceDiagram } from "../diagrams/worker-redis-pubsub-api-sequence-diagram";
+
+<Eli5 title="worker là tổng đài, Redis pub/sub là đường dây nội bộ, api là lễ tân cầm điện thoại" emoji="☎️">
+  Tổng đài (`worker`) biết tin cần báo cho ai, nhưng tổng đài không cầm điện thoại của khách — lễ tân (`api`) mới là người đang cầm ống nghe kết nối trực tiếp với khách (kết nối SSE). Tổng đài không gọi thẳng cho khách được; nó bấm một đường dây nội bộ (kênh Redis pub/sub) và hô đúng tên khách, lễ tân nghe thấy tên đúng của khách mình đang giữ máy thì chuyển tin ngay.
+
+  Đây chính xác là vấn đề `taskflow-api` gặp phải: `worker` (nơi tạo ra notification) và `api` (nơi giữ kết nối SSE của client) là **hai process hoàn toàn khác nhau** — `worker` không có quyền truy cập trực tiếp vào bộ nhớ của `api` để "gọi thẳng" một `EventEmitter` chung, vì chúng không chạy trong cùng process.
+</Eli5>
+
+Bài trước đã xong phần xác thực kết nối. Nhưng có kết nối mở không có nghĩa là có dữ liệu chảy vào nó — `worker` (nơi B09 đã dạy cách insert `notifications`) và `api` (nơi giữ kết nối SSE) chạy trên hai container khác nhau, dùng chung image nhưng khác `command`. Redis — đã có sẵn từ B01, đã dùng cho BullMQ ở B09 và cache ở B10 — đóng thêm một vai trò thứ ba: cầu nối pub/sub giữa hai process.
+
+<WorkerRedisPubsubApiSequenceDiagram />
+
+<Technical>
+
+### Vì sao không dùng `EventEmitter` trong cùng process
+
+Nếu `worker` và route xử lý SSE nằm trong cùng một process Node.js, bạn hoàn toàn có thể dùng một `EventEmitter` chung: emit sự kiện ở một chỗ, lắng nghe ở chỗ khác, không cần Redis. Nhưng `docker-compose.yml` của `taskflow-api` (mục 3 curriculum) chạy `worker` là **service riêng**, cùng image `api` nhưng override `command: ["npm", "run", "worker"]` — nghĩa là hai tiến trình Node.js độc lập, mỗi tiến trình có bộ nhớ (heap) riêng. `EventEmitter` của process này vô hình với process kia.
+
+### Redis Pub/Sub: publish không quan tâm ai đang nghe
+
+```ts title="src/lib/redis-client.ts (đã có từ B10)"
+import Redis from "ioredis";
+
+export const redis = new Redis(process.env.REDIS_URL ?? "redis://redis:6379");
+```
+
+`worker` publish ngay sau khi insert xong dòng `notifications` (nối tiếp code `processTaskStatusChanged` đã viết ở B09):
+
+```ts title="src/worker.ts (bổ sung phần publish vào processor đã có từ B09)"
+import { redis } from "./lib/redis-client.js";
+
+new Worker<TaskStatusChangedJobData>(
+  "notifications",
+  async (job) => {
+    const { taskId, organizationId, actorId, oldStatus, newStatus } = job.data;
+
+    const notification = await db.transaction(async (tx) => {
+      await tx.insert(activityLogs).values({
+        organizationId,
+        actorId,
+        action: "task.status_changed",
+        entityType: "task",
+        entityId: taskId,
+        metadata: { oldStatus, newStatus },
+      });
+
+      const [created] = await tx
+        .insert(notifications)
+        .values({ userId: actorId, type: "task_status_changed", payload: { taskId, oldStatus, newStatus } })
+        .returning();
+
+      return created;
+    });
+
+    // Publish SAU KHI transaction commit thành công — không publish một notification chưa chắc đã lưu được
+    await redis.publish(`notifications:${notification.userId}`, JSON.stringify(notification));
+  },
+  { connection: redisConnection },
+);
+```
+
+`redis.publish()` không trả lỗi nếu không có ai đang lắng nghe kênh `notifications:<userId>` — nó chỉ đơn giản gửi đi, xong. Đây là điểm khác biệt quan trọng với BullMQ (B09): **pub/sub không lưu lại message nếu không ai đang subscribe lúc publish** — nếu client không mở kết nối SSE tại đúng khoảnh khắc đó, message đó mất vĩnh viễn (không giống queue, nơi job vẫn nằm trong Redis chờ được xử lý). Đây là lý do dòng `notifications` trong Postgres vẫn là nguồn sự thật — client có thể `GET /api/v1/notifications` để lấy lại những gì đã bỏ lỡ, pub/sub chỉ lo phần "đẩy ngay khi đang mở kết nối".
+
+### `api` subscribe bằng một connection riêng
+
+Một `IORedis` instance đã ở chế độ subscribe (gọi `subscribe`/`psubscribe`) thì **không dùng được cho lệnh thường** (`GET`, `SET`, `publish`) nữa — phải dùng `redis.duplicate()` để có một connection thứ hai chỉ dành cho việc lắng nghe:
+
+```ts title="src/realtime/notification-pubsub-subscriber.ts"
+import { redis } from "../lib/redis-client.js";
+import { pushNotificationEvent } from "./notification-stream-registry.js";
+
+const subscriber = redis.duplicate(); // connection riêng — KHÔNG dùng chung với redis ở trên
+
+export async function startNotificationSubscriber() {
+  await subscriber.psubscribe("notifications:*"); // lắng nghe kênh của TẤT CẢ user trên instance api này
+
+  subscriber.on("pmessage", (_pattern, channel, message) => {
+    const userId = channel.split(":")[1]; // "notifications:abc-123" -> "abc-123"
+    pushNotificationEvent(userId, JSON.parse(message));
+  });
+}
+```
+
+```ts title="src/realtime/notification-stream-registry.ts"
+import type { ServerResponse } from "node:http";
+
+const connectionsByUserId = new Map<string, Set<ServerResponse>>();
+
+export function registerConnection(userId: string, res: ServerResponse): void {
+  const set = connectionsByUserId.get(userId) ?? new Set();
+  set.add(res);
+  connectionsByUserId.set(userId, set);
+}
+
+export function removeConnection(userId: string, res: ServerResponse): void {
+  connectionsByUserId.get(userId)?.delete(res);
+}
+
+export function pushNotificationEvent(userId: string, payload: unknown): void {
+  const openConnections = connectionsByUserId.get(userId);
+  if (!openConnections || openConnections.size === 0) return; // không ai đang mở kết nối trên instance này
+
+  const chunk = `event: notification\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const res of openConnections) res.write(chunk);
+}
+```
+
+### Ghi chú mở rộng: nếu `api` chạy nhiều instance
+
+`taskflow-api` trong khoá học này chỉ chạy **một** instance `api` (đúng cấu hình `docker-compose.yml` ở mục 3), nên registry trong bộ nhớ của lesson này là đủ. Nhưng nếu production sau này scale `api` ra nhiều instance (nhiều container cùng chạy `command` mặc định), một hệ quả đáng nhớ: **mọi** instance `api` đều nhận được cùng một `pmessage` (vì mỗi instance tự `psubscribe` kênh đó), nhưng chỉ instance nào đang thực sự giữ kết nối SSE của đúng `userId` đó mới tìm thấy gì trong registry của nó để forward — các instance còn lại nhận message, tra registry, thấy rỗng, rồi bỏ qua. Đó là hành vi đúng, không phải bug — nhưng nó có nghĩa là mỗi instance đều tốn một chút CPU xử lý message mà phần lớn thời gian nó không dùng tới. Hệ thống lớn hơn thường thêm một lớp "presence registry" (ví dụ ghi trong Redis instance nào đang giữ kết nối của user nào) để định tuyến chính xác hơn — nằm ngoài phạm vi module này.
+
+</Technical>
+
+<Callout type="warning" title="Đừng publish trước khi transaction commit">
+  Nếu `redis.publish()` được gọi trước khi `db.transaction()` thực sự commit (ví dụ do nhầm thứ tự `await`, hoặc publish trong transaction rồi transaction rollback), client có thể nhận một sự kiện SSE báo về một notification **chưa từng tồn tại** trong Postgres. Luôn publish sau khi chắc chắn transaction đã thành công.
+</Callout>
+
+<Callout type="mistake">
+  Dùng chung một `IORedis` instance cho cả lệnh thường (`GET`/`SET` ở B10) lẫn `subscribe`/`psubscribe`. Một khi connection đã gọi `subscribe`, nó chuyển hẳn sang "subscribe mode" và mọi lệnh khác trên cùng connection đó sẽ lỗi hoặc bị treo — luôn `redis.duplicate()` để có connection riêng cho việc lắng nghe.
+</Callout>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Xem kênh pub/sub đang hoạt động", command: "docker compose exec redis redis-cli PUBSUB CHANNELS \"notifications:*\"", output: "notifications:3f9e2b1a-...-c8d4" },
+    { comment: "Publish thủ công một message giả để test nhanh api có forward đúng không", command: "docker compose exec redis redis-cli PUBLISH notifications:3f9e2b1a-...-c8d4 '{\"type\":\"test\"}'", output: "(integer) 1" },
+    { comment: "Xác nhận worker publish thật khi task đổi trạng thái (xem log api)", command: "docker compose logs -f api | grep notification", output: "[api] forwarded notification to userId=3f9e2b1a-...-c8d4 via SSE" },
+  ]}
+/>
+
+<KeyTerms
+  terms={[
+    { term: "publish/subscribe (pub/sub)", meaning: "Mô hình nhắn tin nơi publisher gửi message vào một kênh, mọi subscriber đang lắng nghe kênh đó nhận được ngay — không lưu lại nếu không ai nghe." },
+    { term: "psubscribe", meaning: "Subscribe theo pattern (ví dụ `notifications:*`) thay vì từng kênh cụ thể — khớp mọi kênh có tên thoả pattern." },
+    { term: "redis.duplicate()", meaning: "Tạo một connection Redis mới dùng chung cấu hình — cần thiết vì connection ở subscribe mode không dùng được cho lệnh thường." },
+    { term: "connection registry", meaning: "Cấu trúc trong bộ nhớ (ví dụ `Map<userId, Set<res>>`) ánh xạ user đang mở kết nối SSE tới đúng response stream để forward dữ liệu." },
+    { term: "fan-out", meaning: "Một message được gửi tới nhiều bên nhận cùng lúc — ở đây là mọi instance `api` đều nhận cùng một `pmessage`." },
+  ]}
+/>
+
+<QuickCheck
+  question="`worker` gọi `redis.publish('notifications:abc-123', payload)` đúng lúc user `abc-123` không mở tab `taskflow-api` nào cả (không có kết nối SSE nào đang mở). Điều gì xảy ra với message đó?"
+  options={[
+    "Redis tự động lưu lại và gửi cho user ngay khi họ mở kết nối SSE lần tới",
+    "`api` báo lỗi 500 vì không tìm thấy kết nối nào để forward",
+    "Message bị mất — pub/sub không lưu lại message nếu không có subscriber nào nhận tại thời điểm publish; dữ liệu notification vẫn an toàn trong Postgres, chỉ riêng phần 'đẩy realtime' của lần đó không xảy ra",
+    "`worker` sẽ tự động retry publish cho tới khi có ai đó subscribe",
+  ]}
+  answerIndex={2}
+  explanation="Đây là khác biệt cốt lõi giữa pub/sub và queue (BullMQ ở B09): queue giữ job lại trong Redis chờ được xử lý, còn pub/sub chỉ chuyển tiếp cho ai đang nghe ngay lúc đó. Vì `notifications` đã được insert vào Postgres trước khi publish, dữ liệu không mất — chỉ có phần đẩy tức thời qua SSE là bỏ lỡ, và client sẽ thấy nó khi gọi lại `GET /api/v1/notifications`."
+/>

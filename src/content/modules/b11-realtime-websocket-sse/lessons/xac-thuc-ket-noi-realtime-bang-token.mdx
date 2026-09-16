@@ -1,0 +1,145 @@
+import { TokenAuthConnectionDiagram } from "../diagrams/token-auth-connection-diagram";
+
+<Eli5 title="Soát vé ở cổng, không soát lại giữa suất chiếu" emoji="🎬">
+  Rạp chiếu phim soát vé đúng một lần lúc bạn bước qua cổng. Sau đó bạn ngồi xem cả suất chiếu — không ai gõ cửa hỏi vé lại giữa phim.
+
+  Kết nối real-time (SSE lẫn WebSocket) hoạt động giống vậy: việc xác thực (`Authorization` header bình thường của REST API) chỉ xảy ra **một lần lúc mở kết nối**, không lặp lại cho từng "sự kiện" chảy qua sau đó. Vấn đề là: `EventSource` — giống `WebSocket` — không cho phép trang web tự thêm header tuỳ ý vào request mở kết nối, nên "vé" (token) phải được đưa vào bằng cách khác: qua chính URL.
+</Eli5>
+
+Curriculum gọi tên `@fastify/websocket` vì đây là plugin chính thức để mở kết nối WebSocket trong Fastify, và cách nó xác thực kết nối bằng token minh hoạ đúng vấn đề chung của mọi kết nối real-time trong trình duyệt. Bài này đi qua cách làm với `@fastify/websocket`, rồi áp dụng đúng kỹ thuật đó cho endpoint SSE — thứ lab thực sự build, theo lý do đã chọn ở bài trước.
+
+<TokenAuthConnectionDiagram />
+
+<Technical>
+
+### Vì sao không dùng được `request.jwtVerify()` mặc định
+
+Từ B05, hầu hết route bảo vệ dùng `preHandler: [app.authenticate]`, bên trong gọi `request.jwtVerify()` — hàm này mặc định đọc token từ header `Authorization: Bearer ...`. Nhưng:
+
+- `new EventSource(url)` không có tham số nào để set header tuỳ ý.
+- `new WebSocket(url, protocols)` cũng vậy — tham số thứ hai là danh sách sub-protocol, không phải nơi nhét token an toàn.
+
+Nên với cả hai, cách phổ biến nhất là đưa token vào **query string** của URL kết nối, rồi handler tự đọc và verify thủ công bằng `app.jwt.verify()` (không phải `request.jwtVerify()`).
+
+### Minh hoạ với `@fastify/websocket`
+
+```ts title="src/app.ts"
+import fastifyWebsocket from "@fastify/websocket";
+
+app.register(fastifyWebsocket);
+```
+
+```ts title="src/routes/ws-example.route.ts (minh hoạ cơ chế — module không dùng route này trong lab)"
+app.register(async (instance) => {
+  instance.get("/api/v1/ws-example", { websocket: true }, async (connection, request) => {
+    const token = (request.query as { token?: string }).token;
+
+    if (!token) {
+      connection.socket.close(1008, "Thiếu token"); // 1008 = policy violation
+      return;
+    }
+
+    try {
+      await app.jwt.verify(token);
+    } catch {
+      connection.socket.close(1008, "Token không hợp lệ hoặc đã hết hạn");
+      return;
+    }
+
+    connection.socket.on("message", (raw) => {
+      // xử lý message hai chiều — taskflow-api không cần nhánh này cho notification
+    });
+  });
+});
+```
+
+Việc verify xảy ra **trước khi** chấp nhận bất kỳ message nào — nếu token sai, đóng socket ngay bằng mã lỗi WebSocket (`1008` = vi phạm policy) thay vì im lặng bỏ qua.
+
+### Áp dụng đúng kỹ thuật đó cho SSE
+
+`taskflow-api` build SSE (lý do ở bài trước), nhưng xác thực kết nối bằng đúng cách trên — vì SSE cũng không cho set header tuỳ ý qua `EventSource`:
+
+```ts title="src/routes/notifications-stream.route.ts"
+import type { FastifyPluginAsync } from "fastify";
+
+interface AccessTokenPayload {
+  sub: string; // user id — giống payload access token đã thiết kế ở B05
+}
+
+export const notificationsStreamRoute: FastifyPluginAsync = async (app) => {
+  app.get("/api/v1/notifications/stream", async (request, reply) => {
+    const query = request.query as { token?: string };
+    const headerToken = request.headers.authorization?.replace(/^Bearer\s+/i, "");
+    const token = query.token ?? headerToken; // hỗ trợ cả query param lẫn header
+
+    if (!token) {
+      return reply.code(401).send({ error: { code: "UNAUTHORIZED", message: "Thiếu token xác thực" } });
+    }
+
+    let userId: string;
+    try {
+      const payload = await app.jwt.verify<AccessTokenPayload>(token);
+      userId = payload.sub;
+    } catch {
+      return reply.code(401).send({ error: { code: "UNAUTHORIZED", message: "Token không hợp lệ hoặc đã hết hạn" } });
+    }
+
+    // Token hợp lệ — phần mở stream thật sự nằm ở bài sau (registry + Redis subscriber)
+    reply.hijack(); // báo Fastify: từ đây tôi tự quản lý response, đừng tự động gửi gì thêm
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    reply.raw.write("retry: 3000\n\n"); // gợi ý client đợi 3s trước khi tự reconnect nếu rớt kết nối
+  });
+};
+```
+
+`request.headers.authorization` vẫn được hỗ trợ song song — client không phải trình duyệt (như script test ở lab sau, hoặc curl) có thể gửi header bình thường, chỉ trình duyệt thật mới bị giới hạn phải dùng query param.
+
+### Rủi ro thật: token nằm trong URL
+
+Đặt token vào query string có một cái giá: URL (kèm token) có thể lọt vào **access log của server, proxy, hoặc lịch sử trình duyệt** — khác với header, vốn thường không bị log mặc định.
+
+</Technical>
+
+<Callout type="warning" title="Token trong query string có thể lọt vào log">
+  Nếu Nginx/Fastify logger ghi lại URL đầy đủ của mỗi request (`GET /notifications/stream?token=eyJhbGci...`), token sẽ nằm trong file log dạng plain text. Vì access token của `taskflow-api` chỉ sống 15 phút (B05), rủi ro bị lộ có thời hạn ngắn — nhưng vẫn nên cấu hình logger loại bỏ query string nhạy cảm khỏi log (`redact` trong pino, đã dùng từ B01) thay vì mặc định ghi nguyên URL.
+</Callout>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Gọi stream không kèm token — phải bị từ chối trước khi mở stream", command: "curl -i http://localhost:3000/api/v1/notifications/stream", output: "HTTP/1.1 401 Unauthorized\n\n{\"error\":{\"code\":\"UNAUTHORIZED\",\"message\":\"Thiếu token xác thực\"}}" },
+    { comment: "Gọi kèm access token hợp lệ trên query param", command: "curl -N -i \"http://localhost:3000/api/v1/notifications/stream?token=$ACCESS_TOKEN\"", output: "HTTP/1.1 200 OK\nContent-Type: text/event-stream\nCache-Control: no-cache\n\nretry: 3000\n" },
+    { comment: "Gọi kèm token hết hạn — vẫn bị chặn dù đúng format JWT", command: "curl -i \"http://localhost:3000/api/v1/notifications/stream?token=$EXPIRED_TOKEN\"", output: "HTTP/1.1 401 Unauthorized\n\n{\"error\":{\"code\":\"UNAUTHORIZED\",\"message\":\"Token không hợp lệ hoặc đã hết hạn\"}}" },
+  ]}
+/>
+
+<Callout type="mistake">
+  Verify token *sau khi* đã `reply.hijack()` và mở stream. Nếu verify thất bại sau khi client đã nhận header `200 text/event-stream`, không còn cách nào "rút lại" — phải verify xong, chắc chắn hợp lệ, rồi mới hijack và mở stream, đúng thứ tự trong ví dụ trên.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "app.jwt.verify()", meaning: "Verify token thủ công từ bất kỳ đâu (query, header) — khác `request.jwtVerify()` vốn chỉ đọc header mặc định." },
+    { term: "reply.hijack()", meaning: "Báo cho Fastify biết handler tự quản lý response từ đây, tránh Fastify tự gửi response chồng lên `reply.raw`." },
+    { term: "close code 1008", meaning: "Mã đóng kết nối WebSocket chuẩn cho \"policy violation\" — dùng khi từ chối kết nối vì lý do xác thực/uỷ quyền." },
+    { term: "query param auth", meaning: "Kỹ thuật đưa token vào query string vì API kết nối (`EventSource`, `WebSocket`) không cho set header tuỳ ý." },
+    { term: "redact", meaning: "Cấu hình logger (pino) loại bỏ trường nhạy cảm (token, mật khẩu) khỏi log trước khi ghi." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao endpoint `GET /api/v1/notifications/stream` không thể tái sử dụng `preHandler: [app.authenticate]` (dùng `request.jwtVerify()`) y hệt các route REST khác trong `taskflow-api`?"
+  options={[
+    "Vì SSE không hỗ trợ JWT nói chung",
+    "Vì `request.jwtVerify()` mặc định chỉ đọc token từ header `Authorization`, trong khi `EventSource` của trình duyệt không có cách nào tự thêm header tuỳ ý vào request mở kết nối — token phải được truyền qua query string và verify thủ công",
+    "Vì `app.authenticate` chỉ hoạt động với route trả JSON, không hoạt động với route trả text/event-stream",
+    "Vì access token từ B05 không tương thích với kết nối giữ mở lâu dài",
+  ]}
+  answerIndex={1}
+  explanation="Cơ chế xác thực (JWT, verify chữ ký) không đổi — chỉ có *nơi lấy token* phải đổi, vì giới hạn của API trình duyệt (`EventSource`/`WebSocket` không set header tuỳ ý được), không phải giới hạn của JWT hay của Fastify."
+/>
