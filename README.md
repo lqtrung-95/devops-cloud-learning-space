@@ -1,9 +1,10 @@
 # Learning Space
 
-Nền tảng web học công nghệ theo kiểu **ELI5 + sơ đồ tương tác + lab**, hiện có 2 khoá:
+Nền tảng web học công nghệ theo kiểu **ELI5 + sơ đồ tương tác + lab**, hiện có 3 khoá:
 
 - ☁️ **DevOps & Cloud (AWS-first)** — Linux, Docker, CI/CD, AWS, Terraform, Kubernetes, Observability, SRE, DevSecOps.
 - 🏗️ **System Design** — building blocks, distributed systems và case study phỏng vấn.
+- 🧩 **Backend Development** — REST/GraphQL/gRPC, database, auth, testing, security, observability — xây dần 1 app `taskflow-api` xuyên suốt.
 
 - 🧸 **ELI5 trước, kỹ thuật sau** — mỗi khái niệm mở đầu bằng ví dụ đời thường
 - 🖼️ **Sơ đồ SVG tương tác** — bấm từng bước, bật/tắt kịch bản, xem gói tin chạy
@@ -15,6 +16,7 @@ Chương trình học:
 
 - DevOps & Cloud: [docs/curriculum.md](docs/curriculum.md) · 28 tuần × ~10h/tuần · 17 module · 6 phase
 - System Design: [docs/system-design-curriculum.md](docs/system-design-curriculum.md) · 24 tuần × ~10h/tuần · 19 module · 5 phase
+- Backend Development: [docs/backend-curriculum.md](docs/backend-curriculum.md) · 24 tuần × ~10h/tuần · 19 module · 5 phase
 
 ## Tech stack
 
@@ -74,6 +76,7 @@ docs/                          # curriculums, authoring guide, architecture, dep
 
 - [Chương trình học DevOps & Cloud](docs/curriculum.md)
 - [Chương trình học System Design](docs/system-design-curriculum.md)
+- [Chương trình học Backend Development](docs/backend-curriculum.md)
 - [Hướng dẫn viết nội dung module](docs/content-authoring-guide.md)
 - [Kiến trúc hệ thống](docs/system-architecture.md)
 - [Hướng dẫn deploy lên Vercel](docs/deployment-guide.md)

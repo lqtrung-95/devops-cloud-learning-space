@@ -1,4 +1,5 @@
 import type { CourseDefinition, PhaseDefinition } from "./content-types";
+import { backendCoursePhases } from "./backend-course-phases";
 import { devopsCoursePhases } from "./devops-course-phases";
 import { systemDesignCoursePhases } from "./system-design-course-phases";
 
@@ -24,6 +25,16 @@ export const courses: CourseDefinition[] = [
     weeksTotal: 24,
     hoursPerWeek: 10,
   },
+  {
+    id: "backend-development",
+    slug: "backend-development",
+    title: "Backend Development",
+    emoji: "🧩",
+    tagline: "Node.js/TypeScript · 24 tuần",
+    description: "Xây taskflow-api từ REST cơ bản tới production-ready: auth, testing, GraphQL, gRPC, security, observability.",
+    weeksTotal: 24,
+    hoursPerWeek: 10,
+  },
 ];
 
-export const coursePhases: PhaseDefinition[] = [...devopsCoursePhases, ...systemDesignCoursePhases];
+export const coursePhases: PhaseDefinition[] = [...devopsCoursePhases, ...systemDesignCoursePhases, ...backendCoursePhases];

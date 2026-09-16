@@ -8,6 +8,7 @@ Source of truth for topics/labs per module:
 |---|---|---|---|
 | DevOps & Cloud | `docs/curriculum.md` | `m01`…`m17` | `phase-0`…`phase-5` (`src/content/devops-course-phases.ts`) |
 | System Design | `docs/system-design-curriculum.md` | `sd01`…`sd19` | `sd-phase-0`…`sd-phase-4` (`src/content/system-design-course-phases.ts`) |
+| Backend Development | `docs/backend-curriculum.md` | `b01`…`b19` | `b-phase-0`…`b-phase-4` (`src/content/backend-course-phases.ts`) |
 
 A module's course is derived from its `phaseId` — there is no `courseId` field.
 
@@ -17,6 +18,7 @@ A module's course is derived from its `phaseId` — there is no `courseId` field
 
 - DevOps & Cloud learner: experienced software developer, new to DevOps. Goal: DevOps/SRE job, AWS-first.
 - System Design learner: experienced developer (often has done the DevOps course), never designed large-scale systems. Goals: make sound architecture decisions at work **and** pass system design interviews (mid–senior).
+- Backend Development learner: developer who can code but hasn't built a production backend end-to-end. Goal: Backend/Fullstack job, and confidence owning a real service (not just CRUD tutorials).
 - Language: **Vietnamese**, keep English technical terms as-is (container, pipeline, VPC, pod…). Don't translate commands, flags, service names.
 - Every concept: **ELI5 first** (everyday Vietnamese-life analogy: nhà hàng, chung cư, bưu điện, ship hàng, chợ, xe buýt…), **then** precise technical explanation. The analogy must map correctly onto the real mechanism — call out where the analogy breaks if it matters.
 - Friendly, concrete, short paragraphs. Use real commands with realistic output. No filler.
@@ -125,7 +127,19 @@ Applies to `sdXX` modules, on top of everything above.
 - **Say things precisely** where people commonly get them wrong: CAP only applies during a partition; "exactly-once" is at-least-once + idempotency; retries need jitter; Redis is not the source of truth unless configured and justified.
 - **Diagram ideas that teach:** step through a request path (LB → app → cache → DB); toggle cache hit vs miss; slider/toggle for replication lag or `N/W/R` quorum; kill-a-node scenario switch (leader election, failover); fan-out push vs pull comparison. `cost` callouts may be used for cloud/egress/storage costs.
 
-## 7. Validate before handing off
+## 7. Backend Development specifics
+
+Applies to `bXX` modules, on top of everything above.
+
+- **One codebase, no exceptions.** Every lab edits the SAME repo, `taskflow-api` — never invent a different app name, a different DB name, or a different port. `docs/backend-curriculum.md` §3 is the single source of truth for its stack, `docker-compose.yml` services/ports, Postgres user/db (`taskflow`/`taskflow`/`taskflow`), and the full domain schema (table names, columns) — **quote the exact values from that section**, don't improvise or "helpfully" rename anything, even if a different name feels more natural. (This course's SD siblings didn't have this rule and 13 of 19 modules drifted to different Postgres credentials before a lead review caught it — don't repeat that here.)
+- **Assume the prior modules' code exists.** A `bXX` lesson's lab builds directly on what `b01…b(XX-1)` already added to `taskflow-api` (schema, routes, middleware). Don't re-scaffold something an earlier module already built; extend it. If your lab needs a new service not yet in the compose table (§3), say explicitly "thêm service X vào `docker-compose.yml`: image Y, port Z" — never assume a service exists that isn't in that table or wasn't added by an earlier, already-shipped module.
+- **Real, runnable TypeScript.** This course is closer to "pair-programming a real backend" than to conceptual explanation. Code blocks in `## Thực hành`/labs must be real, complete-enough-to-run TypeScript/Fastify/Drizzle snippets (not pseudo-code), with realistic terminal output from actually reasoning through what the command would print — don't invent suspiciously precise numbers.
+- **Test-backed claims.** From B07 onward, any lesson that changes behavior should show the test that proves it (or say which existing test would catch a regression).
+- **Trade-off tables still apply** wherever there's a real choice (JWT vs session, REST vs GraphQL, monolith vs split service) — same GFM table convention as System Design's guide (§6).
+- **Security and correctness callouts.** Prefer `<Callout type="warning">` for things that look fine but are exploitable (missing `organization_id` filter, JWT without expiry, unparameterized query) — this course's learner is expected to internalize these as reflexes, not trivia.
+- **Diagram ideas that teach:** request lifecycle through Fastify hooks; JWT/refresh-token issue-and-verify sequence; a transaction that rolls back mid-way; cache-aside hit/miss with invalidation; queue job retry-then-dead-letter; gRPC call between `api` and `notification-service` with a kill-and-recover scenario; API gateway routing `v1`/`v2` to the same service.
+
+## 8. Validate before handing off
 
 ```bash
 pnpm validate:module <id>-slug   # structure, editorial rules, MDX compiles
@@ -135,7 +149,7 @@ pnpm exec eslint src/content/modules/<id>-slug
 
 `validate:module` enforces: 3–6 lessons, ≥2 labs (≥3 steps), 8–12 quiz questions with valid answers, every lesson has `<Eli5>`, `<Technical>`, `<KeyTerms>`, `<QuickCheck>` and imports an existing diagram.
 
-## 8. Checklist
+## 9. Checklist
 
 - [ ] Topics & labs cover the module section in the course's curriculum doc
 - [ ] Every lesson: ELI5 → diagram → technical → hands-on → mistakes → key terms → quick check
@@ -143,3 +157,4 @@ pnpm exec eslint src/content/modules/<id>-slug
 - [ ] Commands are real and correct; outputs realistic
 - [ ] Quiz answers verified; correct option positions varied
 - [ ] Validation, typecheck, eslint clean for owned folder
+- [ ] (Backend/System Design) Every shared-stack detail (service name, port, user/db, table/column name) copied verbatim from the curriculum doc's canonical spec, not improvised
