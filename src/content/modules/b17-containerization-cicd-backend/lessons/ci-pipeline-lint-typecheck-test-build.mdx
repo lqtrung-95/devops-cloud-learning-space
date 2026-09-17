@@ -1,0 +1,132 @@
+import { CiPipelineStagesDiagram } from "../diagrams/ci-pipeline-stages-diagram";
+
+<Eli5 title="Dây chuyền kiểm tra chất lượng trước khi hàng rời kho" emoji="🏭">
+  Một nhà máy không đợi tới lúc đóng thùng mới kiểm tra sản phẩm — có nhiều trạm kiểm tra dọc dây chuyền, trạm rẻ và nhanh đặt trước (nhìn bằng mắt xem có lỗi rõ ràng không), trạm tốn thời gian hơn đặt sau (đo đạc chi tiết, chạy thử máy). Sản phẩm lỗi bị chặn lại NGAY ở trạm đầu tiên phát hiện ra nó — không cần đi hết cả dây chuyền mới biết là hỏng.
+
+  CI pipeline của `taskflow-api` làm đúng vậy: `lint` (nhìn lỗi cú pháp/style — rẻ, vài giây) → `typecheck` (kiểm tra kiểu dữ liệu — vẫn rẻ) → `test` (chạy thử thật với DB — tốn vài chục giây tới vài phút) → `build` (đóng gói Docker image — tốn thời gian nhất). Hỏng ở đâu, dừng ở đó.
+</Eli5>
+
+Bạn đã học CI/CD tổng quát ở course DevOps & Cloud (`m05-cicd-github-actions`) — anatomy của GitHub Actions, matrix, caching, deployment strategy. Bài này không nhắc lại khái niệm CI là gì; nó chỉ ráp đúng 4 bước cho riêng `taskflow-api`, và giải thích vì sao thứ tự đó quan trọng cho một service Node/Fastify có test cần DB thật.
+
+<CiPipelineStagesDiagram />
+
+<Technical>
+
+### Workflow tối thiểu cho taskflow-api
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: taskflow
+          POSTGRES_PASSWORD: taskflow
+          POSTGRES_DB: taskflow
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U taskflow"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+
+      - name: Test
+        run: pnpm test
+        env:
+          DATABASE_URL: postgres://taskflow:taskflow@localhost:5432/taskflow
+          REDIS_URL: redis://localhost:6379
+
+      - name: Build Docker image
+        run: docker build -t taskflow-api:ci .
+```
+
+### Vì sao đúng thứ tự này, không phải thứ tự khác
+
+- **`lint` trước tiên**: bắt lỗi style/cú pháp rõ ràng trong vài giây — không có lý do gì để đợi `test` chạy vài chục giây rồi mới biết PR có dấu `;` sai chỗ.
+- **`typecheck` sau `lint`**: `tsc --noEmit` nhanh hơn chạy cả bộ test thật, và bắt được một lớp lỗi khác (kiểu dữ liệu sai) mà `lint` không nhìn thấy.
+- **`test` sau `typecheck`**: nếu kiểu dữ liệu đã sai, rất có thể test cũng sẽ fail hoặc thậm chí không compile được — chạy test trước khi qua được typecheck là lãng phí thời gian CI runner.
+- **`build` cuối cùng**: đây là bước tốn thời gian nhất (build Docker image thật, layer cache của GitHub Actions runner thường không ấm bằng máy dev) — chỉ nên chạy khi code đã qua được 3 lớp rẻ hơn.
+- **`services: postgres, redis`**: nối đúng nguyên tắc B07 — không mock DB, chỉ mock những thứ THẬT SỰ ngoài tầm kiểm soát. CI cần Postgres/Redis thật để chạy các integration test đã viết, không phải một bản giả lập hành vi khác với môi trường dev.
+
+### Bảng đánh đổi: fail-fast vs chạy song song
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| 4 step tuần tự trong 1 job (bài này) | Đơn giản, dừng ngay ở bước đầu tiên lỗi, tiết kiệm phút runner | PR có lỗi ở `build` phải đợi hết `lint`/`typecheck`/`test` chạy xong mới biết (nếu 3 bước đó đều xanh) | Pipeline nhỏ, ít service, ưu tiên đơn giản và tiết kiệm phút CI |
+| 4 job song song (`lint`, `typecheck`, `test`, `build` độc lập) | Biết kết quả cả 4 mặt cùng lúc, nhanh hơn về "thời gian chờ" (wall-clock) | Tốn nhiều phút runner hơn (chạy `test`/`build` dù `lint` đã biết fail); cấu hình phức tạp hơn (mỗi job cần tự cài dependency) | Team lớn, nhiều PR/ngày, chấp nhận tốn phút CI để rút ngắn thời gian chờ review |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cố tình để lỗi lint (ví dụ biến không dùng), push lên branch feature", command: "git checkout -b ci/test-lint-fail && git commit -am 'test: trigger lint failure' && git push origin ci/test-lint-fail" },
+    { comment: "Mở PR, workflow tự chạy — xem trạng thái", command: "gh pr checks" , output: "Lint\tfail\t8s\nTypecheck\tskipping\nTest\tskipping\nBuild Docker image\tskipping"},
+    { comment: "Sửa lỗi lint, commit và push lại", command: "pnpm lint --fix && git commit -am 'fix: lint error' && git push" },
+    {
+      comment: "Kiểm tra lại — cả 4 step phải xanh trước khi merge",
+      command: "gh pr checks",
+      output: "Lint\tpass\t9s\nTypecheck\tpass\t14s\nTest\tpass\t47s\nBuild Docker image\tpass\t38s",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Chạy `pnpm test` trong CI mà không khai báo `services: postgres, redis`, rồi để test tự kết nối vào `DATABASE_URL` mặc định trỏ ra `localhost` không tồn tại trên runner. Test sẽ fail vì lỗi kết nối, không phải vì code sai — dễ khiến người xem log tưởng nhầm là bug thật, mất thời gian điều tra sai hướng.
+</Callout>
+
+<Callout type="warning">
+  `on: pull_request` chạy code trên máy runner của GitHub Actions với quyền hạn hạn chế cho fork bên ngoài (theo mặc định) — nhưng nếu workflow của bạn có bước cần secret (ví dụ push image lên registry), đừng đặt bước đó trong CHÍNH workflow `pull_request` này chạy cho fork lạ. Đó là chủ đề `secrets/environments/OIDC` đã học ở course DevOps (`m05-cicd-github-actions`) — B17 chỉ dừng ở build, chưa push registry hay deploy.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Fail fast", meaning: "Nguyên tắc xếp bước rẻ/nhanh trước để dừng pipeline sớm nhất có thể khi có lỗi." },
+    { term: "services (GitHub Actions)", meaning: "Container phụ (Postgres, Redis...) GitHub Actions khởi động song song với job, dùng cho test cần dependency thật." },
+    { term: "tsc --noEmit", meaning: "Chạy TypeScript compiler chỉ để kiểm tra kiểu dữ liệu, không sinh ra file .js nào." },
+    { term: "Frozen lockfile", meaning: "Cờ `--frozen-lockfile` của pnpm: cài đúng version đã khoá trong lockfile, fail nếu lockfile không khớp package.json — tránh cài nhầm version khác giữa local và CI." },
+    { term: "Wall-clock time", meaning: "Thời gian thực tế người chờ từ lúc bắt đầu tới lúc có kết quả — khác với tổng số phút runner tiêu tốn." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một PR có lỗi cú pháp rõ ràng (thiếu dấu ngoặc) VÀ một lỗi logic mà chỉ integration test mới bắt được. Với pipeline tuần tự lint → typecheck → test → build, điều gì xảy ra?"
+  options={[
+    "Cả 2 lỗi được báo cùng lúc vì tất cả step chạy song song",
+    "Step `lint` (hoặc `typecheck`, tuỳ loại lỗi cú pháp) fail trước, dừng pipeline ngay — step `test` không chạy nên lỗi logic chưa được phát hiện ở lần chạy này; phải sửa lỗi cú pháp, push lại, rồi mới biết lỗi logic",
+    "Step `build` sẽ fail đầu tiên vì nó luôn chạy trước để tiết kiệm thời gian",
+    "GitHub Actions tự động bỏ qua lỗi cú pháp nếu code vẫn build được image",
+  ]}
+  answerIndex={1}
+  explanation="Đây chính là bản chất của pipeline tuần tự fail-fast: chỉ lỗi ở BƯỚC ĐẦU TIÊN gặp phải được báo trong một lần chạy. Lỗi logic nằm sâu hơn (chỉ `test` mới bắt được) sẽ không lộ ra cho tới khi lỗi cú pháp được sửa và pipeline chạy lại tới được step đó — đây là lý do nên sửa và push sớm, thay vì gộp nhiều thay đổi lớn vào một PR."
+/>

@@ -1,0 +1,151 @@
+import { SigtermGracefulShutdownSequenceDiagram } from "../diagrams/sigterm-graceful-shutdown-sequence-diagram";
+
+<Eli5 title="Đo mạch thật, và đóng cửa nhà hàng đúng cách" emoji="🩺">
+  `/api/v1/health` từ B01 giống một tờ giấy dán sẵn "còn sống" trên cửa — dán một lần, không bao giờ cập nhật, dù bên trong bệnh nhân đã ngừng thở. Một bác sĩ thật sẽ đo mạch, đo huyết áp — kiểm tra những thứ THẬT SỰ quyết định "còn sống hay không". `/healthz` ở bài này chính là bác sĩ đó: nó thật sự "bắt mạch" Postgres và Redis trước khi dám nói "khoẻ".
+
+  Còn `SIGTERM` giống giờ đóng cửa của một nhà hàng: quản lý không đuổi khách đang ăn dở ra ngoài — họ treo biển "ngừng nhận khách mới", để khách hiện tại ăn xong, rồi mới tắt bếp, khoá tủ lạnh, và tắt đèn. Nếu quản lý chỉ đơn giản tắt cầu dao ngay lập tức, khách đang ăn dở bị bỏ lại trong bóng tối — đó chính là thứ graceful shutdown cố tránh.
+</Eli5>
+
+Hai vấn đề này tưởng không liên quan nhưng cùng một chủ đề: **taskflow-api có đang thực sự sẵn sàng phục vụ hay không**, và nếu không, nó có báo đúng và dừng lại đúng cách hay không.
+
+<SigtermGracefulShutdownSequenceDiagram />
+
+<Technical>
+
+### Liveness vs readiness — vì sao `/api/v1/health` không đủ
+
+`/api/v1/health` (B01) trả `{ "status": "ok" }` vô điều kiện — nó chỉ chứng minh **process Node.js còn chạy** (liveness). Nó không chứng minh **service còn phục vụ được** (readiness): nếu Postgres chết, mọi request CRUD đều sẽ lỗi 500, nhưng `/api/v1/health` vẫn cười tươi trả 200.
+
+```ts title="src/routes/healthz.ts"
+import type { FastifyInstance } from "fastify";
+import { sql } from "drizzle-orm";
+import { db } from "../db/client.js";
+import { redis } from "../lib/redis-client.js";
+
+export async function healthzRoute(fastify: FastifyInstance) {
+  fastify.get("/healthz", async (_request, reply) => {
+    const [postgres, redisCheck] = await Promise.allSettled([db.execute(sql`select 1`), redis.ping()]);
+
+    const checks = {
+      postgres: postgres.status === "fulfilled" ? "ok" : "down",
+      redis: redisCheck.status === "fulfilled" ? "ok" : "down",
+    };
+    const healthy = checks.postgres === "ok" && checks.redis === "ok";
+
+    return reply.status(healthy ? 200 : 503).send({ status: healthy ? "ok" : "degraded", checks });
+  });
+}
+```
+
+`/healthz` đặt NGOÀI prefix `/api/v1` (mục 3 curriculum) và không qua middleware auth — đây là endpoint hạ tầng dùng cho Docker `HEALTHCHECK` và (sau này) load balancer, không phải resource nghiệp vụ cho client gọi trực tiếp.
+
+### SIGTERM: đóng đúng thứ tự, không chỉ `process.exit()`
+
+```ts title="src/app.ts (phần dưới file, sau hàm buildApp() đã có từ B02)"
+import { client } from "./db/client.js";
+import { redis } from "./lib/redis-client.js";
+
+const app = buildApp();
+
+await app.listen({ port: 3000, host: "0.0.0.0" });
+
+let shuttingDown = false;
+
+async function shutdown(signal: string) {
+  if (shuttingDown) return; // tránh chạy 2 lần nếu signal tới liên tiếp
+  shuttingDown = true;
+  app.log.info(`Nhận ${signal}, bắt đầu graceful shutdown`);
+
+  try {
+    // app.close() ngừng nhận connection MỚI và đợi request đang xử lý hoàn tất
+    await app.close();
+    // Chỉ đóng pool SAU KHI chắc chắn không còn request nào đang dùng chúng
+    await client.end();
+    await redis.quit();
+    app.log.info("Đóng sạch, thoát process");
+    process.exit(0);
+  } catch (error) {
+    app.log.error(error, "Lỗi khi shutdown, thoát cưỡng bức");
+    process.exit(1);
+  }
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
+```
+
+```ts title="src/db/client.ts (sửa 1 dòng so với B04)"
+import postgres from "postgres";
+import { drizzle } from "drizzle-orm/postgres-js";
+import * as schema from "./schema.js";
+
+const connectionString = process.env.DATABASE_URL ?? "postgres://taskflow:taskflow@postgres:5432/taskflow";
+
+// Trước B17: "const client = ...". Giờ export để B17 gọi client.end() lúc shutdown.
+export const client = postgres(connectionString, { max: 10 });
+
+export const db = drizzle(client, { schema });
+```
+
+### `docker stop` và giới hạn 10 giây
+
+`docker stop api` gửi `SIGTERM`, đợi **grace period** (mặc định 10 giây, chỉnh bằng `docker stop -t <giây>`), rồi gửi `SIGKILL` nếu process chưa thoát. `SIGKILL` không thể bắt được — không có cơ hội chạy thêm bất kỳ dòng dọn dẹp nào. Toàn bộ chuỗi `app.close()` → `client.end()` → `redis.quit()` phải hoàn tất trong khoảng đó; nếu một request đơn lẻ mất hơn 10 giây, nó vẫn bị cắt ngang dù đã có graceful shutdown.
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| `process.exit(0)` ngay khi nhận `SIGTERM` | Đơn giản, thoát tức thì | Cắt ngang mọi request đang xử lý, để lại connection Postgres/Redis mồ côi | Không nên dùng cho service nhận traffic thật |
+| `app.close()` rồi mới đóng pool (cách bài này chọn) | Không mất request đang xử lý; đóng pool đúng lúc an toàn | Cần đảm bảo tổng thời gian dưới grace period của `docker stop` | `taskflow-api` — mọi service Fastify production |
+| Tăng grace period (`docker stop -t 30`) | Cho phép request dài hơn hoàn tất | Container mất nhiều thời gian hơn để dừng hẳn, ảnh hưởng tốc độ rolling deploy | Có endpoint biết trước sẽ chạy lâu (export dữ liệu, batch job) |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Postgres chết giữa chừng — mô phỏng sự cố thật", command: "docker compose stop postgres" },
+    {
+      comment: "Gọi /healthz khi Postgres đã chết",
+      command: "curl -i http://localhost:3000/healthz",
+      output: "HTTP/1.1 503 Service Unavailable\nContent-Type: application/json; charset=utf-8\n\n{\"status\":\"degraded\",\"checks\":{\"postgres\":\"down\",\"redis\":\"ok\"}}",
+    },
+    { comment: "Khôi phục lại trước khi tiếp tục lab", command: "docker compose start postgres" },
+    { comment: "Gửi 1 request tới route /slow (giả lập, tự xoá sau lab) rồi kill SIGTERM ngay lập tức ở terminal khác", command: "curl http://localhost:3000/slow & sleep 0.5 && docker compose kill -s SIGTERM api" },
+    {
+      comment: "Log của api xác nhận đóng đúng thứ tự trước khi request /slow trả kết quả",
+      command: "docker compose logs api --tail 5",
+      output: "api-1  | Nhận SIGTERM, bắt đầu graceful shutdown\napi-1  | request completed  url=/slow statusCode=200\napi-1  | Đóng sạch, thoát process",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Gọi `client.end()`/`redis.quit()` TRƯỚC `app.close()`. Nếu pool đóng trước, bất kỳ request nào đang xử lý dở mà cần query DB sẽ nhận lỗi "connection closed" giữa chừng — đúng thứ graceful shutdown cố tránh, chỉ là chuyển từ "connection bị cắt" sang "query bị lỗi". Thứ tự luôn là: ngừng nhận request mới → đợi request cũ xong → mới đóng pool.
+</Callout>
+
+<Callout type="warning" title="/healthz không thay thế alerting">
+  `/healthz` trả `503` đúng lúc dependency chết, nhưng đó là điều kiện CẦN để orchestrator (Docker, load balancer) ngừng route traffic tới instance đó — không phải điều kiện ĐỦ để đội vận hành biết có sự cố. Observability thật (B16: log có `requestId`, metrics) mới là thứ giúp con người phát hiện và phản ứng kịp thời; `/healthz` chỉ nói cho MÁY biết, không tự thông báo cho NGƯỜI.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Liveness check", meaning: "Kiểm tra process còn chạy hay không — không đảm bảo service còn phục vụ được." },
+    { term: "Readiness check", meaning: "Kiểm tra service có đủ điều kiện (dependency còn sống) để nhận traffic hay không." },
+    { term: "Graceful shutdown", meaning: "Chuỗi thao tác khi nhận tín hiệu dừng: ngừng nhận việc mới, hoàn tất việc đang dở, rồi mới giải phóng tài nguyên và thoát." },
+    { term: "SIGTERM", meaning: "Tín hiệu yêu cầu process tự thoát một cách lịch sự — có thể bắt (catch) và xử lý trước khi thoát." },
+    { term: "SIGKILL", meaning: "Tín hiệu buộc kill process ngay lập tức — không thể bắt hay xử lý, không có cơ hội dọn dẹp." },
+    { term: "Grace period", meaning: "Khoảng thời gian docker stop đợi sau SIGTERM trước khi gửi SIGKILL — mặc định 10 giây." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một request đang gọi một query Postgres mất 15 giây để hoàn tất. Container nhận SIGTERM đúng lúc đó, và docker stop dùng grace period mặc định (10 giây). Điều gì xảy ra?"
+  options={[
+    "Docker tự động gia hạn grace period lên 15 giây để chờ request xong",
+    "app.close() sẽ buộc request đó phải trả lời ngay trong 10 giây bằng cách rút ngắn timeout của Postgres",
+    "Sau 10 giây, Docker gửi SIGKILL bất kể request đã xong hay chưa — request đó vẫn bị cắt ngang, dù code đã có graceful shutdown",
+    "Redis sẽ tự động lưu lại state để tiếp tục request đó sau khi container khởi động lại",
+  ]}
+  answerIndex={2}
+  explanation="Graceful shutdown chỉ hiệu quả nếu TOÀN BỘ quá trình dọn dẹp xong trong grace period. SIGKILL không quan tâm code có đang cố gắng dọn dẹp hay không — nó luôn kích hoạt đúng sau khoảng thời gian đã cấu hình. Request chạy lâu hơn cả grace period vẫn bị cắt ngang; giải pháp là đặt timeout hợp lý cho request hoặc tăng grace period nếu nghiệp vụ thực sự cần."
+/>

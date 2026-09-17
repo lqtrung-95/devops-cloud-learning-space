@@ -1,0 +1,135 @@
+import { DockerfileStageSizeComparisonDiagram } from "../diagrams/dockerfile-stage-size-comparison-diagram";
+
+<Eli5 title="Container là thùng hàng chuyển đến khách — đừng gửi kèm cả xưởng đóng gói" emoji="📦">
+  Khi một xưởng gói hàng gửi sản phẩm cho khách, họ không gửi luôn cả máy đóng gói, băng keo dư, và bản vẽ thiết kế — chỉ gửi đúng sản phẩm đã hoàn thiện. Nếu gửi kèm cả xưởng, thùng hàng vừa nặng vừa lộ ra những công cụ mà khách không cần và không nên có.
+
+  `Dockerfile` multi-stage làm đúng việc đó: một "xưởng" (`builder`) có đủ dụng cụ (TypeScript compiler, `devDependencies`) để biến source thành sản phẩm (`dist/`), rồi một thùng hàng SẠCH khác (`runtime`) chỉ nhận đúng sản phẩm đó, không nhận theo cả xưởng.
+
+  Còn `USER node` giống như: thay vì giao chìa khoá tổng của cả toà nhà cho người giao hàng, bạn chỉ đưa họ chìa khoá phòng nhận hàng — nếu chìa khoá đó có bị mất hay bị lợi dụng, thiệt hại cũng chỉ giới hạn trong phòng đó, không phải cả toà nhà.
+</Eli5>
+
+Bạn đã học chung về Docker và multi-stage build ở course DevOps & Cloud (`m04-docker-containers`) — module đó dạy khái niệm tổng quát cho mọi loại ứng dụng. Ở đây ta không nhắc lại từ đầu: `taskflow-api` đã có sẵn một Dockerfile 2-stage tối giản từ B01. Bài này đi thẳng vào phần đặc thù của một service Node/Fastify thật: tối ưu sâu hơn, đo bằng số liệu thật, và khoá lại quyền chạy container.
+
+<DockerfileStageSizeComparisonDiagram />
+
+<Technical>
+
+### Điểm xuất phát: Dockerfile của B01
+
+```dockerfile title="Dockerfile (B01 — điểm xuất phát)"
+# Stage 1: build — có đủ devDependencies để biên dịch TypeScript
+FROM node:22-slim AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# Stage 2: runtime — chỉ mang theo dist/ và dependencies production
+FROM node:22-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY --from=builder /app/dist ./dist
+EXPOSE 3000
+CMD ["node", "dist/app.js"]
+```
+
+Bản này đã tách đúng 2 stage — không phải sửa lại từ một Dockerfile single-stage. Nhưng nó vẫn còn ba lỗ hổng tối ưu/an toàn: build context không được lọc (`.dockerignore` chưa có), cache `npm ci --omit=dev` bị bỏ lại thành một layer riêng thay vì dọn ngay, và quan trọng nhất — không có dòng `USER` nào, nghĩa là container chạy bằng **root** mặc định.
+
+### Bản đã tối ưu
+
+```dockerfile title="Dockerfile (sau B17)"
+FROM node:22-slim AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY --from=builder /app/dist ./dist
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD node -e "fetch('http://localhost:3000/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+USER node
+EXPOSE 3000
+CMD ["node", "dist/app.js"]
+```
+
+```text title=".dockerignore"
+node_modules
+dist
+.git
+*.test.ts
+learnings.md
+```
+
+### Vì sao từng dòng thay đổi
+
+- `npm cache clean --force` nối liền với `npm ci --omit=dev` trong CÙNG một lệnh `RUN` — Docker cache theo layer, nếu tách thành 2 lệnh `RUN` riêng, cache npm vẫn tồn tại trong layer trước đó dù lệnh dọn chạy ở layer sau (layer trước vẫn nằm trong image, layer chỉ được CỘNG THÊM, không xoá ngược).
+- `.dockerignore` giữ build context (thứ Docker daemon nhận trước khi build) không cõng theo `node_modules` của host — nếu host chạy macOS/ARM và container chạy Linux/x86, `COPY . .` vô tình copy `node_modules` sai kiến trúc CPU sẽ gây lỗi khó hiểu.
+- `USER node` đặt SAU khi mọi lệnh cần quyền ghi (như `npm ci`) đã chạy xong, và TRƯỚC `CMD` — image `node:22-slim` chính thức đã có sẵn user `node` (uid 1000), không cần tự tạo.
+- `HEALTHCHECK` gọi `/healthz` — endpoint thật sự kiểm tra Postgres/Redis, viết ở bài sau. Đặt healthcheck trong Dockerfile nghĩa là bất kỳ ai chạy `docker inspect` cũng thấy container "unhealthy" đúng lúc dependency chết, không chỉ đúng lúc process crash.
+
+### Bảng đánh đổi: chạy root vs non-root trong container
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| Chạy root (mặc định nếu không có `USER`) | Không cần lo quyền ghi file, setup nhanh | Nếu bị RCE, attacker có toàn quyền bên trong container — dễ leo thang, dễ ghi đè file hệ thống, tăng nguy cơ container escape | Không nên dùng cho service production nhận traffic từ Internet |
+| `USER node` (hoặc UID tuỳ chỉnh) | Giới hạn blast radius nếu bị khai thác; đúng khuyến nghị của Docker và Node.js Docker Working Group | Cần đảm bảo mọi file/thư mục app cần ghi (nếu có) đã đúng quyền cho user đó trước khi đổi `USER` | `taskflow-api` — service Fastify không cần ghi file hệ thống lúc runtime |
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Build baseline từ Dockerfile B01 (chưa dọn cache, chưa non-root)", command: "docker build -t taskflow-api:baseline ." },
+    { comment: "Build lại sau khi thêm .dockerignore, dọn cache npm, HEALTHCHECK, USER node", command: "docker build -t taskflow-api:optimized ." },
+    {
+      comment: "So sánh 2 image cùng lúc",
+      command: "docker images taskflow-api",
+      output: "REPOSITORY     TAG         IMAGE ID       CREATED          SIZE\ntaskflow-api   optimized   7c1d52a0e9f3   5 seconds ago    141MB\ntaskflow-api   baseline    b44e0f3c21aa   2 minutes ago    187MB",
+    },
+    { comment: "Xác nhận container không chạy bằng root", command: "docker run --rm taskflow-api:optimized whoami", output: "node" },
+    {
+      comment: "Xem layer nào còn nặng nhất trong image đã tối ưu",
+      command: "docker history taskflow-api:optimized | head -4",
+      output: "IMAGE          CREATED         CREATED BY                                      SIZE\n<missing>      5 seconds ago   CMD [\"node\" \"dist/app.js\"]                      0B\n<missing>      5 seconds ago   USER node                                        0B\n<missing>      5 seconds ago   RUN npm ci --omit=dev && npm cache clean --force 78MB",
+    },
+  ]}
+/>
+
+<Callout type="mistake">
+  Đặt `USER node` NGAY SAU `WORKDIR /app` rồi mới chạy `RUN npm ci --omit=dev`. Ở thời điểm đó, `WORKDIR` vừa được `root` tạo, user `node` có thể không có quyền ghi vào `/app` (tuỳ cách image base thiết lập ownership) — `npm ci` sẽ báo lỗi `EACCES`. Luôn đặt `USER` là dòng CUỐI CÙNG trước `CMD`, sau khi mọi thao tác cần quyền ghi đã hoàn tất.
+</Callout>
+
+<Callout type="warning">
+  `USER node` không phải "chống RCE tuyệt đối". Nó chỉ giới hạn THIỆT HẠI nếu RCE xảy ra — attacker vẫn có thể đọc mọi biến môi trường, gọi ra ngoài, hoặc khai thác tiếp một lỗ hổng kernel/container runtime để "escape" ra host (rủi ro riêng, nằm ngoài phạm vi Dockerfile). Đừng coi non-root là lớp phòng thủ duy nhất — nó đi cùng các lớp khác đã học ở B15 (rate limit, input validation, dependency audit).
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "Multi-stage build", meaning: "Dockerfile có nhiều FROM; chỉ nội dung được COPY --from=<stage> tường minh mới lọt sang stage sau, phần còn lại của stage trước bị bỏ lại." },
+    { term: "Build context", meaning: "Tập file Docker daemon nhận được khi chạy `docker build`, dùng cho các lệnh COPY/ADD — lọc bớt bằng .dockerignore." },
+    { term: "Layer cache", meaning: "Mỗi lệnh trong Dockerfile tạo một layer; Docker tái sử dụng layer cũ nếu lệnh và input không đổi, giúp build lại nhanh hơn." },
+    { term: "USER (Dockerfile instruction)", meaning: "Chỉ định user chạy các lệnh RUN/CMD/ENTRYPOINT sau nó — mặc định là root nếu không khai báo." },
+    { term: "HEALTHCHECK", meaning: "Instruction Dockerfile khai báo lệnh Docker tự chạy định kỳ để đánh giá container 'healthy' hay 'unhealthy'." },
+    { term: "Blast radius", meaning: "Phạm vi thiệt hại tối đa nếu một lỗ hổng bị khai thác thành công — non-root user thu hẹp phạm vi này bên trong container." },
+  ]}
+/>
+
+<QuickCheck
+  question="Dockerfile của taskflow-api tách đúng 2 stage (builder, runtime) từ B01, nhưng B17 vẫn cần tối ưu thêm. Thay đổi nào sau đây giúp GIỚI HẠN THIỆT HẠI nếu container bị khai thác RCE, thay vì chỉ giảm kích thước image?"
+  options={[
+    "Thêm `.dockerignore` liệt kê `node_modules`",
+    "Gộp `npm ci --omit=dev` và `npm cache clean --force` vào cùng một `RUN`",
+    "Thêm `USER node` trước dòng `CMD`",
+    "Đổi base image từ `node:22-slim` sang `node:22` (bản đầy đủ)",
+  ]}
+  answerIndex={2}
+  explanation="Ba lựa chọn còn lại đều nhắm tới kích thước image hoặc build context — hữu ích nhưng không liên quan tới quyền hạn bên trong container. Chỉ `USER node` thay đổi quyền tiến trình đang chạy, giới hạn những gì một attacker có thể làm nếu khai thác được một lỗ hổng RCE."
+/>

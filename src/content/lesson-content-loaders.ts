@@ -61,4 +61,5 @@ export const lessonContentLoaders: Record<string, LessonLoader> = {
   "b12-graphql-api": (lessonSlug) => import(`./modules/b12-graphql-api/lessons/${lessonSlug}.mdx`),
   "b18-api-gateway-backward-compatibility": (lessonSlug) => import(`./modules/b18-api-gateway-backward-compatibility/lessons/${lessonSlug}.mdx`),
   "b19-capstone-production-hardening": (lessonSlug) => import(`./modules/b19-capstone-production-hardening/lessons/${lessonSlug}.mdx`),
+  "b17-containerization-cicd-backend": (lessonSlug) => import(`./modules/b17-containerization-cicd-backend/lessons/${lessonSlug}.mdx`),
 };

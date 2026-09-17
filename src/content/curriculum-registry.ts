@@ -14,6 +14,7 @@ import { b12GraphqlApiModule } from "./modules/b12-graphql-api/module-meta";
 import { b13GrpcInternalServicesModule } from "./modules/b13-grpc-internal-services/module-meta";
 import { b14MicroserviceSplitEventDrivenModule } from "./modules/b14-microservice-split-event-driven/module-meta";
 import { b15SecurityForBackendModule } from "./modules/b15-security-for-backend/module-meta";
+import { b17ContainerizationCicdBackendModule } from "./modules/b17-containerization-cicd-backend/module-meta";
 import { b18ApiGatewayBackwardCompatibilityModule } from "./modules/b18-api-gateway-backward-compatibility/module-meta";
 import { b19CapstoneProductionHardeningModule } from "./modules/b19-capstone-production-hardening/module-meta";
 import { m01LinuxShellModule } from "./modules/m01-linux-shell/module-meta";
@@ -70,6 +71,7 @@ export const curriculumModules: ModuleDefinition[] = [
   b13GrpcInternalServicesModule,
   b14MicroserviceSplitEventDrivenModule,
   b15SecurityForBackendModule,
+  b17ContainerizationCicdBackendModule,
   b18ApiGatewayBackwardCompatibilityModule,
   b19CapstoneProductionHardeningModule,
   m01LinuxShellModule,
