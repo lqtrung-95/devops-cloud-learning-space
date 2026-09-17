@@ -20,7 +20,7 @@ export default async function LandingPage() {
     <div>
       <section className="mx-auto max-w-3xl px-4 py-14 text-center lg:py-20">
         <p className="inline-flex rounded-full bg-indigo-100 px-3 py-1 text-xs font-bold text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300">
-          🧸 Giải thích dễ hiểu · Sơ đồ tương tác · Lab & quiz
+          🧸 Dễ hiểu, có sơ đồ tương tác và lab thực hành
         </p>
         <h1 className="mt-4 text-4xl font-extrabold leading-tight tracking-tight sm:text-5xl">
           Học công nghệ khó <span className="text-indigo-600 dark:text-indigo-400">dễ như nghe kể chuyện</span>
@@ -50,17 +50,19 @@ export default async function LandingPage() {
       <section className="border-y border-stone-200 bg-white py-14 dark:border-stone-800 dark:bg-stone-900/50">
         <div className="mx-auto max-w-6xl px-4">
           <h2 className="text-center text-2xl font-bold">Mỗi bài học đi theo 4 bước</h2>
-          <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            {learningSteps.map((step, index) => (
-              <div key={step.title} className="rounded-2xl bg-stone-50 p-5 dark:bg-stone-900">
-                <p className="text-3xl" aria-hidden>
-                  {step.emoji}
-                </p>
-                <p className="mt-3 text-xs font-bold text-indigo-600 dark:text-indigo-400">BƯỚC {index + 1}</p>
-                <p className="font-bold">{step.title}</p>
-                <p className="mt-1 text-sm leading-relaxed text-stone-600 dark:text-stone-400">{step.text}</p>
-              </div>
-            ))}
+          <div className="relative mt-12">
+            <span aria-hidden className="absolute left-[12.5%] right-[12.5%] top-7 hidden h-px bg-stone-200 dark:bg-stone-800 lg:block" />
+            <ol className="grid gap-8 sm:grid-cols-2 lg:grid-cols-4">
+              {learningSteps.map((step) => (
+                <li key={step.title} className="relative flex flex-col items-center text-center">
+                  <span className="relative z-10 flex size-14 items-center justify-center rounded-full border border-stone-200 bg-stone-50 text-2xl dark:border-stone-800 dark:bg-stone-900">
+                    <span aria-hidden>{step.emoji}</span>
+                  </span>
+                  <p className="mt-4 font-bold">{step.title}</p>
+                  <p className="mt-1 text-sm leading-relaxed text-stone-600 dark:text-stone-400">{step.text}</p>
+                </li>
+              ))}
+            </ol>
           </div>
         </div>
       </section>
