@@ -1,0 +1,141 @@
+import { LoadTestLatencyByStepDiagram } from "../diagrams/load-test-latency-by-step-diagram";
+
+<Eli5 title="Bếp nào nghẹt trước tiên khi khách ùa vào?" emoji="🍳">
+  Nhà hàng có 5 trạm: order, salad, nướng thịt, tính tiền, đóng gói mang về. Một tối vắng khách, cả 5 trạm đều nhanh như nhau. Nhưng khi 50 khách ùa vào cùng lúc, bạn sẽ thấy hàng người dồn ứ ở **trạm nướng thịt** trước tiên — vì nướng một miếng thịt mất đúng một khoảng thời gian cố định trên một cái vỉ, không thể làm song song nhiều hơn số vỉ đang có. Trạm salad thì khác — nhiều đầu bếp có thể trộn salad song song, gần như không nghẽn.
+
+  Load test toàn hệ thống chính là đứng ngoài quan sát cả 5 trạm cùng lúc khi khách đông, thay vì chỉ đứng canh một trạm rồi kết luận "nhà hàng chạy tốt".
+</Eli5>
+
+`taskflow-api` đã có đủ tính năng sau 18 module. Câu hỏi ở B19 không phải "còn thiếu tính năng gì" mà là "khi nhiều người dùng thật cùng lúc, chỗ nào vỡ trước tiên?" — và câu trả lời phải đến từ số liệu đo được, không phải cảm tính.
+
+<LoadTestLatencyByStepDiagram />
+
+<Technical>
+
+### p50 / p95 / p99 — vì sao không nhìn trung bình
+
+- **p50 (median):** một nửa request nhanh hơn số này. Phản ánh trải nghiệm "điển hình".
+- **p95 / p99:** 5% (hoặc 1%) request chậm nhất mất bao lâu. Đây là nơi trải nghiệm tệ thật sự xảy ra — với traffic đủ lớn, "1% chậm" vẫn là hàng nghìn user thật mỗi ngày.
+- **Trung bình (average)** dễ bị vài request rất nhanh kéo xuống thấp, che mất đuôi dài đang tệ dần. Không dùng average để kết luận "hệ thống ổn".
+
+### Vì sao đo cả hành trình, không phải một endpoint
+
+Một load test thực tế phải mô phỏng đúng thứ tự người dùng thật làm: **đăng nhập → tạo project → tạo task → comment → upload attachment**. Nếu chỉ bắn tải vào một endpoint đơn lẻ (ví dụ `GET /tasks`), bạn sẽ bỏ lỡ đúng bước gây nghẽn thật — vì nghẽn thường nằm ở bước có đặc điểm khác biệt (CPU-bound, gọi service ngoài, ghi file) chứ không phải bước đơn giản nhất.
+
+### k6 hay autocannon?
+
+| Lựa chọn | Ưu | Nhược | Dùng khi |
+|---|---|---|---|
+| **k6** | Kịch bản đa bước bằng JS thật (`group`, biến, `Trend` tuỳ chỉnh), threshold pass/fail rõ ràng, output tóm tắt theo từng nhóm | Cần học cú pháp riêng của k6 | Test cả hành trình nhiều bước như `taskflow-api` — đúng nhu cầu của B19 |
+| **autocannon** | Cài nhanh qua `npx`, cú pháp tối giản, tốt để bắn tải thô vào một endpoint | Không hỗ trợ kịch bản nhiều bước có state (token, id vừa tạo) tốt bằng k6 | Kiểm tra nhanh throughput của một endpoint đơn lẻ |
+
+Với hành trình 5 bước có phụ thuộc lẫn nhau (cần token sau khi login, cần `projectId` sau khi tạo project...), **k6** phù hợp hơn cho lab này.
+
+### Kịch bản k6 cho hành trình taskflow-api
+
+```js title="load-test/journey.js"
+import http from "k6/http";
+import { check, group } from "k6";
+import { Trend } from "k6/metrics";
+
+const BASE_URL = "http://localhost:8081/api/v1"; // qua nginx gateway (B17/B18)
+
+// Trend riêng cho từng bước để so sánh p95/p99 — không gộp chung một con số.
+const loginTrend = new Trend("step_login");
+const createProjectTrend = new Trend("step_create_project");
+const createTaskTrend = new Trend("step_create_task");
+const commentTrend = new Trend("step_comment");
+const uploadTrend = new Trend("step_upload");
+
+export const options = {
+  stages: [
+    { duration: "30s", target: 10 },
+    { duration: "1m", target: 50 },
+    { duration: "30s", target: 0 },
+  ],
+  thresholds: {
+    step_login: ["p(95)<300"], // sẽ FAIL nếu bottleneck login thật sự tệ như dự đoán
+  },
+};
+
+export default function journey() {
+  let token;
+
+  group("login", () => {
+    const res = http.post(`${BASE_URL}/auth/login`, JSON.stringify({ email: "loadtest@taskflow.dev", password: "correct-horse" }), {
+      headers: { "Content-Type": "application/json" },
+    });
+    loginTrend.add(res.timings.duration);
+    check(res, { "login 200": (r) => r.status === 200 });
+    token = res.json("accessToken");
+  });
+
+  const authHeaders = { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } };
+  let projectId, taskId;
+
+  group("create_project", () => {
+    const res = http.post(`${BASE_URL}/projects`, JSON.stringify({ name: "Load test project" }), authHeaders);
+    createProjectTrend.add(res.timings.duration);
+    projectId = res.json("id");
+  });
+
+  group("create_task", () => {
+    const res = http.post(`${BASE_URL}/projects/${projectId}/tasks`, JSON.stringify({ title: "Load test task" }), authHeaders);
+    createTaskTrend.add(res.timings.duration);
+    taskId = res.json("id");
+  });
+
+  group("comment", () => {
+    const res = http.post(`${BASE_URL}/tasks/${taskId}/comments`, JSON.stringify({ body: "note" }), authHeaders);
+    commentTrend.add(res.timings.duration);
+  });
+
+  group("upload_attachment", () => {
+    const res = http.post(`${BASE_URL}/tasks/${taskId}/attachments`, JSON.stringify({ filename: "note.txt", sizeBytes: 1024 }), authHeaders);
+    uploadTrend.add(res.timings.duration);
+  });
+}
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Chạy load test tăng dần tải theo stage đã khai báo trong options", command: "k6 run --stage 30s:10,1m:50,30s:0 load-test/journey.js" },
+    { comment: "Ví dụ minh hoạ phần tóm tắt cuối cùng (suy luận theo đặc điểm CPU-bound của login, không phải số đo cố định)", command: "# xem cột 'p(95)' và 'p(99)' của từng Trend", output: "step_login.......: avg=94ms  p(95)=182ms  p(99)=618ms\nstep_create_project: avg=31ms  p(95)=61ms   p(99)=108ms\nstep_create_task..: avg=28ms  p(95)=54ms   p(99)=94ms\nstep_comment......: avg=22ms  p(95)=44ms   p(99)=79ms\nstep_upload.......: avg=101ms p(95)=214ms  p(99)=336ms\n\n✗ step_login: p(95)<300 (182ms tại VU=50, nhưng p(99) đã vượt xa các bước khác)" },
+    { comment: "Ghi lại phát hiện — trích đúng số liệu bạn vừa thấy, không phải số ví dụ ở trên", command: "vim docs/load-test-findings.md" },
+  ]}
+/>
+
+<Callout type="mistake" title="Kết luận bottleneck chỉ từ một lần chạy">
+  Một lần chạy có thể bị nhiễu bởi máy bạn đang làm việc khác cùng lúc. Chạy lại ít nhất 2–3 lần, và luôn so sánh **tương đối giữa các bước trong cùng một lần chạy** (bước nào doãng ra xa nhất khi VU tăng) thay vì tin tuyệt đối vào một con số ms duy nhất.
+</Callout>
+
+<Callout type="warning" title="Đừng vá tạm để 'qua' load test">
+  Nếu threshold `p(95)<300` fail ở bước login, đừng tăng threshold lên `p(95)<1000` để nó pass — đó là che số liệu, không phải sửa vấn đề. Ghi nhận đúng con số thật, rồi đưa hướng sửa (worker threads cho hash, hoặc scale ngang `api`) vào phần cải tiến của design doc ở lesson sau.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "p50 / p95 / p99", meaning: "Phân vị latency: 50%, 95%, 99% request nhanh hơn con số này. p99 phản ánh trải nghiệm tệ nhất còn đáng quan tâm." },
+    { term: "VU (virtual user)", meaning: "Một 'người dùng ảo' mà công cụ load test mô phỏng, chạy lặp lại kịch bản song song với các VU khác." },
+    { term: "ramping load", meaning: "Tăng dần số VU theo từng giai đoạn (stage) để quan sát hệ thống bắt đầu chậm lại từ mức tải nào." },
+    { term: "CPU-bound vs I/O-bound", meaning: "CPU-bound: giới hạn bởi tốc độ tính toán (hash password). I/O-bound: giới hạn bởi thời gian chờ mạng/đĩa (query DB, gọi API ngoài)." },
+    { term: "threshold (k6)", meaning: "Điều kiện pass/fail gắn với một metric, ví dụ `p(95)<300` cho một bước cụ thể." },
+    { term: "bottleneck đầu tiên", meaning: "Thành phần chậm lại và làm nghẽn cả hệ thống sớm nhất khi tải tăng dần — không nhất thiết là thành phần chậm nhất ở mức tải thấp." },
+  ]}
+/>
+
+<QuickCheck
+  question="Load test cho thấy p50 của bước đăng nhập chỉ chậm hơn bước tạo task một chút, nhưng p99 lại cao gấp 6-7 lần. Điều này gợi ý gì?"
+  options={[
+    "Không có gì đáng lo — p50 mới là con số quan trọng nhất",
+    "Phần lớn request đăng nhập vẫn nhanh, nhưng một tỷ lệ nhỏ bị chặn nghiêm trọng khi trùng thời điểm tải cao — đúng đặc điểm của việc CPU-bound (hash password) tranh chấp event loop",
+    "k6 đo sai, cần đổi sang autocannon",
+    "Bước tạo task mới là bottleneck vì p50 của nó thấp hơn",
+  ]}
+  answerIndex={1}
+  explanation="p50 thấp + p99 rất cao là dấu hiệu kinh điển của tranh chấp tài nguyên theo đợt (CPU-bound công việc xếp hàng khi trùng thời điểm), khác với I/O-bound thường tăng đều hơn theo tải."
+/>

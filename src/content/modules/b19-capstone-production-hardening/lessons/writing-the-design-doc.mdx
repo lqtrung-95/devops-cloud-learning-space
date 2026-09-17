@@ -1,0 +1,109 @@
+import { ImprovementPriorityMatrixDiagram } from "../diagrams/improvement-priority-matrix-diagram";
+
+<Eli5 title="Tờ giấy bàn giao nhà cho chủ mới" emoji="📋">
+  Nghiệm thu xong (lesson 1), thử tải xong (lesson 2) — giờ là lúc viết **một tờ giấy duy nhất** để bàn giao cho người tiếp quản `taskflow-api` (có thể chính là bạn 6 tháng sau, hoặc một đồng nghiệp mới). Tờ giấy đó không phải hợp đồng dài 20 trang không ai đọc — nó phải đọc xong trong 10 phút và trả lời đúng 3 câu: **nhà hiện trạng ra sao, nếu có thêm 1 tháng thì sửa gì trước, và duy trì nó tốn khoảng bao nhiêu tiền mỗi tháng.**
+</Eli5>
+
+Đây là "portfolio piece" của cả khoá học — thứ bạn có thể đưa cho nhà tuyển dụng xem để chứng minh không chỉ biết code mà còn biết **suy nghĩ như người vận hành** một hệ thống thật.
+
+<ImprovementPriorityMatrixDiagram />
+
+<Technical>
+
+### Cấu trúc bắt buộc — chỉ 3 phần
+
+Một design doc ngắn tốt không cần nhiều mục hơn thế này:
+
+```md title="docs/design-doc.md"
+# Design doc: taskflow-api — production hardening review
+
+## Kiến trúc hiện tại
+(liệt kê từng service, vai trò, điểm đã harden — tham khảo lesson "production-readiness-checklist")
+
+## 3 cải tiến ưu tiên
+(nếu có thêm 1 tháng, làm gì trước — kèm lý do effort/impact)
+
+## Ước lượng chi phí hạ tầng tối thiểu
+(giả định traffic → ước lượng compute/DB/cache/storage, nêu rõ đây là mức tối thiểu)
+```
+
+### Phần 1 — Kiến trúc hiện tại
+
+Không vẽ lại từ đầu — tóm tắt đúng những gì diagram ở lesson 1 đã chỉ ra: 7 service (`api`, `worker`, `notification-service`, `postgres`, `redis`, `minio`, `nginx`), module nào giới thiệu từng cái, và 2-3 điểm còn yếu nổi bật nhất (ví dụ: chưa có backup Postgres đã thử; gRPC call tới `notification-service` chưa có retry).
+
+### Phần 2 — 3 cải tiến ưu tiên: chọn bằng effort/impact, không bằng cảm tính
+
+Liệt kê mọi ý tưởng cải tiến có thể nghĩ ra, ước lượng **effort** (công sức) và **impact** (tác động) một cách tương đối cho từng ý, rồi chọn đúng 3 mục theo thứ tự: quick win (effort thấp, impact cao) trước, sau đó mới tới việc effort cao hơn nhưng impact cũng cao.
+
+| Vùng trên ma trận | Ý nghĩa | Nên làm trong "1 tháng nữa"? |
+|---|---|---|
+| Effort thấp, impact cao (quick win) | Ít công, tác động lớn | Luôn làm trước |
+| Effort cao, impact cao (dự án lớn) | Đáng làm nhưng cần kế hoạch, có thể vượt quá 1 tháng | Cân nhắc nếu đã hết quick win |
+| Effort thấp, impact thấp | Không gấp | Làm khi rảnh |
+| Effort cao, impact thấp | Tốn công, ít lợi | Tránh trừ khi có lý do khác (compliance, hợp đồng...) |
+
+Với `taskflow-api`, ba mục hợp lý nhất cho "1 tháng nữa" là: **sửa bottleneck CPU ở đăng nhập** (impact cao nhất vì đo được thật ở lesson trước), **tự động backup Postgres + thử restore** (quick win, vá lỗ hổng lớn nhất còn thiếu), và **retry/circuit breaker giữa `api` và `notification-service`** (effort thấp, ngăn lỗi dây chuyền). Scale ngang `api` bị xếp sau vì effort cao nhất và phụ thuộc vào việc sửa bottleneck CPU trước — scale ngang một service vẫn nghẽn CPU không giải quyết được gốc vấn đề.
+
+### Phần 3 — Ước lượng chi phí: luôn nêu giả định trước khi ra số
+
+Không bao giờ chốt một con số duy nhất mà không nói rõ giả định đứng sau nó. Khung tối thiểu:
+
+```
+Giả định: ~50 user đồng thời, traffic thấp (giai đoạn MVP), 1 region, không cần multi-AZ.
+
+| Thành phần | Lựa chọn tối thiểu | Ước lượng (USD/tháng, tham khảo AWS ap-southeast-1) |
+|---|---|---|
+| Compute (api + worker) | 1 instance nhỏ (2 vCPU/4GB) chạy cả hai qua Docker Compose | ~$25-35 |
+| notification-service | Gộp chung instance trên (chưa cần tách máy riêng ở quy mô này) | $0 thêm |
+| Managed Postgres | Instance nhỏ nhất có automated backup | ~$15-25 |
+| Managed Redis | Instance nhỏ nhất, không cần cluster | ~$10-15 |
+| Object storage (thay MinIO) | S3-compatible, dung lượng nhỏ + egress thấp | ~$1-5 |
+| **Tổng ước lượng tối thiểu** | | **~$50-80/tháng** |
+
+Chưa gồm: multi-AZ, CDN, WAF, log retention dài hạn — cần cộng thêm khi traffic thật tăng.
+Giá thay đổi theo thời gian và nhà cung cấp — luôn kiểm tra pricing calculator mới nhất trước khi chốt số thật.
+```
+
+Con số ở trên chỉ minh hoạ cách trình bày (giả định → thành phần → ước lượng có khoảng, không phải một số tuyệt đối) — khi viết doc thật, dùng đúng giả định và mức giá bạn tra được tại thời điểm viết.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Tạo file design doc đúng vị trí trong repo taskflow-api", command: "touch docs/design-doc.md" },
+    { comment: "Đếm số từ để ước lượng thời gian đọc (trung bình ~200 từ/phút)", command: "wc -w docs/design-doc.md", output: "docs/design-doc.md: 480 words" },
+    { comment: "480 từ ÷ 200 từ/phút ≈ 2.4 phút đọc chữ — còn lại là thời gian nhìn bảng/số liệu, vẫn nằm trong 10 phút", command: "# nếu vượt quá rõ rệt, cắt bớt phần Kiến trúc hiện tại xuống còn ý chính" },
+  ]}
+/>
+
+<Callout type="mistake" title="Cải tiến chung chung, không đo được">
+  "Sẽ cải thiện performance" không phải một cải tiến — nó không nói được sửa cái gì, đo bằng gì để biết đã xong. Viết cụ thể: "tách hash password ra worker thread riêng, mục tiêu p99 bước đăng nhập giảm xuống dưới ngưỡng SLA ví dụ đã đặt ở lesson trước".
+</Callout>
+
+<Callout type="warning" title="Ước lượng chi phí thiếu egress/data transfer">
+  Chi phí hạ tầng dễ bị đánh giá thấp vì quên phí truyền dữ liệu ra ngoài (egress) — đặc biệt khi `taskflow-api` phục vụ download attachment từ object storage. Với traffic thấp con số này nhỏ, nhưng phải nêu rõ trong doc là "chưa tính egress ở mức traffic cao" để người đọc sau không hiểu nhầm đây là chi phí trần.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "design doc ngắn", meaning: "Tài liệu 1 trang tóm tắt kiến trúc, cải tiến ưu tiên và chi phí — đọc được trong ~10 phút, không phải tài liệu kỹ thuật đầy đủ." },
+    { term: "effort/impact matrix", meaning: "Công cụ ưu tiên: xếp các việc có thể làm theo công sức cần bỏ ra và tác động mang lại, để chọn quick win trước." },
+    { term: "quick win", meaning: "Việc effort thấp nhưng impact cao — nên luôn làm trước trong khoảng thời gian ngắn." },
+    { term: "back-of-envelope estimate", meaning: "Ước lượng nhanh, nêu rõ giả định, chấp nhận sai số — mục tiêu là có con số hợp lý để ra quyết định, không phải chính xác tuyệt đối." },
+    { term: "egress cost", meaning: "Chi phí truyền dữ liệu ra khỏi hạ tầng cloud (ví dụ user tải file từ object storage) — dễ bị quên khi ước lượng chi phí." },
+  ]}
+/>
+
+<QuickCheck
+  question="Trong 5 cải tiến có thể làm cho `taskflow-api`, mục 'thêm Dependabot/Renovate vào CI' có effort thấp nhất nhưng KHÔNG được chọn vào top 3 của tháng tới. Vì sao hợp lý?"
+  options={[
+    "Vì Dependabot không quan trọng bằng việc khác trong bất kỳ trường hợp nào",
+    "Vì effort thấp không đủ — phải kết hợp với impact: `pnpm audit` thủ công ở B15 đã che được phần lớn rủi ro cấp bách, nên impact ngắn hạn của việc tự động hoá thấp hơn 3 mục còn lại",
+    "Vì CI đã đầy đủ, không cần thêm gì nữa",
+    "Vì Dependabot yêu cầu trả phí nên vượt ngân sách",
+  ]}
+  answerIndex={1}
+  explanation="Chọn ưu tiên là cân bằng cả effort lẫn impact, không chỉ nhìn effort. Một việc effort thấp nhưng impact thấp hơn các việc khác vẫn có thể xếp sau nếu 'chỗ ngồi' trong 1 tháng có hạn."
+/>

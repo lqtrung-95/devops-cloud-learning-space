@@ -1,0 +1,98 @@
+import { TaskflowSystemHardeningDiagram } from "../diagrams/taskflow-system-hardening-diagram";
+
+<Eli5 title="Buổi nghiệm thu trước khi bàn giao nhà" emoji="🏗️">
+  Nhà đã xây xong 18 tháng qua (từng module một): cửa an toàn, sổ phân quyền, kho đồ, việc vặt chạy nền, tủ lạnh, chuông cửa, đường dây nội bộ, khoá cửa sổ, camera giám sát, đóng gói di chuyển, cổng bảo vệ. Giờ là ngày **nghiệm thu** — người kiểm định đi từng phòng, cầm một tờ checklist, không xây thêm gì cả, chỉ hỏi: "cái này đã làm chưa, làm rồi thì chứng minh được không, chưa làm thì vì sao và có sao không".
+
+  Một số mục nghiệm thu viên cố tình đánh "bỏ qua" — ví dụ nhà 2 tầng không cần thang máy — miễn là ghi rõ lý do. Cái tối kỵ là đánh "đạt" cho một mục chưa từng thử thật (kiểu tự nhận "cửa chống cháy tốt" mà chưa từng thử đóng nó).
+</Eli5>
+
+Module này không dạy khái niệm mới. Nó tổng hợp lại đúng những gì `taskflow-api` đã có sau B01–B18, rà theo góc nhìn "đưa hệ thống này ra production thật thì còn thiếu gì" — kỹ năng bạn sẽ dùng ở mọi công việc backend thật, không riêng gì `taskflow-api`.
+
+<TaskflowSystemHardeningDiagram />
+
+<Technical>
+
+### 6 nhóm hạng mục cốt lõi
+
+Một checklist production-readiness thực tế thường xoay quanh 6 nhóm sau — mỗi nhóm `taskflow-api` đã có phần nào từ một module trước đó:
+
+| Nhóm | `taskflow-api` đã làm ở | Cách kiểm chứng thật (không đoán) |
+|---|---|---|
+| Health check | B17 (`/healthz` kiểm tra Postgres + Redis) | `curl` endpoint, rồi tắt Postgres và gọi lại — phải trả lỗi, không phải `200` cứng |
+| Graceful shutdown | B17 (`SIGTERM` đóng pool DB/Redis trước khi thoát) | Gửi `SIGTERM` giữa lúc có request đang chạy, xem request có hoàn thành trước khi process thoát |
+| Structured logging | B16 (pino + `requestId` xuyên suốt) | Gây một lỗi 500 thật, tìm log tương ứng bằng đúng `requestId` trong response |
+| Rate limiting | B15 (chặt cho `/auth/login`), B18 (rate limit ở gateway `nginx`) | Gửi liên tục vượt ngưỡng, xem có nhận `429` không, và header `Retry-After` có đúng không |
+| Secrets management | B15 (`.env`, không hard-code, không rò trong log lỗi) | `grep` mã nguồn tìm chuỗi bí mật hard-code; kiểm tra log lỗi 500 có in nhầm `Authorization` header không |
+| Backup & restore | Chưa module nào làm — đây là khoảng trống cần lấp ở B19 | Chạy thử `pg_dump`, xoá một bảng trong môi trường dev, `restore` lại, xác nhận dữ liệu về đúng |
+
+### Vì sao "đã có code" không có nghĩa là "production-ready"
+
+Ba lỗi thường gặp khi tự chấm checklist:
+
+1. **Chấm đạt vì thấy code tồn tại**, chưa từng chạy thử tình huống lỗi thật (ví dụ có `/healthz` nhưng chưa từng tắt Postgres để xem nó phản ứng ra sao).
+2. **Bỏ qua không ghi lý do** — khác hẳn với "cố ý bỏ qua có lý do". Ví dụ: "chưa cấu hình backup MinIO" mà không nói vì sao chấp nhận được và khi nào phải làm, thì đó là một lỗ hổng bị lờ đi chứ không phải một quyết định có cân nhắc.
+3. **Chấm cả mục đã lỗi thời** — ví dụ B04 review cho `users`/`memberships` xong thì coi như xong mãi mãi, trong khi schema đã đổi ở B05/B06 sau đó.
+
+### Checklist mẫu để copy vào `docs/production-readiness-checklist.md`
+
+```md title="docs/production-readiness-checklist.md"
+| Hạng mục | Trạng thái | Module | Ghi chú / lý do bỏ qua |
+|---|---|---|---|
+| Health check kiểm tra dependency thật (không trả cứng 200) | ☐ Done / ☐ Bỏ qua | B17 | |
+| Graceful shutdown (SIGTERM đợi request xong mới đóng pool) | ☐ Done / ☐ Bỏ qua | B17 | |
+| Structured log có requestId xuyên suốt | ☐ Done / ☐ Bỏ qua | B16 | |
+| Rate limit riêng cho route nhạy cảm (/auth/login) | ☐ Done / ☐ Bỏ qua | B15 | |
+| Rate limit tập trung ở gateway (nginx) | ☐ Done / ☐ Bỏ qua | B18 | |
+| Secret không hard-code, không rò trong log lỗi | ☐ Done / ☐ Bỏ qua | B15 | |
+| Input validation ở mọi route ghi dữ liệu | ☐ Done / ☐ Bỏ qua | B03 | |
+| Password hash đúng cách (argon2id), token có expiry | ☐ Done / ☐ Bỏ qua | B05 | |
+| Multi-tenant isolation (organization_id trong mọi WHERE) | ☐ Done / ☐ Bỏ qua | B06 | |
+| Test + CI gate trước khi merge | ☐ Done / ☐ Bỏ qua | B07 / B17 | |
+| Backup Postgres đã thử restore thật | ☐ Done / ☐ Bỏ qua | (mới ở B19) | |
+| Dependency scan (pnpm audit) đã đọc, có xử lý/document | ☐ Done / ☐ Bỏ qua | B15 | |
+```
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Health check phải phản ánh trạng thái thật, không phải 200 cứng", command: "curl -i localhost:3000/api/v1/healthz", output: "HTTP/1.1 200 OK\n{\"status\":\"ok\",\"postgres\":\"ok\",\"redis\":\"ok\"}" },
+    { comment: "Tắt Postgres rồi gọi lại — healthz phải báo lỗi", command: "docker compose stop postgres && curl -i localhost:3000/api/v1/healthz", output: "HTTP/1.1 503 Service Unavailable\n{\"status\":\"degraded\",\"postgres\":\"down\",\"redis\":\"ok\"}" },
+    { comment: "Bật lại trước khi test tiếp", command: "docker compose start postgres" },
+    { comment: "Gửi SIGTERM giữa lúc đang xử lý request, xem log graceful shutdown", command: "docker compose kill -s SIGTERM api", output: "[info] SIGTERM received, draining connections...\n[info] 1 in-flight request(s), waiting...\n[info] http server closed, closing db pool\n[info] shutdown complete" },
+    { comment: "Đọc report dependency thật, không bịa số lỗ hổng", command: "pnpm audit --audit-level=high", output: "found 0 vulnerabilities" },
+  ]}
+/>
+
+<Callout type="mistake" title="Chấm 'Done' cho thứ chưa từng chạy thử">
+  Có endpoint `/healthz` không đồng nghĩa nó hoạt động đúng khi Postgres thật sự chết. Rất nhiều outage thật xảy ra vì health check "giả" — luôn trả `200` bất kể trạng thái bên trong — khiến orchestrator vẫn đẩy traffic vào một instance đã hỏng.
+</Callout>
+
+<Callout type="warning" title="Bỏ qua phải có lý do, không phải im lặng">
+  "Bỏ qua vì chưa kịp làm" không phải một lý do hợp lệ trong checklist production-readiness. Lý do hợp lệ trả lời được 3 câu: rủi ro hiện tại là gì, vì sao chấp nhận được ở quy mô hiện tại, và điều kiện nào (traffic, số user, loại dữ liệu) thì phải quay lại làm.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "production-readiness checklist", meaning: "Danh sách hạng mục vận hành cần có trước khi một service phục vụ traffic thật, không phải danh sách tính năng." },
+    { term: "health check", meaning: "Endpoint xác nhận service (và dependency của nó) đang phục vụ được, không chỉ 'process còn sống'." },
+    { term: "graceful shutdown", meaning: "Xử lý SIGTERM bằng cách đợi request đang chạy xong rồi mới đóng kết nối, thay vì cắt ngang." },
+    { term: "backup & restore drill", meaning: "Không chỉ backup — phải thử restore thật ít nhất một lần để biết bản backup dùng được." },
+    { term: "bỏ qua có lý do", meaning: "Quyết định có cân nhắc: nêu rủi ro, lý do chấp nhận, và điều kiện khi nào phải làm lại." },
+    { term: "dependency scanning", meaning: "Quét thư viện bên thứ ba tìm lỗ hổng đã công bố (CVE), ví dụ bằng `pnpm audit`." },
+  ]}
+/>
+
+<QuickCheck
+  question="Bạn thấy `taskflow-api` có endpoint `/healthz` trả `200` mọi lúc, kể cả khi vừa tắt thử Postgres. Nên đánh dấu mục 'health check' trong checklist thế nào?"
+  options={[
+    "Done — vì endpoint đã tồn tại và trả response bình thường",
+    "Bỏ qua có lý do — vì health check không quan trọng bằng logic nghiệp vụ",
+    "Chưa đạt — vì health check phải phản ánh đúng trạng thái dependency thật, không phải trả cứng 200",
+    "Done — miễn là endpoint không bị lỗi 500",
+  ]}
+  answerIndex={2}
+  explanation="Một health check trả cứng 200 là 'giả' — nó không giúp orchestrator biết instance nào thật sự khoẻ. Phải chấm 'chưa đạt' và sửa lại để nó thật sự kiểm tra Postgres/Redis."
+/>
