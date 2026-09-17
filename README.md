@@ -9,8 +9,9 @@ Nền tảng web học công nghệ theo kiểu **ELI5 + sơ đồ tương tác 
 - 🧸 **ELI5 trước, kỹ thuật sau** — mỗi khái niệm mở đầu bằng ví dụ đời thường
 - 🖼️ **Sơ đồ SVG tương tác** — bấm từng bước, bật/tắt kịch bản, xem gói tin chạy
 - 🧪 **Lab checklist + quiz** chấm điểm phía server
+- 🔁 **Ôn tập giãn cách (SM-2)** — flashcard rút ra từ quiz, pilot 3 module đầu (m01–m03)
 - 👤 **Tài khoản** (GitHub OAuth / email magic link) và **lưu tiến độ** vào Postgres
-- 📈 **Dashboard**: tiến độ theo chặng, heatmap hoạt động, lịch sử quiz
+- 📈 **Dashboard**: tiến độ theo chặng, heatmap hoạt động, lịch sử quiz, thẻ đến hạn ôn tập
 
 Chương trình học:
 
@@ -56,7 +57,7 @@ Xem hướng dẫn từng bước tại [docs/deployment-guide.md](docs/deployme
 
 ```
 src/
-├── app/                       # Routes: / (chọn khoá), /courses/[slug], /login, /dashboard, /modules/[slug]/(lessons|quiz)
+├── app/                       # Routes: / (chọn khoá), /courses/[slug], /login, /dashboard, /review, /modules/[slug]/(lessons|quiz)
 │   └── actions/               # Server actions: lưu tiến độ, chấm quiz
 ├── components/
 │   ├── diagrams/              # Bộ vẽ SVG: node, arrow, packet, step-diagram
@@ -67,8 +68,8 @@ src/
 │   ├── course-registry.ts     # Danh sách khoá học + phase của từng khoá
 │   ├── curriculum-registry.ts # Danh sách module (mọi khoá)
 │   └── modules/<id>-<slug>/   # module-meta.ts · lessons/*.mdx · diagrams/*.tsx (m01…, sd01…)
-├── db/                        # Drizzle schema (auth + progress)
-└── lib/                       # auth, env, progress (pure logic + repository)
+├── db/                        # Drizzle schema (auth + progress + review)
+└── lib/                       # auth, env, progress, review (pure logic + repository)
 docs/                          # curriculums, authoring guide, architecture, deployment
 ```
 

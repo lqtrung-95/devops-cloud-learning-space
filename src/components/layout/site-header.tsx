@@ -21,9 +21,14 @@ export async function SiteHeader() {
             Khoá học
           </Link>
           {session && (
-            <Link href="/dashboard" className={buttonClassName("ghost", "px-3")}>
-              Tiến độ
-            </Link>
+            <>
+              <Link href="/dashboard" className={buttonClassName("ghost", "px-3")}>
+                Tiến độ
+              </Link>
+              <Link href="/review" className={buttonClassName("ghost", "px-3")}>
+                Ôn tập
+              </Link>
+            </>
           )}
         </nav>
         <div className="ml-auto flex items-center gap-1">

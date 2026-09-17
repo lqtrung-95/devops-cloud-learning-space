@@ -167,6 +167,7 @@ export const b13GrpcInternalServicesModule: ModuleDefinition = {
       ],
       answerIndex: 2,
       explanation: "Tái sử dụng field number đã xoá cho một field có Ý NGHĨA và KIỂU DỮ LIỆU khác là thay đổi phá vỡ kinh điển: bên còn dùng version cũ sẽ gửi/đọc dữ liệu sai kiểu tại đúng vị trí đó. Đổi tên field, thêm field mới, hay thêm RPC method đều an toàn.",
+      recallPrompt: "Vì sao tái sử dụng lại một field number Protobuf đã xoá (cho field khác kiểu) có nguy cơ phá vỡ giao tiếp gRPC giữa hai bên chạy lệch version, trong khi đổi tên field hay thêm field mới thì không?",
     },
     {
       id: "grpc-call-nam-trong-hay-ngoai-transaction",

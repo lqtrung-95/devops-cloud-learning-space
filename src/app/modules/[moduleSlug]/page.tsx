@@ -2,11 +2,13 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { LabChecklistCard } from "@/components/progress/lab-checklist-card";
+import type { RecentLabSubmission } from "@/components/progress/lab-submission-panel";
 import { ProgressItemCheckbox } from "@/components/progress/progress-item-checkbox";
 import { buttonClassName } from "@/components/ui/button-styles";
 import { ProgressBar } from "@/components/ui/progress-bar";
-import { getCourseForModule, getModuleBySlug } from "@/content/curriculum-lookup";
+import { getCourseForModule, getModuleBySlug, toPublicLabSubmissionSpec } from "@/content/curriculum-lookup";
 import { getCurrentSession } from "@/lib/auth/auth-server";
+import { getLabSubmissions } from "@/lib/progress/learning-progress-repository";
 import { labItemKey, lessonItemKey } from "@/lib/progress/progress-item-keys";
 import { QUIZ_PASS_PERCENT } from "@/lib/progress/quiz-grader";
 import { getUserProgressSnapshot } from "@/lib/progress/user-progress-snapshot";
@@ -32,6 +34,19 @@ export default async function ModuleOverviewPage({ params }: PageProps<"/modules
     (lesson) => !snapshot.completedKeys.has(lessonItemKey(learningModule.id, lesson.slug)),
   );
   const firstUnfinishedLab = learningModule.labs.find((lab) => !snapshot.completedKeys.has(labItemKey(learningModule.id, lab.id)));
+
+  // Recent submission history per lab, for the panel's history strip. Bounded to a few labs per
+  // module, so N small indexed queries in parallel beats the complexity of a single grouped query.
+  const recentSubmissionsByLab = new Map<string, RecentLabSubmission[]>();
+  if (session) {
+    await Promise.all(
+      learningModule.labs
+        .filter((lab) => lab.submission)
+        .map(async (lab) => {
+          recentSubmissionsByLab.set(lab.id, await getLabSubmissions(session.user.id, learningModule.id, lab.id, 3));
+        }),
+    );
+  }
 
   // "Học tiếp" moves to whatever's next: a lesson, then a lab (same page, so just
   // scroll to it), then the quiz — not back to lesson 1 once lessons are all done.
@@ -122,8 +137,18 @@ export default async function ModuleOverviewPage({ params }: PageProps<"/modules
         <div className="mt-3 space-y-3">
           {learningModule.labs.map((lab, index) => {
             const itemKey = labItemKey(learningModule.id, lab.id);
+            const publicLab = { ...lab, submission: lab.submission ? toPublicLabSubmissionSpec(lab.submission) : undefined };
             return (
-              <LabChecklistCard key={lab.id} lab={lab} index={index} itemKey={itemKey} completed={snapshot.completedKeys.has(itemKey)} isSignedIn={isSignedIn} />
+              <LabChecklistCard
+                key={lab.id}
+                lab={publicLab}
+                moduleSlug={learningModule.slug}
+                index={index}
+                itemKey={itemKey}
+                completed={snapshot.completedKeys.has(itemKey)}
+                isSignedIn={isSignedIn}
+                recentSubmissions={recentSubmissionsByLab.get(lab.id) ?? []}
+              />
             );
           })}
         </div>

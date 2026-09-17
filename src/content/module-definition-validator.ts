@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import type { ModuleDefinition } from "./content-types";
+import type { LabSubmissionSpec, ModuleDefinition } from "./content-types";
 import { coursePhases } from "./course-registry";
 
 /**
@@ -11,6 +11,11 @@ import { coursePhases } from "./course-registry";
 
 const MODULES_DIR = path.join(process.cwd(), "src/content/modules");
 const SLUG_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const ALLOWED_REGEX_FLAGS = /^[ims]*$/;
+// Matches quiz question text that can only be answered by seeing the option list
+// (e.g. "which of the following...") — those questions need a standalone `recallPrompt`
+// to work as a flashcard front.
+const OPTION_DEPENDENT_PATTERN = /nào (sau đây|dưới đây)|phát biểu nào|đáp án nào|câu nào/i;
 
 export const contentRules = {
   minLessons: 3,
@@ -73,6 +78,7 @@ export function validateModuleDefinition(learningModule: ModuleDefinition): stri
   for (const lab of labs) {
     if (!SLUG_PATTERN.test(lab.id)) problems.push(where(`lab id "${lab.id}" must be kebab-case`));
     if (lab.steps.length < 3) problems.push(where(`lab ${lab.id} needs at least 3 steps`));
+    if (lab.submission) validateLabSubmission(lab.submission, lab.id, where, problems);
   }
 
   for (const question of quiz) {
@@ -82,7 +88,73 @@ export function validateModuleDefinition(learningModule: ModuleDefinition): stri
     }
     if (findDuplicates(question.options).length > 0) problems.push(where(`quiz ${question.id} has duplicate options`));
     if (!question.explanation.trim()) problems.push(where(`quiz ${question.id} has no explanation`));
+    if (OPTION_DEPENDENT_PATTERN.test(question.question) && !question.recallPrompt?.trim()) {
+      problems.push(where(`quiz ${question.id} is option-dependent — add recallPrompt`));
+    }
+    if (question.recallPrompt !== undefined && !question.recallPrompt.trim()) {
+      problems.push(where(`quiz ${question.id} recallPrompt is blank`));
+    }
   }
 
   return problems;
+}
+
+/** Validates one lab's optional submission spec — only called when `lab.submission` is set. */
+function validateLabSubmission(submission: LabSubmissionSpec, labId: string, where: (detail: string) => string, problems: string[]): void {
+  if (!submission.prompt.trim()) problems.push(where(`lab ${labId} submission prompt is empty`));
+
+  for (const duplicate of findDuplicates(submission.checks.map((check) => check.id))) {
+    problems.push(where(`lab ${labId} has duplicate check id ${duplicate}`));
+  }
+
+  for (const check of submission.checks) {
+    if (!SLUG_PATTERN.test(check.id)) problems.push(where(`lab ${labId} check id "${check.id}" must be kebab-case`));
+    if (!check.label.trim()) problems.push(where(`lab ${labId} check ${check.id} has an empty label`));
+
+    switch (check.matcher.kind) {
+      case "contains":
+        if (!check.matcher.value.trim()) problems.push(where(`lab ${labId} check ${check.id} (contains) has an empty value`));
+        break;
+      case "regex":
+        validateRegexMatcher(check.matcher.pattern, check.matcher.flags, labId, check.id, where, problems);
+        break;
+      case "numberInRange": {
+        const isValidRegex = validateRegexMatcher(check.matcher.pattern, undefined, labId, check.id, where, problems);
+        if (isValidRegex) {
+          // Counts `(` not followed by `?` (i.e. not a non-capturing/lookaround group) — good enough for the simple authored patterns this validator sees.
+          const captureGroups = (check.matcher.pattern.match(/\((?!\?)/g) ?? []).length;
+          if (captureGroups !== 1) problems.push(where(`lab ${labId} check ${check.id} (numberInRange) pattern must have exactly 1 capture group`));
+        }
+        if (check.matcher.min === undefined && check.matcher.max === undefined) {
+          problems.push(where(`lab ${labId} check ${check.id} (numberInRange) needs at least one of min/max`));
+        }
+        break;
+      }
+      case "jsonHasKeys":
+        if (check.matcher.keys.length === 0) problems.push(where(`lab ${labId} check ${check.id} (jsonHasKeys) needs at least 1 key`));
+        break;
+    }
+  }
+}
+
+/** Compiles a regex + flags, pushing a problem on failure. Returns whether it compiled. */
+function validateRegexMatcher(
+  pattern: string,
+  flags: string | undefined,
+  labId: string,
+  checkId: string,
+  where: (detail: string) => string,
+  problems: string[],
+): boolean {
+  if (flags !== undefined && !ALLOWED_REGEX_FLAGS.test(flags)) {
+    problems.push(where(`lab ${labId} check ${checkId} regex flags "${flags}" must be a subset of "ims"`));
+    return false;
+  }
+  try {
+    new RegExp(pattern, flags ?? "");
+    return true;
+  } catch {
+    problems.push(where(`lab ${labId} check ${checkId} regex pattern does not compile: ${pattern}`));
+    return false;
+  }
 }

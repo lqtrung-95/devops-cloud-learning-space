@@ -1,4 +1,4 @@
-import type { CourseDefinition, ModuleDefinition, PhaseDefinition, PublicQuizQuestion } from "./content-types";
+import type { CourseDefinition, ModuleDefinition, PhaseDefinition, PublicLabSubmissionSpec, PublicQuizQuestion, LabSubmissionSpec } from "./content-types";
 import { coursePhases, courses } from "./course-registry";
 import { curriculumModules } from "./curriculum-registry";
 import { labItemKey, lessonItemKey } from "@/lib/progress/progress-item-keys";
@@ -87,4 +87,13 @@ export function isKnownProgressItemKey(itemKey: string): boolean {
 /** Strips answers/explanations before sending quiz questions to the browser. */
 export function toPublicQuizQuestions(learningModule: ModuleDefinition): PublicQuizQuestion[] {
   return learningModule.quiz.map(({ id, question, options }) => ({ id, question, options }));
+}
+
+/** Strips matchers (regex/expected values) before sending a lab's submission spec to the browser. */
+export function toPublicLabSubmissionSpec(spec: LabSubmissionSpec): PublicLabSubmissionSpec {
+  return {
+    inputKind: spec.inputKind,
+    prompt: spec.prompt,
+    checks: spec.checks.map(({ id, label, hint }) => ({ id, label, hint })),
+  };
 }

@@ -38,12 +38,59 @@ export interface LessonDefinition {
   summary: string;
 }
 
+export type LabCheckMatcher =
+  /** Normalized substring match (trim + collapse whitespace, case-insensitive by default). */
+  | { kind: "contains"; value: string; caseSensitive?: boolean }
+  /** Author-written regex. `flags` limited to i/m/s. */
+  | { kind: "regex"; pattern: string; flags?: string }
+  /** `pattern` must have exactly 1 capture group; its value is parsed as a number and range-checked. */
+  | { kind: "numberInRange"; pattern: string; min?: number; max?: number }
+  /** Submitted text must parse as JSON and contain every dot-path. */
+  | { kind: "jsonHasKeys"; keys: string[] };
+
+export interface LabCheck {
+  /** kebab-case, stable — stored in submission history. */
+  id: string;
+  /** Vietnamese, shown BEFORE submitting so the learner knows what is verified. */
+  label: string;
+  /** Vietnamese nudge shown only when this check fails. Never reveal the matcher. */
+  hint?: string;
+  matcher: LabCheckMatcher;
+}
+
+export interface LabSubmissionSpec {
+  /** `output` = multiline paste; `url` = a link; `value` = one short token. Drives the input widget. */
+  inputKind: "output" | "url" | "value";
+  /** Vietnamese: the exact command to run and what to paste back. */
+  prompt: string;
+  /** Empty = evidence-only lab (stored, self-attested, no auto-grade). */
+  checks: LabCheck[];
+}
+
 export interface LabDefinition {
   /** Stable id used in progress keys — never rename once published. */
   id: string;
   title: string;
   description: string;
   steps: string[];
+  /** Optional — labs without it keep the legacy self-tick checkbox. */
+  submission?: LabSubmissionSpec;
+}
+
+/** Lab submission spec as sent to the browser — matchers stay on the server, hint text is safe to ship (it never restates the matcher). */
+export interface PublicLabSubmissionSpec {
+  inputKind: LabSubmissionSpec["inputKind"];
+  prompt: string;
+  checks: Array<Pick<LabCheck, "id" | "label" | "hint">>;
+}
+
+/** Lab as sent to the browser — matchers stripped so the client bundle never carries an answer key. */
+export interface PublicLabDefinition {
+  id: string;
+  title: string;
+  description: string;
+  steps: string[];
+  submission?: PublicLabSubmissionSpec;
 }
 
 export interface QuizQuestion {
@@ -53,6 +100,8 @@ export interface QuizQuestion {
   answerIndex: number;
   /** Shown after submitting — explain why, ideally with the ELI5 analogy. */
   explanation: string;
+  /** Standalone re-phrasing used when the question is asked without its options. */
+  recallPrompt?: string;
 }
 
 export interface ResourceLink {

@@ -115,6 +115,7 @@ export const b17ContainerizationCicdBackendModule: ModuleDefinition = {
       ],
       answerIndex: 1,
       explanation: "Copy nguyên `/app` từ stage builder mang theo `node_modules` (đã cài cả devDependencies để build) và toàn bộ source `.ts` gốc — đúng thứ multi-stage sinh ra để loại bỏ. Chỉ nên `COPY --from=builder` đúng thư mục `dist/` đã biên dịch.",
+      recallPrompt: "Vì sao ở stage runtime của một Dockerfile multi-stage, `COPY --from=builder /app ./` (copy nguyên thư mục builder, kể cả node_modules và src/) là sai, thay vì chỉ copy đúng thư mục dist/ đã biên dịch?",
     },
     {
       id: "non-root-blast-radius",

@@ -1,7 +1,9 @@
 import "server-only";
 import { and, desc, eq, gte, sql } from "drizzle-orm";
 import { db } from "@/db/database-client";
+import { labSubmission } from "@/db/lab-submission-schema";
 import { progressItem, quizAttempt } from "@/db/learning-progress-schema";
+import type { LabCheckOutcome } from "./lab-submission-grader";
 
 /** Database access for learner progress. All functions are scoped to one user. */
 
@@ -53,6 +55,51 @@ export async function getLatestCompletedItem(userId: string): Promise<{ itemKey:
     .orderBy(desc(progressItem.completedAt))
     .limit(1);
   return row ?? null;
+}
+
+/** Stores one graded (or evidence-only) lab submission attempt. */
+export async function insertLabSubmission(input: {
+  userId: string;
+  moduleId: string;
+  labId: string;
+  content: string;
+  passed: boolean;
+  checkResults: LabCheckOutcome[];
+}): Promise<void> {
+  await db.insert(labSubmission).values(input);
+}
+
+/** Newest-first submission history for one lab, for the panel's history strip. */
+export async function getLabSubmissions(userId: string, moduleId: string, labId: string, limit = 5) {
+  return db
+    .select({
+      id: labSubmission.id,
+      passed: labSubmission.passed,
+      checkResults: labSubmission.checkResults,
+      content: labSubmission.content,
+      createdAt: labSubmission.createdAt,
+    })
+    .from(labSubmission)
+    .where(and(eq(labSubmission.userId, userId), eq(labSubmission.moduleId, moduleId), eq(labSubmission.labId, labId)))
+    .orderBy(desc(labSubmission.createdAt))
+    .limit(limit);
+}
+
+/** Latest submission row per labId in one module — one query instead of N for SSR of the module page. */
+export async function getLatestLabSubmissionsForModule(userId: string, moduleId: string) {
+  const rows = await db
+    .selectDistinctOn([labSubmission.labId], {
+      labId: labSubmission.labId,
+      id: labSubmission.id,
+      passed: labSubmission.passed,
+      checkResults: labSubmission.checkResults,
+      content: labSubmission.content,
+      createdAt: labSubmission.createdAt,
+    })
+    .from(labSubmission)
+    .where(and(eq(labSubmission.userId, userId), eq(labSubmission.moduleId, moduleId)))
+    .orderBy(labSubmission.labId, desc(labSubmission.createdAt));
+  return new Map(rows.map(({ labId, ...row }) => [labId, row]));
 }
 
 /** Timestamps of all learning activity (completed items + quiz attempts) since `since`. */

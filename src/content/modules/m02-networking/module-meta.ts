@@ -96,6 +96,7 @@ export const m02NetworkingModule: ModuleDefinition = {
       options: ["SSH", "Truy vấn DNS thông thường", "Kết nối PostgreSQL", "HTTP/1.1"],
       answerIndex: 1,
       explanation: "DNS thường gửi một câu hỏi ngắn qua UDP 53 — như ném tờ rơi, mất thì client tự hỏi lại. SSH, Postgres, HTTP/1.1 cần kết nối tin cậy nên dùng TCP.",
+      recallPrompt: "Vì sao DNS, streaming và game online thường dùng UDP thay vì TCP?",
     },
     {
       id: "bind-address",

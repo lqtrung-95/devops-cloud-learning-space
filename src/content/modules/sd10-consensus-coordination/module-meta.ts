@@ -254,6 +254,7 @@ export const sd10ConsensusCoordinationModule: ModuleDefinition = {
       answerIndex: 1,
       explanation:
         "Đúng theo bit layout: 41 bit timestamp bằng nhau ở cả hai ID, phần còn lại (worker id, rồi sequence) quyết định ai lớn hơn về mặt SỐ, không phải về mặt THỜI GIAN THỰC sinh ra. 'Roughly time-sortable' nghĩa là đúng thứ tự theo từng mili-giây, không đảm bảo thứ tự tuyệt đối bên trong cùng một mili-giây giữa các worker khác nhau.",
+      recallPrompt: "Khi hai worker khác nhau sinh ID Snowflake trong đúng cùng một mili-giây, ID lớn hơn có chắc chắn phản ánh ai sinh ra sau trong thực tế không? Vì sao 'roughly time-sortable' không phải là sort tuyệt đối?",
     },
   ],
 };

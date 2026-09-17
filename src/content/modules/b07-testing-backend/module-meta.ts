@@ -166,6 +166,7 @@ export const b07TestingBackendModule: ModuleDefinition = {
       ],
       answerIndex: 2,
       explanation: "Payment gateway/email provider là dịch vụ ngoài, gọi thật sẽ tốn tiền/gửi email thật/không xác định (mạng, rate limit) — đúng định nghĩa 'genuinely outside your control'. DB, route, và hàm thuần đều là code/hạ tầng do chính hệ thống kiểm soát, nên test bằng bản thật (hoặc bản test riêng) chứ không mock.",
+      recallPrompt: "Theo nguyên tắc 'chỉ mock thứ genuinely ngoài tầm kiểm soát', vì sao một payment gateway hay email provider bên thứ ba là ứng viên hợp lý để mock, còn Postgres, route nội bộ và hàm thuần thì không?",
     },
     {
       id: "coverage-100-percent-meaningless",

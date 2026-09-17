@@ -101,6 +101,8 @@ export const sd19MockInterviewCapstoneModule: ModuleDefinition = {
       answerIndex: 1,
       explanation:
         "Đây đúng là lỗi \"vẽ ngay không hỏi\" của SD01: kiến trúc sư không phác thảo khi chưa biết nhà mấy người ở. 5–8 phút đầu luôn dành cho yêu cầu và ước lượng.",
+      recallPrompt:
+        "Trong phỏng vấn system design, nếu bạn lập tức vẽ service và database trong vài phút đầu mà chưa hỏi về quy mô, tính năng cốt lõi hay NFR, thì vấn đề lớn nhất ở đây là gì?",
     },
     {
       id: "time-running-out",

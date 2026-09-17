@@ -184,6 +184,7 @@ export const b16ObservabilityForBackendModule: ModuleDefinition = {
       ],
       answerIndex: 0,
       explanation: "Đây chính là vai trò riêng của distributed tracing: PHÂN RÃ thời gian của một request theo từng span/service (ai chậm, chậm bao lâu) — điều mà log (chỉ ghi lại sự kiện rời rạc) và metric (chỉ tổng hợp số liệu) đều không thể hiện rõ ràng ở mức từng request.",
+      recallPrompt: "Log đã có requestId xuyên process, metric đã có /metrics — vậy distributed tracing (ví dụ OpenTelemetry) trả lời được câu hỏi gì mà log và metric đều không trả lời tốt?",
     },
     {
       id: "bay-cardinality-khi-gan-label-route",

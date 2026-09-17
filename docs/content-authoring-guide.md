@@ -51,12 +51,54 @@ Export one `const <id>CamelCaseModule: ModuleDefinition` (e.g. `sd04CachingCdnMo
 | `eli5Summary` | 1–3 sentences, analogy, no jargon |
 | `objectives` | 4–6 "after this module you can…" bullets |
 | `lessons` | 3–6 items `{ slug, title, minutes, summary }` |
-| `labs` | 2–5 labs from curriculum, each ≥3 concrete steps (commands in backticks) |
+| `labs` | 2–5 labs from curriculum, each ≥3 concrete steps (commands in backticks). Optional `submission` — see §3a |
 | `deliverable`, `successCriteria` | from curriculum |
 | `resources` | 4–8 real, stable URLs (official docs first). `kind`: doc/book/course/tool/video/practice |
-| `quiz` | 8–12 questions, 3–4 options, `answerIndex` 0-based, explanation references the analogy. Vary the correct index position. Test understanding/scenarios, not trivia. |
+| `quiz` | 8–12 questions, 3–4 options, `answerIndex` 0-based, explanation references the analogy. Vary the correct index position. Test understanding/scenarios, not trivia. Explanations double as flashcard backs for the spaced-repetition review (`/review`) — keep them standalone-readable. If the question text can't be answered without seeing the options (e.g. "which of the following…"), add `recallPrompt`: a standalone rephrasing used as the flashcard front instead — validated by `pnpm validate:module` |
 
 Backticks in lab steps, quiz text and step-diagram descriptions render as inline code.
+
+## 3a. Lab submission (auto-graded labs) — pilot: M04 only
+
+**Status: pilot on `m04-docker-containers` only.** Every other module's labs stay self-ticked (no `submission` field) until the pilot is validated further — do not add `submission` to other modules without checking with the lead first.
+
+A lab's optional `submission: LabSubmissionSpec` (`src/content/content-types.ts`) turns its self-tick checkbox into a graded "nộp kết quả" form: the learner pastes real command output, the server grades it against author-written checks, and a full pass writes the same `progress_item` row the checkbox used to.
+
+```ts
+submission: {
+  inputKind: "output" | "url" | "value", // "output" → textarea; "url"/"value" → single-line input
+  prompt: "Vietnamese: the exact command to run and what to paste back",
+  checks: [
+    {
+      id: "kebab-case-stable-id",       // stored in submission history — never rename once published
+      label: "Vietnamese: what this check verifies (shown BEFORE submitting)",
+      hint: "Vietnamese: shown only on failure — nudge, never restate the matcher",
+      matcher: { kind: "contains", value: "…" }, // or regex / numberInRange / jsonHasKeys
+    },
+  ],
+},
+```
+
+**4 matchers only** (`src/lib/progress/lab-submission-grader.ts`), each total (never throws):
+
+| Matcher | Fields | Use when |
+|---|---|---|
+| `contains` | `value`, `caseSensitive?` | Substring must appear (whitespace-normalized, case-insensitive by default) |
+| `regex` | `pattern`, `flags?` (subset of `ims` only — no `g`) | A shape/pattern must appear anywhere in the paste |
+| `numberInRange` | `pattern` (**exactly 1** capture group), `min?`, `max?` | A captured number must fall in range — e.g. a CLI's own exit code or count |
+| `jsonHasKeys` | `keys` (dot-paths) | Paste must parse as JSON and contain every key |
+
+`checks: []` = evidence-only lab: any non-empty paste is stored and marks the lab done, with no grading.
+
+**Writing checks that survive contact with a real machine:**
+
+- **Match invariants, never machine-specific values.** No usernames, image ids, absolute paths, timestamps — a wrong-but-honest paste from a different machine must still pass. Prefer the tool's own summary/exit-code output over parsing full structured output (see next point).
+- **Prefer stable CLI contracts over fragile structured output.** `docker compose ps --format json` prints **one JSON object per line** (not one array) and each line's `Publishers` field embeds nested `{}` — this breaks naive `[^}]*`-scoped regex and defeats `jsonHasKeys` outright (multiple top-level JSON values isn't valid JSON). The M04 `compose-full-stack` check uses the **table form** (`docker compose ps`, no `--format json`) with a per-row `regex`. Likewise, `trivy-scan-fix`'s "Total: N (CRITICAL: N)" summary line is **absent** when a scan is fully clean — instead of parsing that line, the check asks for `trivy … --exit-code 1 --ignore-unfixed …; echo "EXIT_CODE=$?"` and grades the exit code, which Trivy documents as a stable contract.
+- **`hint` is public.** It ships to the browser (`PublicLabSubmissionSpec`) so the learner can see it on failure — never let it restate the matcher (e.g. never put the literal regex or expected string in a hint).
+- **Actually run the command before authoring the check.** Reconstructing "plausible" output from memory is the top failure mode — Trivy's clean-scan output shape, `docker compose ps --format json`'s per-line structure, and `id`'s exact field order all differ from what you'd guess.
+- Validate with `pnpm validate:module <slug>` — it compiles every `regex`/`numberInRange` pattern and checks flags, ids, and non-empty prompts/labels/hints for any lab with `submission`.
+
+**Security:** matchers (`regex`/`pattern`/`value`/`keys`) are stripped before a lab reaches the browser via `toPublicLabSubmissionSpec` (`src/content/curriculum-lookup.ts`) — the client component only ever receives `{ inputKind, prompt, checks: [{ id, label, hint }] }`. Never bypass this projection when wiring a lab into a page.
 
 ## 4. Lesson MDX template
 
@@ -147,7 +189,7 @@ pnpm typecheck 2>&1 | grep "modules/<id>-" # must print nothing
 pnpm exec eslint src/content/modules/<id>-slug
 ```
 
-`validate:module` enforces: 3–6 lessons, ≥2 labs (≥3 steps), 8–12 quiz questions with valid answers, every lesson has `<Eli5>`, `<Technical>`, `<KeyTerms>`, `<QuickCheck>` and imports an existing diagram.
+`validate:module` enforces: 3–6 lessons, ≥2 labs (≥3 steps), 8–12 quiz questions with valid answers, every lesson has `<Eli5>`, `<Technical>`, `<KeyTerms>`, `<QuickCheck>` and imports an existing diagram. For any lab with `submission` (§3a): non-empty prompt, kebab-case+unique check ids, non-empty labels, and every `regex`/`numberInRange` pattern compiles with allowed flags.
 
 ## 9. Checklist
 
@@ -155,6 +197,7 @@ pnpm exec eslint src/content/modules/<id>-slug
 - [ ] Every lesson: ELI5 → diagram → technical → hands-on → mistakes → key terms → quick check
 - [ ] Every diagram interactive (steps, toggles or clicks) and readable in light/dark
 - [ ] Commands are real and correct; outputs realistic
-- [ ] Quiz answers verified; correct option positions varied
+- [ ] (M04 pilot only) Every `submission` check verified by actually running the command — not reconstructed from memory; matchers key on invariants, never machine-specific values
+- [ ] Quiz answers verified; correct option positions varied; option-dependent questions have a `recallPrompt`
 - [ ] Validation, typecheck, eslint clean for owned folder
 - [ ] (Backend/System Design) Every shared-stack detail (service name, port, user/db, table/column name) copied verbatim from the curriculum doc's canonical spec, not improvised

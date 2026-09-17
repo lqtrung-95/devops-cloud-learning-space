@@ -152,6 +152,7 @@ export const m16SrePracticesModule: ModuleDefinition = {
       ],
       answerIndex: 2,
       explanation: "Toil: thủ công, lặp lại, tự động hoá được, không để lại giá trị lâu dài và tăng tuyến tính theo quy mô. Giải pháp: log rotation + retention tự động.",
+      recallPrompt: "Việc SSH vào từng server mỗi sáng để xoá log cũ bằng tay, số lần tăng theo số server, là ví dụ điển hình của khái niệm gì trong SRE, và vì sao?",
     },
     {
       id: "incident-commander-role",

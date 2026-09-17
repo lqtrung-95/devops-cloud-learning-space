@@ -39,6 +39,24 @@ export const m04DockerContainersModule: ModuleDefinition = {
         "Kiểm tra non-root: `docker run --rm api:multi id` phải không trả về `uid=0(root)`",
         "Chạy `hadolint Dockerfile` và sửa các cảnh báo",
       ],
+      submission: {
+        inputKind: "output",
+        prompt: "Dán output của 2 lệnh: `docker images api --format \"{{.Tag}} {{.Size}}\"` và `docker run --rm api:multi id`.",
+        checks: [
+          {
+            id: "non-root-user",
+            label: "Container api:multi không chạy bằng root",
+            hint: "Container vẫn chạy bằng root — thêm `USER node` (hoặc user không phải root) vào stage runtime rồi build lại `api:multi`.",
+            matcher: { kind: "regex", pattern: "uid=(?!0\\b)\\d+" },
+          },
+          {
+            id: "multi-tag-exists",
+            label: "Đã build tag api:multi",
+            hint: "Chưa thấy tag `multi` trong output `docker images api` — build lại với `docker build -t api:multi .`.",
+            matcher: { kind: "contains", value: "multi" },
+          },
+        ],
+      },
     },
     {
       id: "compose-full-stack",
@@ -52,6 +70,24 @@ export const m04DockerContainersModule: ModuleDefinition = {
         "Thử `docker compose down` rồi `up` lại: dữ liệu Postgres vẫn còn; `docker compose down -v` thì mất — ghi lại vì sao",
         "Clone repo sang thư mục khác (hoặc máy khác), chạy `docker compose up` và app hoạt động không cần cài gì thêm ngoài Docker",
       ],
+      submission: {
+        inputKind: "output",
+        prompt: "Chạy `docker compose ps` (dạng bảng, KHÔNG dùng `--format json`) sau khi mọi service đã lên, rồi dán nguyên output.",
+        checks: [
+          {
+            id: "db-healthy",
+            label: "Service db đang healthy",
+            hint: "Dòng `db` chưa có `(healthy)` — kiểm tra `healthcheck` dùng `pg_isready -U postgres` và đợi đủ `retries`.",
+            matcher: { kind: "regex", pattern: "^.*\\bdb\\b.*\\(healthy\\).*$", flags: "m" },
+          },
+          {
+            id: "redis-healthy",
+            label: "Service redis đang healthy",
+            hint: "Dòng `redis` chưa có `(healthy)` — thử lệnh `redis-cli ping` trong healthcheck.",
+            matcher: { kind: "regex", pattern: "^.*\\bredis\\b.*\\(healthy\\).*$", flags: "m" },
+          },
+        ],
+      },
     },
     {
       id: "trivy-scan-fix",
@@ -64,6 +100,25 @@ export const m04DockerContainersModule: ModuleDefinition = {
         "Chạy lại với `--exit-code 1 --ignore-unfixed --severity CRITICAL` cho tới khi lệnh trả về exit code 0",
         "Kiểm tra secret lọt vào image: `trivy image --scanners secret api:multi`",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          'Chạy `trivy image --severity CRITICAL --exit-code 1 --ignore-unfixed api:multi; echo "EXIT_CODE=$?"` rồi dán toàn bộ output, kể cả dòng `EXIT_CODE=` cuối cùng.',
+        checks: [
+          {
+            id: "zero-critical",
+            label: "Không còn lỗ hổng CRITICAL có bản vá",
+            hint: "EXIT_CODE khác 0 nghĩa là vẫn còn lỗ hổng CRITICAL có `Fixed Version` — nâng base image hoặc cập nhật package rồi build lại.",
+            matcher: { kind: "numberInRange", pattern: "EXIT_CODE=(\\d+)", max: 0 },
+          },
+          {
+            id: "scanned-right-image",
+            label: "Đã quét đúng image api:multi",
+            hint: "Output không phải của image `api:multi` — chạy lại đúng lệnh trỏ vào image này.",
+            matcher: { kind: "contains", value: "api:multi" },
+          },
+        ],
+      },
     },
     {
       id: "push-ghcr-git-sha",
@@ -76,6 +131,18 @@ export const m04DockerContainersModule: ModuleDefinition = {
         "Push: `docker push ghcr.io/<user>/api:sha-$GIT_SHA` và ghi lại digest `sha256:...` được in ra",
         "Xoá image local, pull lại bằng digest `docker pull ghcr.io/<user>/api@sha256:...` để chắc chắn đúng bản đã push",
       ],
+      submission: {
+        inputKind: "value",
+        prompt: "Dán digest `sha256:...` được in ra sau khi `docker push` (chỉ digest, ví dụ `sha256:` theo sau bởi 64 ký tự hex thường).",
+        checks: [
+          {
+            id: "valid-digest",
+            label: "Digest hợp lệ",
+            hint: "Digest phải có dạng `sha256:` theo sau đúng 64 ký tự hex thường (0-9, a-f), không có khoảng trắng hay ký tự khác.",
+            matcher: { kind: "regex", pattern: "^sha256:[0-9a-f]{64}$" },
+          },
+        ],
+      },
     },
   ],
   deliverable: "Repo app mẫu có Dockerfile multi-stage cho từng service, `.dockerignore`, `compose.yaml` chạy app 3-tier (frontend, API, Postgres + Redis) và README hướng dẫn chạy.",

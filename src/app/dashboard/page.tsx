@@ -3,6 +3,7 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { ActivityHeatmapGrid } from "@/components/progress/activity-heatmap-grid";
 import { CourseProgressSection } from "@/components/progress/course-progress-section";
+import { ReviewDueBanner } from "@/components/progress/review-due-banner";
 import { buttonClassName } from "@/components/ui/button-styles";
 import { getAllCourses, getCourseForModule, getModuleById, getModulesForCourse, getPhasesWithModules } from "@/content/curriculum-lookup";
 import { getCurrentSession } from "@/lib/auth/auth-server";
@@ -12,6 +13,7 @@ import { getActivityDates, getLatestCompletedItem, getRecentQuizAttempts } from 
 import { lessonItemKey, parseItemKey } from "@/lib/progress/progress-item-keys";
 import { QUIZ_PASS_PERCENT, toPercent } from "@/lib/progress/quiz-grader";
 import { getUserProgressSnapshot } from "@/lib/progress/user-progress-snapshot";
+import { getReviewQueueSnapshot } from "@/lib/review/review-queue-snapshot";
 
 export const metadata: Metadata = { title: "Tiến độ của tôi" };
 
@@ -30,6 +32,13 @@ export default async function DashboardPage() {
     getActivityDates(userId, since),
     getLatestCompletedItem(userId),
   ]);
+
+  // Derived from the already-loaded snapshot (bestQuizPercent !== null exactly when a quiz was
+  // attempted — module-progress-calculator.ts) so this never re-runs `getBestQuizPercentByModule`.
+  const eligibleModuleIds = new Set(
+    [...snapshot.moduleProgressById].filter(([, progress]) => progress.bestQuizPercent !== null).map(([moduleId]) => moduleId),
+  );
+  const reviewQueue = await getReviewQueueSnapshot(userId, { eligibleModuleIds });
 
   const courses = getAllCourses();
   const courseSummaries = [...snapshot.courseProgressById.values()];
@@ -57,6 +66,11 @@ export default async function DashboardPage() {
     { label: "Bài học đã xong", value: `${total((summary) => summary.lessonsDone)}/${total((summary) => summary.lessonsTotal)}`, emoji: "📖" },
     { label: "Lab đã xong", value: `${total((summary) => summary.labsDone)}/${total((summary) => summary.labsTotal)}`, emoji: "🧪" },
     { label: `Ngày học (${HEATMAP_WEEKS} tuần)`, value: String(activeDays), emoji: "🔥" },
+    {
+      label: reviewQueue.newCount > 0 ? `Thẻ đến hạn (+${reviewQueue.newCount} mới)` : "Thẻ đến hạn",
+      value: String(reviewQueue.dueCount),
+      emoji: "🔁",
+    },
   ];
 
   return (
@@ -64,7 +78,7 @@ export default async function DashboardPage() {
       <h1 className="text-3xl font-extrabold tracking-tight">Chào {session.user.name || "bạn"} 👋</h1>
       <p className="mt-1 text-stone-600 dark:text-stone-400">Mỗi ngày một chút — kiên trì là chìa khoá.</p>
 
-      <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
         {stats.map((stat) => (
           <div key={stat.label} className="rounded-2xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
             <p className="text-2xl" aria-hidden>
@@ -75,6 +89,12 @@ export default async function DashboardPage() {
           </div>
         ))}
       </div>
+
+      {reviewQueue.dueCount > 0 && (
+        <div className="mt-6">
+          <ReviewDueBanner dueCount={reviewQueue.dueCount} newCount={reviewQueue.newCount} />
+        </div>
+      )}
 
       {nextModule && continueHref && (
         <div className="mt-6 flex flex-wrap items-center justify-between gap-4 rounded-2xl bg-gradient-to-r from-indigo-600 to-violet-600 p-6 text-white">

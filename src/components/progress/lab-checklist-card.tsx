@@ -2,24 +2,40 @@
 
 import { useState } from "react";
 import { InlineCodeText } from "@/components/ui/inline-code-text";
-import type { LabDefinition } from "@/content/content-types";
+import type { PublicLabDefinition } from "@/content/content-types";
+import { LabSubmissionPanel, type RecentLabSubmission } from "./lab-submission-panel";
 import { ProgressItemCheckbox } from "./progress-item-checkbox";
 
 interface LabChecklistCardProps {
-  lab: LabDefinition;
+  lab: PublicLabDefinition;
+  moduleSlug: string;
   index: number;
   itemKey: string;
   completed: boolean;
   isSignedIn: boolean;
+  recentSubmissions: RecentLabSubmission[];
 }
 
-export function LabChecklistCard({ lab, index, itemKey, completed, isSignedIn }: LabChecklistCardProps) {
+export function LabChecklistCard({ lab, moduleSlug, index, itemKey, completed, isSignedIn, recentSubmissions }: LabChecklistCardProps) {
   const [isExpanded, setIsExpanded] = useState(false);
+  // Auto-graded labs (≥1 check) can only be completed by submitting — no self-tick checkbox for those.
+  const isAutoGraded = Boolean(lab.submission && lab.submission.checks.length > 0);
 
   return (
     <div className="rounded-2xl border border-stone-200 bg-white dark:border-stone-800 dark:bg-stone-900">
       <div className="flex items-start gap-3 p-4">
-        <ProgressItemCheckbox itemKey={itemKey} completed={completed} isSignedIn={isSignedIn} label={`Hoàn thành lab ${lab.title}`} />
+        {isAutoGraded ? (
+          <span
+            aria-hidden
+            className={`mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full border-2 text-xs font-bold ${
+              completed ? "border-emerald-500 bg-emerald-500 text-white" : "border-stone-300 bg-white dark:border-stone-600 dark:bg-stone-900"
+            }`}
+          >
+            {completed && "✓"}
+          </span>
+        ) : (
+          <ProgressItemCheckbox itemKey={itemKey} completed={completed} isSignedIn={isSignedIn} label={`Hoàn thành lab ${lab.title}`} />
+        )}
         <div className="min-w-0 flex-1">
           <button type="button" onClick={() => setIsExpanded(!isExpanded)} aria-expanded={isExpanded} className="w-full text-left">
             <p className="font-semibold">
@@ -38,6 +54,16 @@ export function LabChecklistCard({ lab, index, itemKey, completed, isSignedIn }:
                 </li>
               ))}
             </ol>
+          )}
+          {lab.submission && (
+            <LabSubmissionPanel
+              moduleSlug={moduleSlug}
+              labId={lab.id}
+              spec={lab.submission}
+              isSignedIn={isSignedIn}
+              completed={completed}
+              recentSubmissions={recentSubmissions}
+            />
           )}
         </div>
       </div>
