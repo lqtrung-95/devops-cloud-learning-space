@@ -39,6 +39,12 @@ export const m01LinuxShellModule: ModuleDefinition = {
         "Bật firewall: `sudo ufw allow OpenSSH && sudo ufw enable`",
         "Kiểm tra: mở terminal mới, SSH vào bằng key thành công; thử `ssh root@...` phải bị từ chối",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          "Dán output của 2 lệnh làm bằng chứng đã hoàn thành (lab này tự chứng nhận, không auto-chấm): `sudo sshd -T | grep -E '^(passwordauthentication|permitrootlogin)'` rồi `sudo ufw status | head -3`.",
+        checks: [],
+      },
     },
     {
       id: "backup-script",
@@ -53,6 +59,37 @@ export const m01LinuxShellModule: ModuleDefinition = {
         "Kích hoạt timer, kiểm tra bằng `systemctl list-timers` và `journalctl -u backup`",
         "Chạy ShellCheck trên script, sửa hết cảnh báo",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          'Ở thư mục chứa `backup.sh`, chạy và dán nguyên output: `echo "TIMER_ENABLED=$(systemctl is-enabled backup.timer)"; echo "TIMER_ACTIVE=$(systemctl is-active backup.timer)"; shellcheck backup.sh; echo "SHELLCHECK_EXIT=$?"; ls -1 <thư mục backup> | tail -3`.',
+        checks: [
+          {
+            id: "timer-enabled",
+            label: "backup.timer đã enabled",
+            hint: "Chưa thấy `TIMER_ENABLED=enabled` — chạy `sudo systemctl enable backup.timer`.",
+            matcher: { kind: "contains", value: "TIMER_ENABLED=enabled" },
+          },
+          {
+            id: "timer-active",
+            label: "backup.timer đang active",
+            hint: "Chưa thấy `TIMER_ACTIVE=active` — chạy `sudo systemctl start backup.timer` rồi kiểm tra lại.",
+            matcher: { kind: "contains", value: "TIMER_ACTIVE=active" },
+          },
+          {
+            id: "shellcheck-clean",
+            label: "ShellCheck không còn cảnh báo",
+            hint: "SHELLCHECK_EXIT khác 0 nghĩa là còn cảnh báo — sửa hết rồi chạy lại `shellcheck backup.sh`.",
+            matcher: { kind: "numberInRange", pattern: "SHELLCHECK_EXIT=\\s*(\\d+)", max: 0 },
+          },
+          {
+            id: "dated-archive-exists",
+            label: "Có file backup đặt tên theo ngày",
+            hint: "Chưa thấy file dạng `backup-YYYY-MM-DD....tar.gz` trong thư mục đích — kiểm tra lệnh `tar -czf` dùng `$(date +%F)` trong tên file.",
+            matcher: { kind: "regex", pattern: "\\d{4}-\\d{2}-\\d{2}[^\\s]*\\.tar\\.gz" },
+          },
+        ],
+      },
     },
     {
       id: "healthcheck-script",
@@ -62,10 +99,35 @@ export const m01LinuxShellModule: ModuleDefinition = {
         "Lấy % disk đã dùng của `/` bằng `df` + `awk`",
         "Lấy % RAM đã dùng bằng `free` + `awk`",
         "Lấy load average từ `/proc/loadavg` và so với số CPU (`nproc`)",
-        "Cho phép chỉnh ngưỡng qua biến môi trường (ví dụ `DISK_THRESHOLD=80`)",
+        "Cho phép chỉnh ngưỡng qua 3 biến môi trường bắt buộc: `DISK_THRESHOLD`, `RAM_THRESHOLD`, `LOAD_THRESHOLD` (ví dụ `DISK_THRESHOLD=80`) — đặt cả 3 biến khi chạy thử, thiếu một biến có thể khiến kết quả không ổn định",
         "In cảnh báo và thoát với exit code khác 0 khi vượt ngưỡng",
         "Thử làm đầy disk bằng `fallocate -l 1G /tmp/bigfile` để kiểm chứng cảnh báo",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          'Chạy script 2 lần với ngưỡng ép buộc, rồi ShellCheck, dán nguyên toàn bộ output: `DISK_THRESHOLD=0 RAM_THRESHOLD=0 LOAD_THRESHOLD=0 ./healthcheck.sh; echo "OVER_EXIT=$?"` — `DISK_THRESHOLD=100 RAM_THRESHOLD=100 LOAD_THRESHOLD=100 ./healthcheck.sh; echo "UNDER_EXIT=$?"` — `shellcheck healthcheck.sh; echo "SHELLCHECK_EXIT=$?"`.',
+        checks: [
+          {
+            id: "alerts-when-over-threshold",
+            label: "Cảnh báo và thoát khác 0 khi vượt ngưỡng",
+            hint: "OVER_EXIT phải khác 0 khi ép ngưỡng về 0 — kiểm tra script có `exit 1` (hoặc khác 0) khi vượt ngưỡng disk/RAM/load.",
+            matcher: { kind: "numberInRange", pattern: "OVER_EXIT=\\s*(\\d+)", min: 1 },
+          },
+          {
+            id: "silent-when-under-threshold",
+            label: "Thoát 0 khi trong ngưỡng an toàn",
+            hint: "UNDER_EXIT phải bằng 0 khi ngưỡng ép lên 100 — script có thể đang exit khác 0 dù không vượt ngưỡng nào.",
+            matcher: { kind: "numberInRange", pattern: "UNDER_EXIT=\\s*(\\d+)", max: 0 },
+          },
+          {
+            id: "shellcheck-clean",
+            label: "ShellCheck không còn cảnh báo",
+            hint: "SHELLCHECK_EXIT khác 0 nghĩa là còn cảnh báo — sửa hết rồi chạy lại `shellcheck healthcheck.sh`.",
+            matcher: { kind: "numberInRange", pattern: "SHELLCHECK_EXIT=\\s*(\\d+)", max: 0 },
+          },
+        ],
+      },
     },
     {
       id: "systemd-app-service",
@@ -79,6 +141,12 @@ export const m01LinuxShellModule: ModuleDefinition = {
         "Giết tiến trình bằng `kill -9 <PID>` và quan sát systemd tự khởi động lại",
         "Reboot VM và xác nhận app tự chạy lại",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          "Sau khi `kill -9` tiến trình và quan sát systemd tự khởi động lại, dán output làm bằng chứng đã hoàn thành (lab này tự chứng nhận, không auto-chấm): `systemctl show my-app --no-pager --property=ActiveState,UnitFileState,User,NRestarts`.",
+        checks: [],
+      },
     },
   ],
   deliverable: "Một repo Git chứa backup.sh, healthcheck.sh, file .service/.timer và README hướng dẫn cài đặt trên VM mới.",

@@ -38,6 +38,25 @@ export const m02NetworkingModule: ModuleDefinition = {
         "Phương án 2: public `/24` nhỏ, private `/20` lớn và chừa dải trống — kiểm tra không chồng lấn bằng `ipaddress.ip_network(...).overlaps(...)`",
         "Ghi quyết định (vì sao chọn kích thước này, AZ nào dùng subnet nào) vào `docs/network-plan.md` trong repo",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          "Chạy `python3 -c \"import ipaddress; print(list(ipaddress.ip_network('10.0.0.0/16').subnets(new_prefix=<prefix bạn tính được>)))\"` và dán nguyên output.",
+        checks: [
+          {
+            id: "correct-new-prefix",
+            label: "Prefix mới đúng cho 8 subnet bằng nhau",
+            hint: "8 subnet bằng nhau từ /16 cần mượn 3 bit — tính lại prefix rồi chạy lại lệnh.",
+            matcher: { kind: "contains", value: "10.0.32.0/19" },
+          },
+          {
+            id: "eight-equal-subnets",
+            label: "Đủ 8 block, block cuối đúng",
+            hint: "Danh sách chưa đủ 8 block — block cuối cùng chưa đúng.",
+            matcher: { kind: "contains", value: "10.0.224.0/19" },
+          },
+        ],
+      },
     },
     {
       id: "nginx-reverse-proxy-lb",
@@ -51,6 +70,37 @@ export const m02NetworkingModule: ModuleDefinition = {
         "Tắt một backend, gọi lại và đọc `/var/log/nginx/error.log` để thấy Nginx bỏ qua backend hỏng",
         "Xác nhận backend chỉ listen `127.0.0.1` bằng `ss -tlnp` (không lộ ra ngoài)",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          'Chạy 3 lệnh sau và dán toàn bộ output: `sudo nginx -t 2>&1` — `ss -tlnp | grep -E \':(3001|3002)\'` — `curl -s -o /dev/null -w "PROXY_HTTP=%{http_code}\\n" http://127.0.0.1/api/`.',
+        checks: [
+          {
+            id: "nginx-config-valid",
+            label: "Cấu hình Nginx hợp lệ",
+            hint: "Output `nginx -t` chưa báo thành công — kiểm tra cú pháp block `upstream`/`location` rồi chạy lại (nhớ `2>&1`, nginx ghi kết quả ra stderr).",
+            matcher: { kind: "contains", value: "test is successful" },
+          },
+          {
+            id: "backend-3001-loopback-only",
+            label: "Backend 3001 chỉ listen 127.0.0.1",
+            hint: "Chưa thấy `127.0.0.1:3001` trong output `ss -tlnp` — backend có thể đang listen `0.0.0.0` hoặc chưa chạy.",
+            matcher: { kind: "contains", value: "127.0.0.1:3001" },
+          },
+          {
+            id: "backend-3002-loopback-only",
+            label: "Backend 3002 chỉ listen 127.0.0.1",
+            hint: "Chưa thấy `127.0.0.1:3002` trong output `ss -tlnp` — backend có thể đang listen `0.0.0.0` hoặc chưa chạy.",
+            matcher: { kind: "contains", value: "127.0.0.1:3002" },
+          },
+          {
+            id: "proxy-returns-2xx",
+            label: "Gọi qua Nginx trả 2xx",
+            hint: "PROXY_HTTP không nằm trong khoảng 200-299 — kiểm tra `proxy_pass` trỏ đúng `upstream` và backend đang chạy.",
+            matcher: { kind: "numberInRange", pattern: "PROXY_HTTP=\\s*(\\d+)", min: 200, max: 299 },
+          },
+        ],
+      },
     },
     {
       id: "https-letsencrypt",
@@ -63,18 +113,62 @@ export const m02NetworkingModule: ModuleDefinition = {
         "Kiểm tra: `curl -I http://app.<domain>` trả `301`, `curl -v https://app.<domain>` báo `SSL certificate verify ok`",
         "Xác nhận tự gia hạn: `systemctl list-timers | grep certbot` và `sudo certbot renew --dry-run`",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          "Thay `<domain>` bằng domain của bạn, chạy cả 2 lệnh và dán cả 2 output: `curl -sI http://<domain> | head -1` — `echo | openssl s_client -connect <domain>:443 2>/dev/null | openssl x509 -noout -issuer`.",
+        checks: [
+          {
+            id: "http-redirects-to-https",
+            label: "HTTP tự chuyển sang HTTPS (301/308)",
+            hint: "Dòng status chưa phải `301`/`308` — kiểm tra certbot đã chọn redirect HTTP → HTTPS chưa (`sudo certbot --nginx -d <domain>` rồi chọn redirect).",
+            matcher: { kind: "regex", pattern: "HTTP/[\\d.]+ 30[18]" },
+          },
+          {
+            id: "letsencrypt-issued-cert",
+            label: "Certificate do Let's Encrypt cấp",
+            hint: "Issuer không chứa `Let's Encrypt` — nếu domain đi qua CDN (Cloudflare…), cert có thể do CDN cấp thay vì Let's Encrypt trực tiếp.",
+            matcher: { kind: "contains", value: "Let's Encrypt" },
+          },
+        ],
+      },
     },
     {
       id: "tcpdump-http-capture",
       title: "Bắt gói tin một request HTTP",
       description: "Dùng tcpdump quan sát handshake, dữ liệu và đóng kết nối của một request thật.",
       steps: [
-        "Mở terminal 1 trên server: `sudo tcpdump -i any -nn -A 'tcp port 80'`",
+        "Mở terminal 1 trên server: `sudo tcpdump -i any -nn 'tcp port 80'` (KHÔNG dùng `-A` khi nộp bài — `-A` in cả nội dung gói tin, có thể lộ cookie/header nhạy cảm; chỉ dùng `-A` để tự khám phá thêm ở máy riêng, không dùng cho phần nộp bài)",
         "Terminal 2: `curl http://127.0.0.1/` (hoặc gọi từ máy khác qua IP)",
         "Đánh dấu trong output các gói SYN `[S]`, SYN-ACK `[S.]`, ACK `[.]`, dữ liệu `[P.]`, FIN `[F.]`",
         "Lưu capture ra file bằng `-w http.pcap` và mở bằng Wireshark để xem từng tầng header",
         "Viết giải thích từng bước từ DNS lookup tới response cho lệnh `curl https://example.com` (tiêu chí đạt của module)",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          "Terminal 1: `sudo tcpdump -i any -nn 'tcp port 80'` (không thêm `-A`). Terminal 2: `curl http://127.0.0.1/`. Đợi ~2 giây, `Ctrl-C` terminal 1, dán nguyên output.",
+        checks: [
+          {
+            id: "syn-observed",
+            label: "Thấy gói SYN mở kết nối",
+            hint: "Chưa thấy `Flags [S]` — capture có thể đã bắt đầu sau khi request đã gửi, chạy lại tcpdump trước rồi mới curl.",
+            matcher: { kind: "contains", value: "Flags [S]" },
+          },
+          {
+            id: "syn-ack-observed",
+            label: "Thấy gói SYN-ACK phản hồi",
+            hint: "Chưa thấy `Flags [S.]` — kiểm tra server có đang lắng nghe port 80 không.",
+            matcher: { kind: "contains", value: "Flags [S.]" },
+          },
+          {
+            id: "connection-closed",
+            label: "Thấy gói đóng kết nối (FIN)",
+            hint: "Chưa thấy `Flags [F` — đợi thêm chút trước khi Ctrl-C để capture trọn cả lúc đóng kết nối.",
+            matcher: { kind: "regex", pattern: "Flags \\[F" },
+          },
+        ],
+      },
     },
   ],
   deliverable: "VM chạy Nginx reverse proxy cân bằng tải cho 2 backend, có domain + HTTPS (redirect HTTP → HTTPS), kèm bảng subnet và ghi chú tcpdump trong repo.",

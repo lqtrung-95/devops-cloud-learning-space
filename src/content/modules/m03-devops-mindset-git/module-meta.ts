@@ -38,6 +38,31 @@ export const m03DevopsMindsetGitModule: ModuleDefinition = {
         "Chạy Postgres + Redis local bằng `docker run` (hoặc compose) và unit test chạy được bằng 1 lệnh, vd `npm test` / `pytest` / `go test ./...`",
         "README ghi rõ: yêu cầu, cách chạy local, biến môi trường, cách chạy test",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          'Trong repo `sample-app`, với app đang chạy local, chạy và dán (KHÔNG dán nội dung `.env`): `echo "ENV_TRACKED=$(git ls-files .env | wc -l)"` — `echo "ENV_EXAMPLE=$(git ls-files .env.example | wc -l)"` — `curl -s -o /dev/null -w "HEALTHZ=%{http_code}\\n" http://localhost:$PORT/healthz`.',
+        checks: [
+          {
+            id: "env-not-committed",
+            label: ".env không bị commit vào git",
+            hint: "`.env` đang bị git theo dõi — `git rm --cached .env` và thêm vào `.gitignore`.",
+            matcher: { kind: "numberInRange", pattern: "ENV_TRACKED=\\s*(\\d+)", max: 0 },
+          },
+          {
+            id: "env-example-committed",
+            label: ".env.example đã được commit",
+            hint: "Chưa commit `.env.example` — người khác không biết app cần biến nào.",
+            matcher: { kind: "numberInRange", pattern: "ENV_EXAMPLE=\\s*(\\d+)", min: 1 },
+          },
+          {
+            id: "healthz-returns-200",
+            label: "/healthz trả 200",
+            hint: "`/healthz` chưa trả 200 — app chưa chạy, hoặc DB/Redis chưa kết nối được, hoặc `$PORT` sai.",
+            matcher: { kind: "numberInRange", pattern: "HEALTHZ=\\s*(\\d+)", min: 200, max: 200 },
+          },
+        ],
+      },
     },
     {
       id: "pre-commit-conventional-commits",
@@ -50,6 +75,31 @@ export const m03DevopsMindsetGitModule: ModuleDefinition = {
         "Thử commit message sai chuẩn và một file chứa chuỗi giống AWS access key giả để thấy hook chặn",
         "Ghi quy ước commit (`feat`, `fix`, `docs`, `chore`, `!` cho breaking change) vào `CONTRIBUTING.md`",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          'Xoá file chứa key giả ở bước 4 (KHÔNG dán kết quả quét gitleaks — nó chứa chuỗi bị phát hiện), rồi chạy và dán: `pre-commit run --all-files; echo "PRECOMMIT_EXIT=$?"` — `echo "GITLEAKS_CONFIGURED=$(grep -c gitleaks .pre-commit-config.yaml)"` — `git commit --allow-empty -m "sai chuan commit"; echo "BAD_COMMIT_EXIT=$?"` (nếu commit cuối này lỡ thành công, hoàn tác bằng `git reset --hard HEAD~1`).',
+        checks: [
+          {
+            id: "hooks-pass-on-clean-repo",
+            label: "Mọi hook pass trên repo sạch",
+            hint: "Còn hook fail — chạy `pre-commit run --all-files` và sửa hết trước khi nộp.",
+            matcher: { kind: "numberInRange", pattern: "PRECOMMIT_EXIT=\\s*(\\d+)", max: 0 },
+          },
+          {
+            id: "gitleaks-hook-configured",
+            label: "Hook quét secret (gitleaks) đã khai báo",
+            hint: "`.pre-commit-config.yaml` chưa khai báo hook quét secret.",
+            matcher: { kind: "numberInRange", pattern: "GITLEAKS_CONFIGURED=\\s*(\\d+)", min: 1 },
+          },
+          {
+            id: "bad-commit-message-blocked",
+            label: "Commit message sai chuẩn bị chặn",
+            hint: "Commit sai chuẩn vẫn tạo được — thiếu `pre-commit install --hook-type commit-msg` hoặc thiếu hook `conventional-pre-commit`.",
+            matcher: { kind: "numberInRange", pattern: "BAD_COMMIT_EXIT=\\s*(\\d+)", min: 1 },
+          },
+        ],
+      },
     },
     {
       id: "branch-protection-pr-flow",
@@ -58,11 +108,36 @@ export const m03DevopsMindsetGitModule: ModuleDefinition = {
       steps: [
         "Thêm workflow CI tối thiểu `.github/workflows/ci.yml` chạy lint + test trên `pull_request` (job tên `test`)",
         "Thêm `.github/CODEOWNERS` và `.github/pull_request_template.md`",
-        "Bật branch protection hoặc ruleset cho `main`: bắt buộc PR, ≥1 approval, review từ Code Owners, status check `test`, chặn force push, áp dụng cho cả admin",
+        "Bật bảo vệ nhánh `main` bằng **Ruleset** (Settings → Rules → Rulesets, KHÔNG dùng branch protection kiểu cũ): rule `pull_request` (≥1 approval, review từ Code Owners) + rule `required_status_checks` với context `test`, áp dụng cho cả admin",
         "Thử `git push origin main` trực tiếp và xác nhận bị từ chối",
         "Mở một PR cố tình làm test fail (`gh pr create --fill`), thấy nút merge bị khoá; sửa, push lại, merge bằng `gh pr merge --squash --delete-branch`",
         "Tạo tag release đầu tiên `v0.1.0` (hoặc cấu hình release-please) và ghi changelog",
       ],
+      submission: {
+        inputKind: "output",
+        prompt:
+          'Trên `main` local, thử push thẳng rồi đọc rule của nhánh; dán cả hai. **Xoá token nhúng trong remote URL trước khi dán, nếu có.** `git push origin main 2>&1 | tail -20` — `gh api repos/<user>/<repo>/rules/branches/main --jq \'[.[].type]\'`.',
+        checks: [
+          {
+            id: "direct-push-rejected",
+            label: "Push thẳng vào main bị từ chối",
+            hint: "Chưa thấy thông báo bị chặn — kiểm tra ruleset đã `enforcement: active` và áp dụng cho nhánh `main` chưa.",
+            matcher: { kind: "regex", pattern: "(GH006|GH013|protected branch|must be made through a pull request)", flags: "i" },
+          },
+          {
+            id: "pull-request-required",
+            label: "Rule yêu cầu Pull Request đã bật",
+            hint: "Danh sách rule chưa có `pull_request` — thêm rule Pull Request vào Ruleset của nhánh `main`.",
+            matcher: { kind: "contains", value: "pull_request" },
+          },
+          {
+            id: "status-check-required",
+            label: "Rule yêu cầu status check đã bật",
+            hint: "Danh sách rule chưa có `required_status_checks` — thêm rule Require status checks (context `test`) vào Ruleset.",
+            matcher: { kind: "contains", value: "required_status_checks" },
+          },
+        ],
+      },
     },
     {
       id: "slo-dora-baseline",
@@ -74,6 +149,12 @@ export const m03DevopsMindsetGitModule: ModuleDefinition = {
         "Ghi cách đo 4 DORA metrics cho repo (tag release, `gh pr list --state merged --json createdAt,mergedAt`, số lần revert)",
         "Ghi số liệu baseline hiện tại (dù còn thô) để so sánh sau khi có CI/CD",
       ],
+      submission: {
+        inputKind: "url",
+        prompt:
+          "Dán link tới `docs/slo.md` trong repo `sample-app` (vd `https://github.com/<user>/sample-app/blob/main/docs/slo.md`). Lab này không auto-chấm: hệ thống lưu lại bằng chứng và bạn tự xác nhận đã viết đủ SLI, SLO, error budget policy và cách đo 4 DORA metrics.",
+        checks: [],
+      },
     },
   ],
   deliverable: "Repo `sample-app` (frontend + API + PostgreSQL + Redis) cấu hình qua env, có `/healthz`, unit test chạy bằng 1 lệnh, README, `.editorconfig`, pre-commit hooks, CODEOWNERS và branch protection trên `main`.",

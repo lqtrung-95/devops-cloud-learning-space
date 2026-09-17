@@ -58,9 +58,11 @@ Export one `const <id>CamelCaseModule: ModuleDefinition` (e.g. `sd04CachingCdnMo
 
 Backticks in lab steps, quiz text and step-diagram descriptions render as inline code.
 
-## 3a. Lab submission (auto-graded labs) — pilot: M04 only
+## 3a. Lab submission (auto-graded & evidence-only labs)
 
-**Status: pilot on `m04-docker-containers` only.** Every other module's labs stay self-ticked (no `submission` field) until the pilot is validated further — do not add `submission` to other modules without checking with the lead first.
+**Status: live on M01–M04 of the DevOps course.** Every other module's labs stay self-ticked (no `submission` field) until further validated — do not add `submission` to other modules without checking with the lead first.
+
+`checks: []` = evidence-only lab: it hides the legacy self-tick checkbox (same as a graded lab) but any non-empty paste is stored and marks the lab done, with no grading.
 
 A lab's optional `submission: LabSubmissionSpec` (`src/content/content-types.ts`) turns its self-tick checkbox into a graded "nộp kết quả" form: the learner pastes real command output, the server grades it against author-written checks, and a full pass writes the same `progress_item` row the checkbox used to.
 
@@ -88,12 +90,13 @@ submission: {
 | `numberInRange` | `pattern` (**exactly 1** capture group), `min?`, `max?` | A captured number must fall in range — e.g. a CLI's own exit code or count |
 | `jsonHasKeys` | `keys` (dot-paths) | Paste must parse as JSON and contain every key |
 
-`checks: []` = evidence-only lab: any non-empty paste is stored and marks the lab done, with no grading.
-
 **Writing checks that survive contact with a real machine:**
 
 - **Match invariants, never machine-specific values.** No usernames, image ids, absolute paths, timestamps — a wrong-but-honest paste from a different machine must still pass. Prefer the tool's own summary/exit-code output over parsing full structured output (see next point).
 - **Prefer stable CLI contracts over fragile structured output.** `docker compose ps --format json` prints **one JSON object per line** (not one array) and each line's `Publishers` field embeds nested `{}` — this breaks naive `[^}]*`-scoped regex and defeats `jsonHasKeys` outright (multiple top-level JSON values isn't valid JSON). The M04 `compose-full-stack` check uses the **table form** (`docker compose ps`, no `--format json`) with a per-row `regex`. Likewise, `trivy-scan-fix`'s "Total: N (CRITICAL: N)" summary line is **absent** when a scan is fully clean — instead of parsing that line, the check asks for `trivy … --exit-code 1 --ignore-unfixed …; echo "EXIT_CODE=$?"` and grades the exit code, which Trivy documents as a stable contract.
+- **Prefer a labelled, machine-readable echo over parsing a tool's human table.** Make the shell print `echo "TIMER_ACTIVE=$(systemctl is-active backup.timer)"` or `cmd; echo "EXIT_CODE=$?"` rather than grading column-formatted output (`systemctl list-timers`, `docker ps`) — the latter is terminal-width dependent and truncates; a labelled token is not.
+- **`numberInRange` over a `$(… | wc -l)` value must tolerate padding.** BSD/macOS `wc -l` emits leading spaces (`LABEL=       0`) — write the pattern `LABEL=\s*(\d+)`, never `LABEL=(\d+)`.
+- **Avoid `$` anchors in `regex` matchers.** A paste from a Windows terminal carries `\r` before `\n`, so `\S+$` silently fails. Use a leading `^…` with the `m` flag plus a negative lookahead (`^User=(?!root\b)\S`) instead of a trailing anchor.
 - **`hint` is public.** It ships to the browser (`PublicLabSubmissionSpec`) so the learner can see it on failure — never let it restate the matcher (e.g. never put the literal regex or expected string in a hint).
 - **Actually run the command before authoring the check.** Reconstructing "plausible" output from memory is the top failure mode — Trivy's clean-scan output shape, `docker compose ps --format json`'s per-line structure, and `id`'s exact field order all differ from what you'd guess.
 - Validate with `pnpm validate:module <slug>` — it compiles every `regex`/`numberInRange` pattern and checks flags, ids, and non-empty prompts/labels/hints for any lab with `submission`.
@@ -197,7 +200,7 @@ pnpm exec eslint src/content/modules/<id>-slug
 - [ ] Every lesson: ELI5 → diagram → technical → hands-on → mistakes → key terms → quick check
 - [ ] Every diagram interactive (steps, toggles or clicks) and readable in light/dark
 - [ ] Commands are real and correct; outputs realistic
-- [ ] (M04 pilot only) Every `submission` check verified by actually running the command — not reconstructed from memory; matchers key on invariants, never machine-specific values
+- [ ] (M01–M04) Every `submission` check verified by actually running the command — not reconstructed from memory; matchers key on invariants, never machine-specific values
 - [ ] Quiz answers verified; correct option positions varied; option-dependent questions have a `recallPrompt`
 - [ ] Validation, typecheck, eslint clean for owned folder
 - [ ] (Backend/System Design) Every shared-stack detail (service name, port, user/db, table/column name) copied verbatim from the curriculum doc's canonical spec, not improvised

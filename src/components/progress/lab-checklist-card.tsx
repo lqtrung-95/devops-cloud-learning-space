@@ -18,13 +18,14 @@ interface LabChecklistCardProps {
 
 export function LabChecklistCard({ lab, moduleSlug, index, itemKey, completed, isSignedIn, recentSubmissions }: LabChecklistCardProps) {
   const [isExpanded, setIsExpanded] = useState(false);
-  // Auto-graded labs (≥1 check) can only be completed by submitting — no self-tick checkbox for those.
-  const isAutoGraded = Boolean(lab.submission && lab.submission.checks.length > 0);
+  // Labs with a submission form are completed by submitting (graded) or by attesting
+  // (evidence-only, checks: []) — never by the legacy self-tick checkbox.
+  const hasSubmission = Boolean(lab.submission);
 
   return (
     <div className="rounded-2xl border border-stone-200 bg-white dark:border-stone-800 dark:bg-stone-900">
       <div className="flex items-start gap-3 p-4">
-        {isAutoGraded ? (
+        {hasSubmission ? (
           <span
             aria-hidden
             className={`mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full border-2 text-xs font-bold ${
