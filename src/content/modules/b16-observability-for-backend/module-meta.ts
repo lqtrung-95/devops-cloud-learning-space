@@ -1,0 +1,213 @@
+import type { ModuleDefinition } from "@/content/content-types";
+
+export const b16ObservabilityForBackendModule: ModuleDefinition = {
+  id: "b16",
+  slug: "b16-observability-for-backend",
+  phaseId: "b-phase-3",
+  order: 16,
+  weeks: "Tuần 20",
+  title: "Observability cho backend",
+  emoji: "🔭",
+  eli5Summary:
+    "Từ B13/B14, một yêu cầu có thể chạy qua 2 tiến trình khác nhau (`api`/`worker` và `notification-service`) trước khi xong việc. Khi một trong hai chỗ đó lỗi, bạn cần một 'mã vận đơn' duy nhất đi theo suốt hành trình — để dù gói hàng qua bao nhiêu trạm trung chuyển, chỉ cần đọc đúng mã đó ở bất kỳ trạm nào cũng biết chính xác nó từng ở đâu, làm gì, và hỏng ở bước nào.",
+  objectives: [
+    "Giải thích vì sao structured (JSON) log hữu ích hơn free-text log khi cần grep/gộp log qua nhiều tiến trình, thay vì đọc bằng mắt trên 1 máy",
+    "Sinh `requestId` ở `onRequest` hook và gắn nó vào MỌI dòng log của đúng request đó bằng pino child logger — không cần truyền tay vào từng lời gọi log",
+    "Truyền `requestId` qua ranh giới process bằng gRPC metadata, và làm cho `notification-service` log lại đúng giá trị đó",
+    "Expose endpoint `/metrics` chuẩn Prometheus bằng `prom-client` với request count và latency histogram, tránh bẫy cardinality khi gắn label",
+    "Phân biệt rạch ròi vai trò của log (chuyện gì xảy ra ở 1 request), metric (hệ thống có ổn không, nhìn tổng thể) và distributed trace (thời gian đi đâu qua nhiều service) — không dùng nhầm chỗ",
+    "Từ đúng một `requestId` trong log lỗi 500, dựng lại toàn bộ đường đi của request đó qua cả `api` và `notification-service` để tìm root cause",
+  ],
+  lessons: [
+    {
+      slug: "structured-logging-va-requestid-qua-onrequest-hook",
+      title: "Structured logging & requestId qua onRequest hook",
+      minutes: 40,
+      summary: "Vì sao log JSON hơn hẳn log dạng chữ khi cần tìm kiếm; sinh `requestId` sớm nhất có thể và gắn vào mọi dòng log bằng pino child logger.",
+    },
+    {
+      slug: "truyen-requestid-qua-grpc-metadata-sang-notification-service",
+      title: "Truyền requestId qua gRPC metadata sang notification-service",
+      minutes: 40,
+      summary: "`requestId` chỉ hữu ích trong 1 process là chưa đủ — gắn nó vào gRPC metadata khi `api` gọi `notification-service`, và log lại đúng giá trị đó ở phía nhận.",
+    },
+    {
+      slug: "expose-metrics-bang-prom-client-va-phan-biet-log-metric-trace",
+      title: "Expose /metrics bằng prom-client & phân biệt log/metric/trace",
+      minutes: 45,
+      summary: "Thêm request-count và latency histogram bằng `prom-client`; phân biệt rõ log/metric/trace trả lời câu hỏi gì; lần dấu 1 lỗi 500 thật xuyên 2 process chỉ bằng `requestId`.",
+    },
+  ],
+  labs: [
+    {
+      id: "sinh-requestid-va-child-logger",
+      title: "Sinh requestId ở onRequest & gắn vào mọi log qua child logger",
+      description: "Cập nhật `src/plugins/request-logger.ts` (đã có từ B02) để mọi request có một `requestId` riêng, xuất hiện tự động trong mọi dòng log của request đó.",
+      steps: [
+        "Trong `src/plugins/request-logger.ts`, import `randomUUID` từ `node:crypto` và khai báo module augmentation thêm field `requestId: string` cho `FastifyRequest`",
+        "Trong hook `onRequest`, thêm dòng `request.requestId = randomUUID()` NGAY TRƯỚC khi gán `request.startTime`, rồi gán `request.log = request.log.child({ requestId: request.requestId })`",
+        "Vẫn trong `onRequest`, set header trả về cho client: `reply.header(\"x-request-id\", request.requestId)`",
+        "Gọi một route đã có (`curl -s localhost:3000/api/v1/projects -D -`) và xác nhận: header `x-request-id` trong response khớp với field `requestId` xuất hiện ở MỌI dòng log của đúng request đó (kể cả dòng do `request.log.info(...)` gọi từ trong route handler)",
+        "Gọi liên tiếp 2 request khác nhau, xác nhận 2 `requestId` khác nhau — mỗi request có đúng một 'mã vận đơn' riêng, không lẫn với request khác",
+      ],
+    },
+    {
+      id: "truyen-requestid-qua-grpc-metadata",
+      title: "Truyền requestId qua gRPC metadata sang notification-service",
+      description: "requestId của `api` phải \"đi theo\" cuộc gọi gRPC sang `notification-service` — nếu không, log ở `notification-service` hoàn toàn không liên hệ được với request nào đã gây ra nó.",
+      steps: [
+        "Sửa `src/grpc/notification-client.ts`: thêm tham số `requestId: string` vào `sendNotification(input, requestId)`; tạo `const metadata = new grpc.Metadata(); metadata.set(\"x-request-id\", requestId);` rồi truyền `metadata` làm tham số thứ 2 của `client.SendNotification(...)`",
+        "Tạo route mới `src/routes/notifications.route.ts` với `POST /api/v1/notifications/:id/resend` (hành động on-call: gửi lại một notification cụ thể) — đọc bản ghi từ bảng `notifications`, gọi `sendNotification({...}, request.requestId)`, rồi đăng ký route này ở `src/app.ts`",
+        "Sửa `notification-service/src/server.ts`: thêm `pino` (thay cho `console.log`), đọc `call.metadata.get(\"x-request-id\")`, tạo child logger `logger.child({ requestId })`, và log dòng `\"delivering notification\"` bằng child logger đó trước khi gọi `callback(...)`",
+        "Rebuild cả hai service (`docker compose up -d --build api notification-service`), gọi thử `curl -s -X POST localhost:3000/api/v1/notifications/<id>/resend -D -` với một notification có sẵn, lấy `requestId` từ header `x-request-id` trong response",
+        "Chạy `docker compose logs api | grep <requestId>` và `docker compose logs notification-service | grep <requestId>` — xác nhận CÙNG một `requestId` xuất hiện ở log của cả hai process, cho đúng một request",
+      ],
+    },
+    {
+      id: "metrics-va-trace-loi-500-bang-requestid",
+      title: "Expose /metrics & lần dấu lỗi 500 xuyên 2 process bằng đúng 1 requestId",
+      description: "Thêm request-count và latency histogram bằng `prom-client`, rồi cố tình tạo ra 1 lỗi 500 thật và chỉ dùng `requestId` để dựng lại toàn bộ đường đi qua `api` và `notification-service`.",
+      steps: [
+        "`pnpm add prom-client` cho `api`; tạo `src/plugins/metrics.ts` với `new client.Registry()`, một `Counter` tên `http_requests_total` (labels `method`, `route`, `status_code`) và một `Histogram` tên `http_request_duration_seconds` (cùng labels, `buckets` hợp lý cho API nội bộ, ví dụ `[0.01, 0.05, 0.1, 0.3, 0.5, 1, 2, 5]`)",
+        "Trong hook `onResponse` (đã có từ B02), sau dòng log request completed, gọi `.inc()`/`.observe()` cho đúng 2 chỉ số trên — lấy `route` từ `request.routeOptions.url` (mẫu route như `/api/v1/tasks/:id`), KHÔNG dùng `request.url` thô (chứa ID thật, gây bùng nổ cardinality)",
+        "Thêm route `GET /metrics` trả `await register.metrics()` với header `Content-Type: register.contentType`; xác nhận `curl -s localhost:3000/metrics | head` ra đúng định dạng text Prometheus",
+        "Cố tình gây lỗi 500 thật: `docker compose exec postgres psql -U taskflow -c \"UPDATE notifications SET type = 'legacy_digest_summary' WHERE id = '<id>';\"` (giả lập dữ liệu cũ mang type mà `notification-service` chưa từng biết), sau đó gọi lại `curl -s -X POST localhost:3000/api/v1/notifications/<id>/resend -D -`",
+        "Từ response 500 vừa nhận, lấy `requestId` ở header `x-request-id`; chạy `docker compose logs api | grep <requestId>` và `docker compose logs notification-service | grep <requestId>` để dựng lại đúng trình tự: `api` nhận request → gọi gRPC → `notification-service` từ chối vì `type` không hợp lệ → lỗi rơi vào `setErrorHandler` (B03) → trả 500 — xác định đúng root cause chỉ từ 2 dòng log có chung `requestId`, không cần đoán",
+      ],
+    },
+  ],
+  deliverable:
+    "`taskflow-api` có `onRequest` hook sinh `requestId` (UUID) và gắn vào pino child logger cho mọi dòng log của request đó, trả lại qua header `x-request-id`; `notification-client.ts` truyền `requestId` qua gRPC metadata, `notification-service` đọc lại và log cùng giá trị bằng pino; `api` expose `GET /metrics` bằng `prom-client` với `http_requests_total` (Counter) và `http_request_duration_seconds` (Histogram) gắn label theo route pattern (không phải URL thô); có ít nhất 1 lần chứng minh thật: từ 1 `requestId` trong log lỗi 500, lần ra chính xác root cause nằm ở `notification-service`.",
+  successCriteria:
+    "Từ 1 `requestId` trong log lỗi, lần được toàn bộ đường đi của request đó qua cả `api` và `notification-service`; `curl localhost:3000/metrics` trả về đúng định dạng Prometheus với 2 metric đã thêm; giải thích được rành mạch khi nào dùng log, khi nào dùng metric, khi nào (sau này) cần distributed trace — không lẫn lộn vai trò của cả ba.",
+  resources: [
+    { title: "pino — Documentation", url: "https://getpino.io/#/docs/api", kind: "doc" },
+    { title: "grpc.io — Metadata guide", url: "https://grpc.io/docs/guides/metadata/", kind: "doc" },
+    { title: "Prometheus docs — Instrumentation best practices", url: "https://prometheus.io/docs/practices/instrumentation/", kind: "doc" },
+    { title: "prom-client (npm)", url: "https://www.npmjs.com/package/prom-client", kind: "tool" },
+    { title: "prom-client (GitHub — siimon/prom-client)", url: "https://github.com/siimon/prom-client", kind: "tool" },
+    { title: "Google SRE Book — Monitoring Distributed Systems", url: "https://sre.google/sre-book/monitoring-distributed-systems/", kind: "book" },
+  ],
+  quiz: [
+    {
+      id: "vi-sao-structured-log-hon-free-text",
+      question: "`taskflow-api` giờ có 2 process (`api`, `notification-service`) cùng ghi log. Vì sao chuyển sang log dạng JSON (structured) thay vì chuỗi chữ tự do (`\"User 42 logged in at 10:03\"`) lại quan trọng hơn hẳn khi có từ 2 process trở lên?",
+      options: [
+        "JSON luôn chiếm ít dung lượng đĩa hơn chuỗi chữ tự do",
+        "JSON có cấu trúc field cố định (`requestId`, `level`, `msg`...) nên công cụ (grep theo field, log aggregator) có thể lọc/gộp log từ NHIỀU process theo đúng field đó, thay vì phải đoán vị trí thông tin trong một câu chữ tự do mỗi nơi viết một kiểu",
+        "JSON là format duy nhất pino hỗ trợ, không có lựa chọn nào khác",
+        "Free-text log không thể ghi ra file, chỉ JSON mới ghi được",
+      ],
+      answerIndex: 1,
+      explanation: "Giá trị cốt lõi của structured log không phải là gọn nhẹ hơn — mà là MÁY MÓC đọc được nhất quán. Khi log đến từ nhiều process, chỉ có field cố định (như `requestId`) mới cho phép lọc/gộp đáng tin cậy; free-text mỗi chỗ viết một kiểu câu sẽ không thể lọc chính xác.",
+    },
+    {
+      id: "generate-requestid-o-dau",
+      question: "`requestId` nên được sinh ở hook nào trong vòng đời Fastify để chắc chắn NÓ CÓ MẶT ngay cả khi request bị từ chối sớm (ví dụ lỗi validation ở `preValidation`)?",
+      options: [
+        "Trong route handler, ngay dòng đầu tiên",
+        "Trong `onRequest` — hook chạy sớm nhất, trước cả `preValidation`, nên requestId luôn tồn tại dù request có bị chặn ở bước nào sau đó",
+        "Trong `onSend`, sau khi response đã được serialize",
+        "Không cần sinh riêng — dùng luôn `reply.statusCode` làm định danh",
+      ],
+      answerIndex: 1,
+      explanation: "Nếu sinh `requestId` trong handler, một request bị chặn ở `preValidation` (lỗi input) sẽ không bao giờ có `requestId` — đúng lúc bạn cần nó nhất để debug. `onRequest` chạy sớm nhất nên đảm bảo mọi request, kể cả request lỗi sớm, đều có `requestId`.",
+    },
+    {
+      id: "child-logger-vs-truyen-tay",
+      question: "Sau khi chạy `request.log = request.log.child({ requestId })` trong `onRequest`, vì sao route handler gọi `request.log.info({ taskId }, \"...\")` KHÔNG cần tự thêm `requestId` vào object đó nữa?",
+      options: [
+        "Vì Fastify tự động xoá `requestId` khỏi mọi log để tiết kiệm dung lượng",
+        "Vì `child()` tạo ra một logger MỚI đã 'nhớ sẵn' `{ requestId }` và tự động gộp field đó vào MỌI dòng log gọi qua logger con đó, không cần lặp lại thủ công ở từng lời gọi",
+        "Vì `requestId` chỉ có tác dụng với log level `error`, không áp dụng cho `info`",
+        "Vì pino tự đoán `requestId` dựa vào IP của client",
+      ],
+      answerIndex: 1,
+      explanation: "Đây chính là lợi ích của pino child logger: field truyền vào `child({...})` được gộp (merge) tự động vào MỌI dòng log gọi tiếp theo qua chính logger con đó — tránh phải nhớ truyền tay `requestId` vào từng lời gọi log rải rác khắp route handler.",
+    },
+    {
+      id: "requestid-chi-trong-1-process-co-du-khong",
+      question: "Nếu `requestId` chỉ xuất hiện trong log của `api`, còn `notification-service` vẫn log rời rạc không có field nào liên hệ được với request gốc, thì khi `notification-service` từ chối một request, giá trị debug thực tế của `requestId` đó còn lại bao nhiêu?",
+      options: [
+        "Vẫn đủ dùng — chỉ cần đọc log `api` là biết hết mọi thứ xảy ra ở `notification-service`",
+        "Giảm đi đáng kể — bạn biết CHÍNH XÁC request nào đã lỗi ở phía `api`, nhưng không thể nối nó với dòng log tương ứng bên `notification-service` để biết TẠI SAO nó lỗi ở đó, phải đoán hoặc dò log theo thời gian gần đúng",
+        "Không ảnh hưởng gì vì `notification-service` không bao giờ log lỗi",
+        "Tăng lên vì `api` sẽ tự động log thay cho `notification-service`",
+      ],
+      answerIndex: 1,
+      explanation: "requestId chỉ hữu ích trọn vẹn khi nó được PROPAGATE qua mọi hop, kể cả cross-process. Dừng lại ở 1 process khi hệ thống có 2+ process khiến bạn mất khả năng nối log giữa 2 phía — đúng nội dung cốt lõi của module này.",
+    },
+    {
+      id: "cach-dung-de-mang-requestid-qua-grpc",
+      question: "Cách ĐÚNG để mang `requestId` của `api` sang cho `notification-service` khi gọi `SendNotification` qua gRPC là gì?",
+      options: [
+        "Thêm field `request_id` vào message `SendNotificationRequest` trong file `.proto`",
+        "Gắn `requestId` vào `grpc.Metadata` (ví dụ key `x-request-id`) và truyền metadata đó kèm theo lời gọi — tương đương HTTP header, không phải một phần payload nghiệp vụ",
+        "Ghi `requestId` vào biến môi trường chung trước khi gọi gRPC",
+        "Không cần làm gì thêm — gRPC tự động đồng bộ requestId giữa client và server",
+      ],
+      answerIndex: 1,
+      explanation: "gRPC metadata đóng đúng vai trò như HTTP header: mang thông tin về NGỮ CẢNH cuộc gọi (tracing, auth, correlation id...), tách biệt khỏi payload nghiệp vụ trong message `.proto`. Nhét `request_id` vào chính message nghiệp vụ sẽ làm lẫn lộn 'dữ liệu cần xử lý' với 'thông tin vận hành', và mọi client cũ chưa biết field đó cũng phải chỉnh theo.",
+    },
+    {
+      id: "metric-vs-log-tra-loi-cau-hoi-khac-nhau",
+      question: "Một kỹ sư muốn biết: \"latency p95 của toàn bộ endpoint `/api/v1/tasks` trong 1 giờ qua có tăng bất thường không, tính trên hàng chục nghìn request?\" Nguồn dữ liệu phù hợp nhất là gì?",
+      options: [
+        "Đọc từng dòng log của từng request để tự cộng trung bình",
+        "Metric (`http_request_duration_seconds` Histogram) — được thiết kế để trả lời câu hỏi TỔNG THỂ hệ thống có ổn không qua thời gian, không cần giữ chi tiết từng request riêng lẻ",
+        "requestId của 1 request cụ thể bất kỳ",
+        "gRPC metadata của lần gọi notification-service gần nhất",
+      ],
+      answerIndex: 1,
+      explanation: "Đây đúng là ranh giới log vs metric: log trả lời 'chuyện gì xảy ra ở request NÀY', còn metric (số liệu tổng hợp theo thời gian, như histogram latency) trả lời 'hệ thống có ổn không xét trên diện rộng'. Dùng log để trả lời câu hỏi tổng hợp là chọn sai công cụ, tốn tài nguyên và không có sẵn con số percentile.",
+    },
+    {
+      id: "vi-du-can-1-request-cu-the-dung-log",
+      question: "Ngược lại, một khách hàng báo: \"lúc 10:03 tôi bấm gửi lại notification, hệ thống báo lỗi 500\" và đưa đúng `requestId` trong response họ nhận được. Cách tra cứu ĐÚNG hướng là gì?",
+      options: [
+        "Xem biểu đồ Grafana p95 latency toàn hệ thống trong ngày hôm đó",
+        "Xem `/metrics` để đếm tổng số request 500 trong 1 giờ",
+        "grep đúng `requestId` đó trong log của cả `api` và `notification-service` để đọc lại chính xác những gì đã xảy ra CHO ĐÚNG request này",
+        "Chờ distributed tracing triển khai xong rồi mới tra được",
+      ],
+      answerIndex: 2,
+      explanation: "Đây là câu hỏi về MỘT request cụ thể — đúng vai trò của log (có requestId để lọc đúng, không lẫn với request khác), không phải của metric (chỉ cho con số tổng hợp, không cho chi tiết từng request).",
+    },
+    {
+      id: "vai-tro-distributed-tracing",
+      question: "Log đã có `requestId` xuyên 2 process, metric đã có `/metrics`. Câu hỏi nào dưới đây distributed tracing (ví dụ OpenTelemetry — chưa triển khai đầy đủ trong module này) trả lời tốt hơn cả log lẫn metric?",
+      options: [
+        "Trong 1 request cụ thể đi qua `api` rồi `notification-service`, THỜI GIAN cụ thể bị tiêu tốn ở từng bước (network, xử lý ở mỗi service) là bao nhiêu, để biết chính xác đoạn nào đang chậm",
+        "Tổng số request 500 trong ngày hôm nay",
+        "Nội dung chi tiết của 1 dòng log lỗi cụ thể",
+        "Danh sách toàn bộ label đang được dùng trong `/metrics`",
+      ],
+      answerIndex: 0,
+      explanation: "Đây chính là vai trò riêng của distributed tracing: PHÂN RÃ thời gian của một request theo từng span/service (ai chậm, chậm bao lâu) — điều mà log (chỉ ghi lại sự kiện rời rạc) và metric (chỉ tổng hợp số liệu) đều không thể hiện rõ ràng ở mức từng request.",
+    },
+    {
+      id: "bay-cardinality-khi-gan-label-route",
+      question: "Khi gắn label `route` cho `http_requests_total`, dùng `request.url` thô (ví dụ `/api/v1/tasks/3f2a-9c11-...`) thay vì route pattern (`/api/v1/tasks/:id`) sẽ gây ra vấn đề gì?",
+      options: [
+        "Không có vấn đề gì, chỉ là chuỗi dài hơn một chút",
+        "Prometheus sẽ tự động gộp các URL giống nhau lại, không ảnh hưởng gì",
+        "Mỗi task ID khác nhau tạo ra một combination label MỚI — số time series tăng không kiểm soát theo số lượng resource thực tế (cardinality explosion), làm Prometheus tốn bộ nhớ và chậm dần theo thời gian",
+        "Response API sẽ trả về lỗi 500 ngay lập tức",
+      ],
+      answerIndex: 2,
+      explanation: "Đây là bẫy kinh điển khi instrument metrics: label phải có tập giá trị GIỚI HẠN (route pattern cố định), không phải giá trị biến thiên vô hạn (ID cụ thể). Dùng `request.url` thô làm số time series phình to vô kiểm soát theo số lượng task thực tế trong hệ thống.",
+    },
+    {
+      id: "trace-500-tu-requestid-ket-luan-dung",
+      question: "Ở lab cuối, một `notification` bị đổi `type` thành `legacy_digest_summary` (giá trị `notification-service` chưa từng biết). Gọi `resend` trả về 500. grep đúng `requestId` đó, log `api` chỉ thấy dòng 'Unhandled error' chung chung, nhưng log `notification-service` cùng `requestId` lại thấy rõ `\"unsupported notification type\"` kèm `type: \"legacy_digest_summary\"`. Kết luận đúng là gì?",
+      options: [
+        "Lỗi nằm ở tầng gRPC — cấu hình `deadline` hoặc `metadata` bị sai",
+        "Lỗi nằm ở `api` — route handler `resend` viết sai logic",
+        "Lỗi nằm ở phía `notification-service` — dữ liệu có giá trị `type` mà service này chưa hỗ trợ; log `api` một mình không đủ để kết luận điều này, nhưng ghép với log `notification-service` cùng requestId thì thấy ngay",
+        "Không thể kết luận gì nếu chưa có distributed tracing đầy đủ",
+      ],
+      answerIndex: 2,
+      explanation: "Đây chính là giá trị thực chiến của requestId xuyên process: log riêng lẻ ở `api` chỉ nói 'có lỗi', nhưng ghép đúng dòng log cùng requestId ở `notification-service` cho biết CHÍNH XÁC lý do — root cause nằm ở dữ liệu (`type` không được hỗ trợ), không phải ở hạ tầng gRPC hay logic của `api`.",
+    },
+  ],
+};

@@ -1,0 +1,160 @@
+import { RequestIdGrpcMetadataBoundaryDiagram } from "../diagrams/request-id-grpc-metadata-boundary-diagram";
+
+<Eli5 title="Mã vận đơn phải dán TRÊN gói hàng, không phải chỉ ghi trong sổ ở bưu cục gốc" emoji="🚚">
+  Bài trước, bưu cục gốc (`api`) đã dán mã vận đơn lên mọi gói hàng nó xử lý. Nhưng nếu gói hàng đó cần chuyển tiếp sang một bưu cục trung chuyển khác (`notification-service`) mà mã vận đơn KHÔNG được dán theo — bưu cục trung chuyển sẽ ghi sổ của riêng họ, với một mã hoàn toàn khác (hoặc không mã nào cả). Khi gói hàng bị thất lạc ở trạm trung chuyển, hai cuốn sổ không thể ghép lại được: bưu cục gốc nói "tôi đã gửi đi", trạm trung chuyển nói "tôi có nhận gói nào đâu, gói nào cơ?".
+
+  gRPC metadata chính là "nhãn dán ngoài gói hàng" đó — mang `requestId` đi CÙNG cuộc gọi, tách biệt khỏi nội dung gói hàng (payload nghiệp vụ) bên trong.
+</Eli5>
+
+Bài trước, `requestId` đã bám theo mọi dòng log của `api`. Nhưng nếu `notification-service` (B13) vẫn log rời rạc không liên hệ được với request nào, `requestId` chỉ hữu ích được MỘT NỬA hành trình — đúng lúc `notification-service` từ chối một request (bài sau sẽ dùng chính kịch bản này), bạn sẽ không có cách nào nối 2 phía log lại với nhau.
+
+<RequestIdGrpcMetadataBoundaryDiagram />
+
+<Technical>
+
+### gRPC metadata — tương đương HTTP header, không phải payload nghiệp vụ
+
+`.proto` của `SendNotification` (từ B13) không hề có field `request_id` — và **không nên thêm** field đó vào message nghiệp vụ. gRPC có sẵn `Metadata`: một cơ chế key-value đi kèm cuộc gọi, giống hệt HTTP header, dùng đúng cho thông tin về NGỮ CẢNH cuộc gọi (correlation id, auth token...) — tách biệt khỏi dữ liệu cần xử lý.
+
+### Client: gắn `requestId` vào metadata khi gọi
+
+```ts title="src/grpc/notification-client.ts (cập nhật từ B13)"
+import * as grpc from "@grpc/grpc-js";
+// ... các import khác giữ nguyên như B13 ...
+
+interface SendNotificationInput {
+  notificationId: string;
+  userId: string;
+  type: string;
+  payloadJson: string;
+}
+
+export function sendNotification(
+  input: SendNotificationInput,
+  requestId: string, // MỚI ở B16
+): Promise<{ delivered: boolean; deliveryId: string }> {
+  return new Promise((resolve, reject) => {
+    const deadline = new Date(Date.now() + 3000);
+
+    // MỚI ở B16: đây là CÁCH DUY NHẤT để requestId "đi theo" cuộc gọi. Không có cơ chế
+    // tự động nào làm việc này — quên set là notification-service hoàn toàn không biết
+    // request này tới từ đâu.
+    const metadata = new grpc.Metadata();
+    metadata.set("x-request-id", requestId);
+
+    client.SendNotification(
+      { notification_id: input.notificationId, user_id: input.userId, type: input.type, payload_json: input.payloadJson },
+      metadata,
+      { deadline },
+      (error: grpc.ServiceError | null, response: { delivered: boolean; delivery_id: string }) => {
+        if (error) return reject(error);
+        resolve({ delivered: response.delivered, deliveryId: response.delivery_id });
+      },
+    );
+  });
+}
+```
+
+### Endpoint on-call mới: gọi `sendNotification` ngay trong request (đồng bộ)
+
+Luồng chính để gửi notification (comment.created) vẫn đi qua outbox + relay bất đồng bộ (B14) — đúng chủ đích, để chịu được lúc `notification-service` tạm chết. Nhưng để quan sát rõ nhất "1 request, 2 process, cùng 1 requestId", module này thêm một endpoint **on-call** nhỏ: gửi lại thủ công một notification cụ thể, gọi gRPC NGAY trong vòng đời của chính request đó — không qua queue.
+
+```ts title="src/routes/notifications.route.ts (mới ở B16)"
+import type { FastifyInstance } from "fastify";
+import { eq } from "drizzle-orm";
+import { db } from "../db/client.js";
+import { notifications } from "../db/schema.js";
+import { sendNotification } from "../grpc/notification-client.js";
+import { NotFoundError } from "../errors/app-error.js";
+
+export async function notificationsRoutes(fastify: FastifyInstance) {
+  fastify.post<{ Params: { id: string } }>("/api/v1/notifications/:id/resend", async (request) => {
+    const [row] = await db.select().from(notifications).where(eq(notifications.id, request.params.id));
+    if (!row) throw new NotFoundError(`Notification ${request.params.id} not found`);
+
+    request.log.info({ notificationId: row.id }, "resending notification via gRPC");
+
+    // requestId của CHÍNH request HTTP này đi kèm luôn qua gRPC metadata.
+    const result = await sendNotification(
+      { notificationId: row.id, userId: row.userId, type: row.type, payloadJson: JSON.stringify(row.payload) },
+      request.requestId,
+    );
+
+    return { resent: true, deliveryId: result.deliveryId };
+  });
+}
+```
+
+```ts title="src/app.ts (đăng ký route mới)"
+app.register(notificationsRoutes);
+```
+
+### Server: đọc metadata & log lại đúng requestId
+
+```ts title="notification-service/src/server.ts (cập nhật từ B13)"
+import pino from "pino"; // MỚI ở B16 — trước đó dùng console.log
+import * as grpc from "@grpc/grpc-js";
+// ... các import khác giữ nguyên như B13 ...
+
+const logger = pino();
+
+function sendNotification(
+  call: grpc.ServerUnaryCall<{ notification_id: string; user_id: string; type: string; payload_json: string }, unknown>,
+  callback: grpc.sendUnaryData<{ delivered: boolean; delivery_id: string }>,
+) {
+  // metadata.get() luôn trả về mảng — lấy phần tử đầu tiên, phòng khi không có giá trị nào.
+  const requestIdValues = call.metadata.get("x-request-id");
+  const requestId = typeof requestIdValues[0] === "string" ? requestIdValues[0] : "unknown";
+  const log = logger.child({ requestId }); // MỚI ở B16 — cùng requestId với phía api
+
+  const { notification_id, user_id, type } = call.request;
+
+  log.info({ notification_id, user_id, type }, "delivering notification");
+  callback(null, { delivered: true, delivery_id: `dl_${notification_id}` });
+}
+```
+
+`call.metadata` có sẵn trên mọi `call` gRPC nhận được ở server — không cần cấu hình gì thêm ngoài việc client có gắn key đó hay không.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Rebuild cả 2 service sau khi sửa code", command: "docker compose up -d --build api notification-service", output: "[+] Running 2/2\n ✔ Container taskflow-api-api-1                    Started\n ✔ Container taskflow-api-notification-service-1  Started" },
+    { comment: "Gọi resend cho 1 notification có sẵn", command: "curl -s -D - -X POST http://localhost:3000/api/v1/notifications/n_9f2c/resend", output: "HTTP/1.1 200 OK\nx-request-id: b7e1f4a2-...\n\n{\"resent\":true,\"deliveryId\":\"dl_n_9f2c\"}" },
+    { comment: "Log api — có dòng resend, cùng requestId với header vừa nhận", command: "docker compose logs api --tail 3", output: '{"level":30,"requestId":"b7e1f4a2-...","notificationId":"n_9f2c","msg":"resending notification via gRPC"}' },
+    { comment: "Log notification-service — CÙNG requestId, dù là process khác", command: "docker compose logs notification-service --tail 3", output: '{"level":30,"requestId":"b7e1f4a2-...","notification_id":"n_9f2c","user_id":"u_1","type":"task_status_changed","msg":"delivering notification"}' },
+    { comment: "Xác nhận: grep đúng requestId ra cả 2 phía", command: "docker compose logs | grep b7e1f4a2" },
+  ]}
+/>
+
+<Callout type="warning" title="Đừng nhét requestId vào message .proto">
+  Thêm `string request_id = 5;` vào `SendNotificationRequest` để "cho tiện" trộn lẫn 2 khái niệm khác nhau: dữ liệu nghiệp vụ (client nào cũng phải biết) và thông tin vận hành (chỉ dùng để debug, không phải hợp đồng nghiệp vụ). Dùng `Metadata` giữ đúng ranh giới, và không buộc mọi client `.proto` phải quan tâm tới field đó.
+</Callout>
+
+<Callout type="mistake">
+  Quên đọc `call.metadata.get("x-request-id")` ở phía server — code vẫn chạy đúng (không lỗi), nhưng `notification-service` log không có `requestId`, coi như quay lại tình trạng "log không nối được với request nào" của trước bài này.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "gRPC Metadata", meaning: "Cơ chế key-value đi kèm 1 cuộc gọi gRPC, tương đương HTTP header — mang thông tin ngữ cảnh, tách biệt khỏi payload nghiệp vụ." },
+    { term: "call.metadata", meaning: "Đối tượng metadata phía server nhận được, đọc bằng `.get(key)` — luôn trả về mảng giá trị." },
+    { term: "on-call endpoint", meaning: "Endpoint vận hành (không phải nghiệp vụ chính) dùng khi cần can thiệp thủ công, ví dụ gửi lại 1 notification cụ thể." },
+    { term: "cross-process correlation", meaning: "Khả năng nối log của 2 process khác nhau lại với nhau bằng 1 giá trị chung (ở đây là requestId)." },
+  ]}
+/>
+
+<QuickCheck
+  question="Cách ĐÚNG để mang `requestId` từ `api` sang `notification-service` khi gọi `SendNotification` là gì?"
+  options={[
+    "Thêm field `request_id` vào message `SendNotificationRequest` trong `.proto`",
+    "Gắn `requestId` vào `grpc.Metadata` (key `x-request-id`) và truyền kèm lời gọi — giống HTTP header, tách biệt khỏi payload nghiệp vụ",
+    "Ghi `requestId` ra một file chung cả 2 service cùng đọc",
+    "Không cần làm gì — gRPC tự đồng bộ requestId giữa client và server",
+  ]}
+  answerIndex={1}
+  explanation="Metadata đóng đúng vai trò tương đương HTTP header trong gRPC: mang ngữ cảnh (correlation id, auth...) mà không làm bẩn payload nghiệp vụ trong message .proto — và không buộc mọi client/server phải đổi contract nghiệp vụ chỉ vì thêm 1 trường vận hành."
+/>

@@ -1,0 +1,138 @@
+import { RequestIdOnRequestChildLoggerDiagram } from "../diagrams/request-id-onrequest-child-logger-diagram";
+
+<Eli5 title="Mỗi đơn hàng cần một mã vận đơn, dán từ lúc nhận đơn" emoji="📦">
+  Một bưu cục nhận hàng trăm đơn mỗi ngày. Nếu nhân viên chỉ ghi vào sổ bằng câu chữ tự do — "khách áo xanh gửi hộp to lúc sáng" — thì tối muốn tìm lại một đơn cụ thể gần như bất khả thi, nhất là khi đơn đó còn phải qua tay một bưu cục trung chuyển khác (giống `notification-service`, bài sau).
+
+  Cách đúng: ngay khi nhận đơn, dán **một mã vận đơn duy nhất** lên gói hàng. Từ đó, mọi ghi chú xử lý (cân, đóng gói, giao trung chuyển) đều ghi kèm đúng mã đó. Muốn tra một đơn, chỉ cần tìm đúng mã — không cần đọc lại cả cuốn sổ.
+
+  `requestId` trong `taskflow-api` chính là mã vận đơn đó — dán vào ngay khi request tới (`onRequest`), đi theo mọi dòng log của đúng request ấy.
+</Eli5>
+
+Từ B02, `src/plugins/request-logger.ts` đã log mỗi request bằng pino (`request.log.info(...)`) — nhưng khi có 2 request chạy đồng thời, log của chúng xen kẽ nhau trong cùng một stream, không có gì phân biệt dòng nào thuộc request nào. Với 1 process, còn có thể đoán bằng thời gian; nhưng B13 đã thêm `notification-service` — một process HOÀN TOÀN riêng, log HOÀN TOÀN riêng. Nếu không có gì nối hai bên lại, không cách nào biết dòng log nào ở `notification-service` tương ứng với request nào ở `api`.
+
+<RequestIdOnRequestChildLoggerDiagram />
+
+<Technical>
+
+### Vì sao structured (JSON) log là điều kiện cần, trước cả requestId
+
+pino ghi log dạng JSON mặc định (đã dùng từ B01) — mỗi dòng là một object có field cố định (`level`, `time`, `msg`...), không phải câu chữ tự do. Đây không phải chi tiết thẩm mỹ:
+
+| Cách ghi | Tìm theo field cụ thể | Gộp log từ nhiều process (Loki, CloudWatch, ELK...) |
+|---|---|---|
+| Free-text (`"User 42 xử lý task lúc 10:03"`) | Phải viết regex đoán vị trí, dễ vỡ khi câu chữ đổi | Không thể lọc chính xác theo field — công cụ chỉ thấy chuỗi ký tự |
+| JSON (`{"userId":42,"msg":"...","time":...}`) | Lọc trực tiếp theo field, không cần đoán | Công cụ log-aggregation lọc/gộp theo field thật, đáng tin cậy |
+
+Nếu bạn đã học module M15 (Observability) của course DevOps & Cloud, đây chính là điều kiện tiên quyết để Loki/CloudWatch group log theo field hoạt động được — ở đây ta áp nó vào chính 2 service `api`/`notification-service` do mình viết, không phải cụm hạ tầng có sẵn của người khác.
+
+### Sinh `requestId` ở `onRequest` — sớm nhất có thể
+
+```ts title="src/plugins/request-logger.ts (cập nhật từ B02)"
+import { randomUUID } from "node:crypto";
+import fp from "fastify-plugin";
+import type { FastifyInstance, FastifyRequest } from "fastify";
+
+declare module "fastify" {
+  interface FastifyRequest {
+    startTime?: bigint;
+    requestId: string; // MỚI ở B16
+  }
+}
+
+async function requestLoggerPlugin(fastify: FastifyInstance) {
+  fastify.addHook("onRequest", async (request: FastifyRequest, reply) => {
+    // MỚI ở B16: sinh requestId TRƯỚC MỌI THỨ KHÁC — kể cả preValidation có chặn
+    // request lại vì input sai, request đó vẫn có requestId để log lỗi kèm theo.
+    request.requestId = randomUUID();
+
+    // Child logger: một pino instance CON, tự động gộp { requestId } vào mọi dòng
+    // log gọi qua request.log từ đây trở đi — không cần truyền tay vào từng lời gọi.
+    request.log = request.log.child({ requestId: request.requestId });
+
+    request.startTime = process.hrtime.bigint();
+
+    // Trả lại cho client — hữu ích khi client tự báo lỗi kèm đúng mã này.
+    reply.header("x-request-id", request.requestId);
+  });
+
+  fastify.addHook("onResponse", async (request, reply) => {
+    const durationMs = request.startTime ? Number(process.hrtime.bigint() - request.startTime) / 1_000_000 : undefined;
+    request.log.info({ method: request.method, url: request.url, statusCode: reply.statusCode, durationMs }, "request completed");
+  });
+}
+
+export const requestLogger = fp(requestLoggerPlugin);
+```
+
+Không cần đổi gì ở `src/app.ts` — `request-logger` đã được đăng ký từ B02, mọi route đăng ký sau nó tự động có `requestId`.
+
+### Vì sao dùng `child()` thay vì tự thêm `requestId` vào từng lời gọi log
+
+```ts title="Cách SAI — dễ quên, dễ lệch"
+request.log.info({ requestId: request.requestId, taskId }, "processing task");
+request.log.info({ requestId: request.requestId, count }, "tasks loaded"); // lặp lại y hệt, dễ quên 1 chỗ
+```
+
+```ts title="Cách ĐÚNG — child logger tự nhớ"
+// request.log đã là child({ requestId }) từ onRequest — chỉ cần gọi bình thường
+request.log.info({ taskId }, "processing task");
+request.log.info({ count }, "tasks loaded"); // vẫn có requestId, không cần lặp lại
+```
+
+`child()` không tạo ra một logger tách biệt hoàn toàn — nó vẫn ghi ra cùng output, cùng cấu hình (kể cả `redact` đã cấu hình ở B15 nếu logger gốc có), chỉ thêm field cố định vào mọi dòng log gọi qua nó.
+
+### Vì sao trả `requestId` qua HEADER, không nhét vào response body
+
+Response lỗi/thành công của `taskflow-api` đã bị **chốt cứng** từ B03 (`{ error: { code, message, details } }` hoặc trả thẳng resource) — thêm field `requestId` vào body sẽ phá format đã chốt cho cả 19 module. Header `x-request-id` là chỗ đúng: không đụng tới response contract, vẫn cho client (hoặc người debug) một cách để tra log.
+
+</Technical>
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Gọi 1 request, xem cả header lẫn log", command: "curl -s -D - -o /dev/null http://localhost:3000/api/v1/projects" },
+    {
+      comment: "Header response — mã vận đơn của đúng request này",
+      command: "# (trích từ output trên)",
+      output: "HTTP/1.1 200 OK\nx-request-id: a1b2c3d4-...\ncontent-type: application/json",
+    },
+    {
+      comment: "Log của api — cùng requestId ở MỌI dòng liên quan tới request đó",
+      command: "docker compose logs api --tail 5",
+      output:
+        '{"level":30,"requestId":"a1b2c3d4-...","msg":"fetching projects"}\n{"level":30,"requestId":"a1b2c3d4-...","count":4,"msg":"projects loaded"}\n{"level":30,"requestId":"a1b2c3d4-...","method":"GET","url":"/api/v1/projects","statusCode":200,"durationMs":3.1,"msg":"request completed"}',
+    },
+    { comment: "Gọi request thứ 2 — requestId khác hẳn, không lẫn với request trước", command: "curl -s -D - -o /dev/null http://localhost:3000/api/v1/projects | grep x-request-id" },
+  ]}
+/>
+
+<Callout type="mistake" title="Sinh requestId trong route handler thay vì onRequest">
+  Nếu sinh `requestId` bên trong handler, một request bị chặn sớm ở `preValidation` (lỗi input, B03) sẽ KHÔNG có `requestId` — đúng lúc bạn cần debug nhất. `onRequest` chạy trước mọi hook khác nên luôn đảm bảo có `requestId`, kể cả request bị từ chối ngay từ đầu.
+</Callout>
+
+<Callout type="tip">
+  `randomUUID()` (từ `node:crypto`, không cần cài thêm gói) đủ tốt cho correlation id nội bộ — không cần thư viện ngoài chỉ để sinh 1 chuỗi ngẫu nhiên duy nhất.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "structured log", meaning: "Log dạng JSON có field cố định, máy đọc/lọc được — khác với free-text chỉ người đọc hiểu." },
+    { term: "requestId", meaning: "Mã định danh duy nhất cho một request, sinh ở onRequest, đi theo mọi log của request đó." },
+    { term: "pino child logger", meaning: "Logger con tạo bằng `.child({...})` — tự động gộp field cố định vào mọi dòng log gọi qua nó." },
+    { term: "onRequest hook", meaning: "Hook Fastify chạy sớm nhất trong vòng đời request — đúng chỗ để sinh requestId." },
+    { term: "x-request-id header", meaning: "Header response chứa requestId — không đụng vào response body đã chốt format từ B03." },
+  ]}
+/>
+
+<QuickCheck
+  question="Vì sao route handler gọi `request.log.info({ taskId }, 'processing')` lại tự động có field `requestId` trong log, dù không truyền `requestId` vào object đó?"
+  options={[
+    "Vì Fastify tự quét toàn bộ log và chèn thêm requestId sau khi ghi",
+    "Vì `request.log` đã được gán lại thành `request.log.child({ requestId })` ở onRequest — mọi lời gọi log qua logger con đó tự động gộp thêm field requestId",
+    "Vì requestId được lưu trong biến môi trường toàn cục",
+    "Vì pino mặc định luôn thêm 1 UUID ngẫu nhiên vào mọi dòng log",
+  ]}
+  answerIndex={1}
+  explanation="`child()` tạo logger con nhớ sẵn field truyền vào lúc tạo, tự gộp vào mọi dòng log gọi tiếp theo qua chính logger con đó — đây là lý do route handler không cần truyền tay requestId vào từng lời gọi log."
+/>

@@ -1,0 +1,156 @@
+import { Trace500ErrorAcrossProcessesDiagram } from "../diagrams/trace-500-error-across-processes-diagram";
+
+<Eli5 title="Sổ nhật ký, bảng táp-lô, và GPS theo dõi hành trình — ba thứ khác nhau, đừng dùng lẫn" emoji="🚕">
+  Một hãng taxi có ba công cụ khác nhau. **Sổ nhật ký** ghi lại từng chuyến xe cụ thể — biết được đúng chuyến của khách hàng X đi lúc mấy giờ, tài xế nào, có sự cố gì không (đây là **log**, cần đúng "mã chuyến" — `requestId` — để tra đúng chuyến). **Bảng táp-lô** ở tổng đài chỉ hiện vài con số lớn: tổng số chuyến/giờ, thời gian chờ trung bình — không cần biết từng chuyến cụ thể, chỉ cần biết CẢ HỆ THỐNG có đang ổn không (đây là **metric**). Còn **GPS theo dõi hành trình** cho biết CHÍNH XÁC chiếc xe đó đang chậm ở đoạn đường nào, kẹt xe hay dừng đèn đỏ (đây là **distributed trace**).
+
+  Ba công cụ trả lời ba câu hỏi khác nhau. Dùng sổ nhật ký để trả lời "cả hệ thống có ổn không" thì phải đọc hàng nghìn dòng — chậm và dễ sai; dùng bảng táp-lô để tìm một chuyến cụ thể thì vô ích vì nó không lưu chi tiết từng chuyến.
+</Eli5>
+
+Hai bài trước đã lo phần **log**: `requestId` bám theo mọi dòng log, xuyên cả `api` lẫn `notification-service`. Bài này thêm phần **metric** (`/metrics` bằng `prom-client`), rồi dùng đúng những gì đã xây để chứng minh giá trị thật của `requestId`: từ 1 lỗi 500, lần ra root cause chỉ bằng grep.
+
+<Technical>
+
+### `prom-client`: Registry, Counter, Histogram
+
+```ts title="src/plugins/metrics.ts (mới ở B16)"
+import client from "prom-client";
+import fp from "fastify-plugin";
+import type { FastifyInstance } from "fastify";
+
+export const register = new client.Registry();
+
+// Đếm tổng số request, phân theo method/route/status_code.
+export const httpRequestsTotal = new client.Counter({
+  name: "http_requests_total",
+  help: "Tổng số HTTP request đã xử lý",
+  labelNames: ["method", "route", "status_code"],
+  registers: [register],
+});
+
+// Phân phối latency theo bucket — đủ để tính p50/p95/p99 sau này bằng PromQL.
+export const httpRequestDurationSeconds = new client.Histogram({
+  name: "http_request_duration_seconds",
+  help: "Thời gian xử lý 1 HTTP request (giây)",
+  labelNames: ["method", "route", "status_code"],
+  buckets: [0.01, 0.05, 0.1, 0.3, 0.5, 1, 2, 5],
+  registers: [register],
+});
+
+async function metricsPlugin(fastify: FastifyInstance) {
+  fastify.get("/metrics", async (_request, reply) => {
+    reply.header("Content-Type", register.contentType);
+    return register.metrics();
+  });
+}
+
+export const metricsRoute = fp(metricsPlugin);
+```
+
+### Ghi nhận số liệu ở đúng chỗ đã có sẵn: `onResponse`
+
+`src/plugins/request-logger.ts` (B02, đã thêm `requestId` ở bài 1) đã có hook `onResponse` chạy sau MỌI request. Đây đúng là chỗ để cộng dồn metric — không cần thêm hook mới:
+
+```ts title="src/plugins/request-logger.ts (cập nhật thêm ở B16)"
+import { httpRequestDurationSeconds, httpRequestsTotal } from "./metrics.js";
+// ... phần onRequest giữ nguyên như bài 1 ...
+
+fastify.addHook("onResponse", async (request, reply) => {
+  const durationMs = request.startTime ? Number(process.hrtime.bigint() - request.startTime) / 1_000_000 : undefined;
+  request.log.info({ method: request.method, url: request.url, statusCode: reply.statusCode, durationMs }, "request completed");
+
+  // MỚI ở B16: route lấy từ ROUTE PATTERN, không phải URL thô.
+  const route = request.routeOptions.url ?? "unknown";
+  const labels = { method: request.method, route, status_code: String(reply.statusCode) };
+  httpRequestsTotal.inc(labels);
+  if (durationMs !== undefined) httpRequestDurationSeconds.observe(labels, durationMs / 1000);
+});
+```
+
+### Bẫy cardinality — vì sao KHÔNG dùng `request.url`
+
+| Cách lấy label `route` | Số time series khi có 10.000 task | Vấn đề |
+|---|---|---|
+| `request.url` (thô, có ID thật: `/api/v1/tasks/3f2a-...`) | Tăng theo SỐ TASK thực tế — có thể tới hàng chục nghìn | Cardinality explosion: Prometheus tốn bộ nhớ lưu time series, chậm dần, có thể sập |
+| `request.routeOptions.url` (mẫu route: `/api/v1/tasks/:id`) | Cố định theo SỐ ROUTE khai báo trong code | An toàn — đúng tinh thần "label phải có tập giá trị giới hạn" |
+
+Đây là lỗi rất dễ mắc và rất tốn kém khi phát hiện muộn — luôn kiểm tra 1 label có tập giá trị HỮU HẠN trước khi gắn nó vào metric.
+
+### Log, metric, trace — ba vai trò không được lẫn lộn
+
+| Công cụ | Trả lời câu hỏi | Ví dụ cụ thể ở `taskflow-api` |
+|---|---|---|
+| **Log** (`requestId`, 2 bài trước) | Chuyện gì xảy ra ở ĐÚNG 1 request này? | Khách báo lỗi kèm `requestId` → grep đúng dòng log ở cả `api` và `notification-service` |
+| **Metric** (`/metrics`, bài này) | Hệ thống có ổn không, nhìn TỔNG THỂ theo thời gian? | p95 latency của `/api/v1/tasks` trong 1 giờ qua có tăng bất thường không |
+| **Distributed trace** (chưa triển khai ở module này) | Với 1 request cụ thể đi qua nhiều service, THỜI GIAN cụ thể tiêu tốn ở đâu? | Trong 1 lần gọi `resend`, mất bao lâu ở `api`, bao lâu ở mạng, bao lâu ở `notification-service` |
+
+Ba công cụ này **bổ sung cho nhau, không thay thế nhau**: metric cho biết "có gì đó sai" (p95 tăng đột biến), log (nhờ `requestId`) cho biết "chính xác request nào và điều gì đã xảy ra", còn distributed tracing — bước tự nhiên tiếp theo, ví dụ dùng OpenTelemetry, ngoài phạm vi triển khai đầy đủ của module này — sẽ trả lời "thời gian trong request đó đi đâu" khi bức tranh có nhiều hơn 2 service. Nhầm vai trò của 3 công cụ (ví dụ cố dùng log để trả lời câu hỏi tổng thể của metric) khiến bạn tốn công đọc hàng nghìn dòng thay vì nhìn 1 con số.
+
+</Technical>
+
+### Lần dấu một lỗi 500 thật, chỉ bằng đúng 1 `requestId`
+
+Bây giờ mọi mảnh ghép đã có đủ: `requestId` xuyên 2 process (bài 1, 2), `/metrics` để biết "có vấn đề" ở tầm hệ thống, và log để biết "vấn đề gì, ở request nào". Kịch bản dưới đây cố tình tạo ra một lỗi thật — không giả lập — để chứng minh giá trị của toàn bộ 2 bài trước.
+
+<Trace500ErrorAcrossProcessesDiagram />
+
+Root cause ở đây không nằm ở gRPC hay ở logic `api` — nó nằm ở DỮ LIỆU: một `notification` cũ mang giá trị `type` mà `notification-service` chưa từng được dạy để hiểu. Không có `requestId` xuyên 2 process, log `api` chỉ nói được "có lỗi 500, không rõ vì sao"; phải có đúng dòng log tương ứng bên `notification-service` mới thấy được lý do thật.
+
+## Thực hành
+
+<Terminal
+  commands={[
+    { comment: "Cài prom-client cho api", command: "pnpm add prom-client", output: "dependencies:\n+ prom-client 15.1.3" },
+    { comment: "Đăng ký route /metrics ở src/app.ts", command: "# app.register(metricsRoute);" },
+    { comment: "Rebuild & kiểm tra /metrics trả đúng định dạng Prometheus", command: "docker compose up -d --build api && curl -s http://localhost:3000/metrics | head -n 8", output: "# HELP http_requests_total Tổng số HTTP request đã xử lý\n# TYPE http_requests_total counter\nhttp_requests_total{method=\"GET\",route=\"/api/v1/projects\",status_code=\"200\"} 3\n# HELP http_request_duration_seconds Thời gian xử lý 1 HTTP request (giây)\n# TYPE http_request_duration_seconds histogram" },
+    {
+      comment: "Giả lập dữ liệu cũ mang type không được notification-service hỗ trợ",
+      command: "docker compose exec postgres psql -U taskflow -c \"UPDATE notifications SET type = 'legacy_digest_summary' WHERE id = 'n_9f2c';\"",
+      output: "UPDATE 1",
+    },
+    {
+      comment: "Gọi resend — lần này nhận 500 thật",
+      command: "curl -s -D - -X POST http://localhost:3000/api/v1/notifications/n_9f2c/resend",
+      output:
+        'HTTP/1.1 500 Internal Server Error\nx-request-id: e7f0219b-...\n\n{"error":{"code":"INTERNAL_ERROR","message":"Đã có lỗi xảy ra, vui lòng thử lại sau","details":[]}}',
+    },
+    {
+      comment: "Grep đúng requestId ở CẢ HAI container log — chỉ cần 1 lệnh mỗi bên",
+      command: "docker compose logs api notification-service | grep e7f0219b",
+      output:
+        'api-1                    | {"level":30,"requestId":"e7f0219b-...","notificationId":"n_9f2c","msg":"resending notification via gRPC"}\nnotification-service-1   | {"level":50,"requestId":"e7f0219b-...","type":"legacy_digest_summary","msg":"unsupported notification type"}\napi-1                    | {"level":50,"requestId":"e7f0219b-...","err":{"message":"3 INVALID_ARGUMENT: Unsupported notification type: legacy_digest_summary"},"msg":"Unhandled error"}',
+    },
+  ]}
+/>
+
+<Callout type="tip" title="Quy trình debug 1 lỗi 500 khi có ≥2 process">
+  1. Lấy `requestId` từ header `x-request-id` của response lỗi (hoặc từ báo cáo của khách hàng).
+  2. `docker compose logs <mọi service liên quan> | grep <requestId>` — một lệnh, không cần đoán service nào liên quan.
+  3. Đọc log theo đúng thứ tự thời gian — dòng lỗi ở service NÀO xuất hiện ĐẦU TIÊN thường là nơi root cause thật sự nằm.
+</Callout>
+
+<Callout type="mistake">
+  Cố dùng `/metrics` để tìm nguyên nhân của MỘT lỗi 500 cụ thể — metric không lưu chi tiết từng request, chỉ có số liệu tổng hợp. `/metrics` chỉ nên dùng để phát hiện "có bất thường" (ví dụ tỉ lệ lỗi 500 tăng), sau đó chuyển sang log (có `requestId`) để tìm chính xác request nào và vì sao.
+</Callout>
+
+<KeyTerms
+  terms={[
+    { term: "prom-client", meaning: "Thư viện Node.js tạo và expose metric theo định dạng Prometheus." },
+    { term: "Counter", meaning: "Metric chỉ tăng dần — ví dụ tổng số request đã xử lý." },
+    { term: "Histogram", meaning: "Metric phân phối giá trị theo bucket — dùng để tính percentile latency (p50/p95/p99)." },
+    { term: "cardinality", meaning: "Số lượng tổ hợp giá trị label khác nhau của 1 metric — label có giá trị không giới hạn (như ID) gây cardinality explosion." },
+    { term: "log vs metric vs trace", meaning: "Log: chi tiết 1 request. Metric: tổng hợp toàn hệ thống theo thời gian. Trace: thời gian đi đâu qua nhiều service của 1 request." },
+    { term: "distributed tracing", meaning: "Kỹ thuật theo dấu 1 request qua nhiều service bằng span/trace ID — ví dụ OpenTelemetry; bước tiếp theo tự nhiên sau module này." },
+  ]}
+/>
+
+<QuickCheck
+  question="Một dashboard cho thấy tỉ lệ lỗi 500 của `/api/v1/notifications/:id/resend` tăng từ 0% lên 8% trong 10 phút qua. Bước tiếp theo hợp lý nhất là gì?"
+  options={[
+    "Đọc toàn bộ log `api` trong 10 phút qua bằng mắt để tìm dòng lỗi",
+    "Thêm ngay 1 field mới vào `/metrics` để có thêm chi tiết",
+    "Lọc log theo `status_code=500` trong cùng khung giờ để lấy các `requestId` cụ thể, rồi grep từng `requestId` đó xuyên cả `api` và `notification-service` để tìm nguyên nhân",
+    "Kết luận ngay là do `notification-service` bị treo mà không cần kiểm tra thêm",
+  ]}
+  answerIndex={2}
+  explanation="Metric (tỉ lệ lỗi tăng) chỉ báo hiệu CÓ vấn đề ở tầm hệ thống — bước tiếp theo đúng đắn là dùng nó để khoanh vùng thời điểm, rồi chuyển sang log (nhờ requestId) để tìm chính xác request nào lỗi và vì sao. Đọc log bằng mắt không có bộ lọc, hay đoán nguyên nhân mà không kiểm chứng, đều sai quy trình đã học."
+/>
